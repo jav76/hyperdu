@@ -7,7 +7,7 @@ namespace hyperdu.Cli;
 
 public static class Program
 {
-    private record CommandLineOptions(
+    private sealed record CommandLineOptions(
         string TargetPath,
         int? CustomThreads,
         bool SkipHidden,

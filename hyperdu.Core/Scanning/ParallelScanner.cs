@@ -233,49 +233,15 @@ public class ParallelScanner
             cancellationToken.ThrowIfCancellationRequested();
 
             bool isSymlink = entry.Attributes.HasFlag(FileAttributes.ReparsePoint);
-            string? linkTarget = null;
-            if (isSymlink)
-            {
-                try
-                {
-                    linkTarget = entry.LinkTarget;
-                }
-                catch
-                {
-                    // Ignore failure to resolve link target.
-                }
-            }
+            string? linkTarget = isSymlink ? ResolveLinkTargetSafely(entry) : null;
 
             if (entry is DirectoryInfo subDir)
             {
-                string subPath = subDir.FullName;
-                if (IsVirtualOrSystemPath(subPath)) continue;
-                if (IsExcludedPath(subPath)) continue;
-                DirectoryNode childNode = new DirectoryNode(subPath, node);
-
-                if (isSymlink && !_options.FollowSymlinks)
-                {
-                    ProcessDirectorySymlink(node, childNode, linkTarget, localUpdates);
-                    continue;
-                }
-
-                subdirsToQueue ??= new List<DirectoryNode>(4);
-                subdirsToQueue.Add(childNode);
-                lock (node.Subdirectories)
-                {
-                    node.Subdirectories.Add(childNode);
-                }
-
-                QueueLocalUpdate(localUpdates, node, 0, 1, 0);
+                ProcessDirectoryEntry(subDir, node, isSymlink, linkTarget, ref subdirsToQueue, localUpdates);
             }
             else if (entry is FileInfo file)
             {
-                if (isSymlink && !_options.FollowSymlinks)
-                    continue;
-
-                long fileSize = GetFileSizeSafely(file);
-                localSelfSize += fileSize;
-                localFilesCount++;
+                ProcessFileEntry(file, isSymlink, ref localSelfSize, ref localFilesCount);
             }
         }
 
@@ -305,6 +271,51 @@ public class ParallelScanner
         }
 
         if (localUpdates.Count >= 50) FlushLocalUpdates(localUpdates);
+    }
+
+    private static string? ResolveLinkTargetSafely(FileSystemInfo entry)
+    {
+        try
+        {
+            return entry.LinkTarget;
+        }
+        catch
+        {
+            // Ignore failure to resolve link target.
+            return null;
+        }
+    }
+
+    private void ProcessDirectoryEntry(DirectoryInfo subDir, DirectoryNode node, bool isSymlink, string? linkTarget, ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    {
+        string subPath = subDir.FullName;
+        if (IsVirtualOrSystemPath(subPath)) return;
+        if (IsExcludedPath(subPath)) return;
+        DirectoryNode childNode = new DirectoryNode(subPath, node);
+
+        if (isSymlink && !_options.FollowSymlinks)
+        {
+            ProcessDirectorySymlink(node, childNode, linkTarget, localUpdates);
+            return;
+        }
+
+        subdirsToQueue ??= new List<DirectoryNode>(4);
+        subdirsToQueue.Add(childNode);
+        lock (node.Subdirectories)
+        {
+            node.Subdirectories.Add(childNode);
+        }
+
+        QueueLocalUpdate(localUpdates, node, 0, 1, 0);
+    }
+
+    private void ProcessFileEntry(FileInfo file, bool isSymlink, ref long localSelfSize, ref int localFilesCount)
+    {
+        if (isSymlink && !_options.FollowSymlinks) return;
+
+        long fileSize = GetFileSizeSafely(file);
+        localSelfSize += fileSize;
+        localFilesCount++;
     }
 
     private void ProcessDirectorySymlink(DirectoryNode node, DirectoryNode childNode, string? linkTarget, Dictionary<DirectoryNode, NodeDelta> localUpdates)
@@ -384,15 +395,15 @@ public class ParallelScanner
         localUpdates.Clear();
     }
 
-    private static void EnsureParentHierarchyExists(Dictionary<DirectoryNode, NodeDelta> localUpdates, List<DirectoryNode> nodes)
+    private static void EnsureParentHierarchyExists(Dictionary<DirectoryNode, NodeDelta> localUpdates, IEnumerable<DirectoryNode> nodes)
     {
-        foreach (DirectoryNode node in nodes)
+        foreach (DirectoryNode? parent in nodes.Select(node => node.Parent))
         {
-            DirectoryNode? parent = node.Parent;
-            while (parent != null && !localUpdates.ContainsKey(parent))
+            DirectoryNode? current = parent;
+            while (current != null && !localUpdates.ContainsKey(current))
             {
-                localUpdates[parent] = default;
-                parent = parent.Parent;
+                localUpdates[current] = default;
+                current = current.Parent;
             }
         }
     }

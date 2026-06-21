@@ -447,6 +447,14 @@ public class ExplorerRenderer
     private long _lastSize;
     private int _lastSubdirs;
 
+    private record struct TableRenderContext(
+        int ScrollOffset,
+        int SelectedIndex,
+        int PageSize,
+        ParallelScanner? Scanner,
+        string Spinner
+    );
+
     public Table Render(DirectoryNode current, List<NavigatorItem> items, int selectedIndex, int scrollOffset,
         int pageSize, ParallelScanner? scanner)
     {
@@ -492,7 +500,8 @@ public class ExplorerRenderer
         table.AddColumn("[bold]Visual Usage[/]");
 
         long parentTotalSize = current.TotalSize > 0 ? current.TotalSize : 1;
-        AddTableRows(table, items, scrollOffset, selectedIndex, pageSize, parentTotalSize, scanner, spinner);
+        TableRenderContext context = new TableRenderContext(scrollOffset, selectedIndex, pageSize, scanner, spinner);
+        AddTableRows(table, items, parentTotalSize, context);
 
         if (items.Count > pageSize)
         {
@@ -626,19 +635,19 @@ public class ExplorerRenderer
         }
     }
 
-    private void AddTableRows(Table table, List<NavigatorItem> items, int scrollOffset, int selectedIndex, int pageSize, long parentTotalSize, ParallelScanner? scanner, string spinner)
+    private void AddTableRows(Table table, List<NavigatorItem> items, long parentTotalSize, TableRenderContext ctx)
     {
-        int visibleCount = Math.Min(pageSize, items.Count - scrollOffset);
-        bool parentSelected = selectedIndex >= 0 && selectedIndex < items.Count && items[selectedIndex].IsParentLink;
+        int visibleCount = Math.Min(ctx.PageSize, items.Count - ctx.ScrollOffset);
+        bool parentSelected = ctx.SelectedIndex >= 0 && ctx.SelectedIndex < items.Count && items[ctx.SelectedIndex].IsParentLink;
 
         for (int i = 0; i < visibleCount; i++)
         {
-            int index = scrollOffset + i;
+            int index = ctx.ScrollOffset + i;
             NavigatorItem item = items[index];
-            bool isSelected = index == selectedIndex;
+            bool isSelected = index == ctx.SelectedIndex;
 
             string selectMarker = isSelected ? "[bold green]>[/]" : " ";
-            string displayName = GetItemDisplayName(item, isSelected, parentSelected, scanner, spinner);
+            string displayName = GetItemDisplayName(item, isSelected, parentSelected, ctx.Scanner, ctx.Spinner);
             string percentStr = item.IsParentLink ? "-" : $"{((double)item.Size / parentTotalSize * 100):F1}%";
             string bar = BuildProgressBar(item, parentTotalSize);
 
@@ -652,7 +661,7 @@ public class ExplorerRenderer
         }
     }
 
-    private string GetItemDisplayName(NavigatorItem item, bool isSelected, bool parentSelected, ParallelScanner? scanner, string spinner)
+    private static string GetItemDisplayName(NavigatorItem item, bool isSelected, bool parentSelected, ParallelScanner? scanner, string spinner)
     {
         string rawDisplayName;
         if (item.IsParentLink)
