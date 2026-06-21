@@ -87,8 +87,25 @@ public static class Program
         AnsiConsole.MarkupLine($"Target Directory: [cyan]{Markup.Escape(targetPath)}[/]");
 
         bool isNetwork = IsNetworkMount(targetPath);
-        int finalWorkers = parsed.CustomThreads ??
-                           (isNetwork ? Math.Max(32, Environment.ProcessorCount * 2) : Environment.ProcessorCount);
+        bool isRotational = !isNetwork && DiskDeviceHelper.IsRotationalDrive(targetPath);
+
+        int finalWorkers;
+        if (parsed.CustomThreads.HasValue)
+        {
+            finalWorkers = parsed.CustomThreads.Value;
+        }
+        else if (isNetwork)
+        {
+            finalWorkers = Math.Max(32, Environment.ProcessorCount * 2);
+        }
+        else if (isRotational)
+        {
+            finalWorkers = 1;
+        }
+        else
+        {
+            finalWorkers = Environment.ProcessorCount;
+        }
 
         ScanOptions options = new ScanOptions
         {
@@ -105,6 +122,11 @@ public static class Program
         {
             AnsiConsole.MarkupLine(
                 $"[yellow]Network mount detected. Automatically optimized scanner workers to {finalWorkers} to hide latency.[/]");
+        }
+        else if (isRotational && parsed.CustomThreads == null)
+        {
+            AnsiConsole.MarkupLine(
+                $"[yellow]Rotational HDD detected. Automatically optimized scanner workers to {finalWorkers} to prevent disk head thrashing.[/]");
         }
 
         AnsiConsole.MarkupLine($"Scanner Workers:  [green]{options.WorkerCount}[/]");

@@ -223,26 +223,44 @@ public class ParallelScanner
 
         node.StartTicks = DateTime.UtcNow.Ticks;
 
-        DirectoryInfo dirInfo = new DirectoryInfo(node.Path);
         long localSelfSize = 0;
         int localFilesCount = 0;
         List<DirectoryNode>? subdirsToQueue = null;
 
-        foreach (FileSystemInfo entry in dirInfo.EnumerateFileSystemInfos("*", enumerationOptions))
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            bool isSymlink = entry.Attributes.HasFlag(FileAttributes.ReparsePoint);
-            string? linkTarget = isSymlink ? ResolveLinkTargetSafely(entry) : null;
-
-            if (entry is DirectoryInfo subDir)
+            using var enumerator = new LightweightFileSystemEnumerator(node.Path, enumerationOptions);
+            while (enumerator.MoveNext())
             {
-                ProcessDirectoryEntry(subDir, node, isSymlink, linkTarget, ref subdirsToQueue, localUpdates);
+                cancellationToken.ThrowIfCancellationRequested();
+                LightweightEntry entry = enumerator.Current;
+
+                bool isSymlink = entry.Attributes.HasFlag(FileAttributes.ReparsePoint);
+
+                if (entry.IsDirectory)
+                {
+                    ProcessDirectoryEntry(entry, node, isSymlink, ref subdirsToQueue, localUpdates);
+                }
+                else
+                {
+                    ProcessFileEntry(entry, isSymlink, ref localSelfSize, ref localFilesCount);
+                }
             }
-            else if (entry is FileInfo file)
-            {
-                ProcessFileEntry(file, isSymlink, ref localSelfSize, ref localFilesCount);
-            }
+        }
+        catch (UnauthorizedAccessException)
+        {
+            MarkNodeFailed(node, "Access Denied");
+            return;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            MarkNodeFailed(node, "Directory Not Found");
+            return;
+        }
+        catch (Exception ex)
+        {
+            MarkNodeFailed(node, ex.Message);
+            return;
         }
 
         node.SelfSize = localSelfSize;
@@ -280,28 +298,37 @@ public class ParallelScanner
         }
     }
 
-    private static string? ResolveLinkTargetSafely(FileSystemInfo entry)
+    private static string? ResolveLinkTargetSafely(string path)
     {
         try
         {
-            return entry.LinkTarget;
+            var target = Directory.ResolveLinkTarget(path, false);
+            return target?.FullName;
         }
         catch
         {
-            // Ignore failure to resolve link target.
-            return null;
+            try
+            {
+                var target = File.ResolveLinkTarget(path, false);
+                return target?.FullName;
+            }
+            catch
+            {
+                return null;
+            }
         }
     }
 
-    private void ProcessDirectoryEntry(DirectoryInfo subDir, DirectoryNode node, bool isSymlink, string? linkTarget, ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    private void ProcessDirectoryEntry(LightweightEntry entry, DirectoryNode node, bool isSymlink, ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates)
     {
-        string subPath = subDir.FullName;
+        string subPath = Path.Combine(node.Path, entry.Name);
         if (IsVirtualOrSystemPath(subPath)) return;
         if (IsExcludedPath(subPath)) return;
         DirectoryNode childNode = new DirectoryNode(subPath, node);
 
         if (isSymlink && !_options.FollowSymlinks)
         {
+            string? linkTarget = ResolveLinkTargetSafely(subPath);
             ProcessDirectorySymlink(node, childNode, linkTarget, localUpdates);
             return;
         }
@@ -316,12 +343,11 @@ public class ParallelScanner
         QueueLocalUpdate(localUpdates, node, 0, 1, 0);
     }
 
-    private void ProcessFileEntry(FileInfo file, bool isSymlink, ref long localSelfSize, ref int localFilesCount)
+    private void ProcessFileEntry(LightweightEntry entry, bool isSymlink, ref long localSelfSize, ref int localFilesCount)
     {
         if (isSymlink && !_options.FollowSymlinks) return;
 
-        long fileSize = GetFileSizeSafely(file);
-        localSelfSize += fileSize;
+        localSelfSize += entry.Length;
         localFilesCount++;
     }
 
@@ -339,26 +365,6 @@ public class ParallelScanner
         Interlocked.Increment(ref _directoriesScanned);
 
         QueueLocalUpdate(localUpdates, node, targetLength, 1, 0);
-    }
-
-    private static long GetFileSizeSafely(FileInfo file)
-    {
-        try
-        {
-            return file.Length;
-        }
-        catch (FileNotFoundException)
-        {
-            return 0;
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return 0;
-        }
-        catch (IOException)
-        {
-            return 0;
-        }
     }
 
     private void MarkNodeFailed(DirectoryNode node, string errorMessage)
