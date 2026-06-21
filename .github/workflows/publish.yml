@@ -4,10 +4,12 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
 
 jobs:
   build:
-    name: Build and Publish
+    name: Build and Publish (${{ matrix.platform }})
     runs-on: ubuntu-latest
 
     strategy:
@@ -23,6 +25,28 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - name: Parse Version
+        id: versioning
+        shell: bash
+        run: |
+          BASE_VERSION="1.0.0"
+          if [ -f Directory.Build.props ]; then
+            PROP_VERSION=$(grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' Directory.Build.props | head -n 1)
+            if [ -n "$PROP_VERSION" ]; then
+              BASE_VERSION="$PROP_VERSION"
+            fi
+          fi
+          
+          if [[ "${{ github.ref }}" =~ ^refs/tags/v ]]; then
+            TAG_NAME="${{ github.ref_name }}"
+            SEM_VER="${TAG_NAME#v}"
+            echo "version_prefix=${SEM_VER}" >> $GITHUB_OUTPUT
+            echo "version_suffix=" >> $GITHUB_OUTPUT
+          else
+            echo "version_prefix=${BASE_VERSION}" >> $GITHUB_OUTPUT
+            echo "version_suffix=ci.${{ github.run_number }}" >> $GITHUB_OUTPUT
+          fi
+
       - name: Publish Profile (${{ matrix.platform }})
         run: |
           dotnet publish hyperdu.Cli/hyperdu.Cli.csproj \
@@ -31,10 +55,52 @@ jobs:
             --self-contained true \
             -p:PublishSingleFile=true \
             -p:PublishTrimmed=true \
+            -p:VersionPrefix="${{ steps.versioning.outputs.version_prefix }}" \
+            -p:VersionSuffix="${{ steps.versioning.outputs.version_suffix }}" \
+            -p:FileVersion="${{ steps.versioning.outputs.version_prefix }}.${{ github.run_number }}" \
+            -p:InformationalVersion="${{ steps.versioning.outputs.version_prefix }}${{ steps.versioning.outputs.version_suffix != '' && format('-{0}', steps.versioning.outputs.version_suffix) || '' }}+sha.${{ github.sha }}" \
             -o publish/${{ matrix.platform }}
+
+      - name: Compress Executables
+        shell: bash
+        run: |
+          cd publish/${{ matrix.platform }}
+          if [[ "${{ matrix.platform }}" == win-* ]]; then
+            zip -j ../../hyperdu-${{ matrix.platform }}.zip *
+          else
+            tar -czf ../../hyperdu-${{ matrix.platform }}.tar.gz *
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: hyperdu-${{ matrix.platform }}
-          path: publish/${{ matrix.platform }}/
+          path: |
+            hyperdu-${{ matrix.platform }}.zip
+            hyperdu-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/hyperdu-*.zip
+            artifacts/hyperdu-*.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false

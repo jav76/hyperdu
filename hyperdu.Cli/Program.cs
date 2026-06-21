@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Text;
 using hyperdu.Cli.UI;
 using hyperdu.Core.Scanning;
@@ -12,7 +13,8 @@ public static class Program
         int? CustomThreads,
         bool SkipHidden,
         List<string> CustomExcludes,
-        bool ShowHelp
+        bool ShowHelp,
+        bool ShowVersion
     );
 
     private static CommandLineOptions ParseArguments(string[] args)
@@ -22,6 +24,7 @@ public static class Program
         bool skipHidden = false;
         List<string> customExcludes = new();
         bool showHelp = false;
+        bool showVersion = false;
 
         int i = 0;
         while (i < args.Length)
@@ -30,6 +33,11 @@ public static class Program
             if (arg == "-h" || arg == "--help")
             {
                 showHelp = true;
+                i++;
+            }
+            else if (arg == "-v" || arg == "--version")
+            {
+                showVersion = true;
                 i++;
             }
             else if ((arg == "-t" || arg == "--threads") && i + 1 < args.Length)
@@ -57,7 +65,7 @@ public static class Program
             }
         }
 
-        return new CommandLineOptions(targetPath, customThreads, skipHidden, customExcludes, showHelp);
+        return new CommandLineOptions(targetPath, customThreads, skipHidden, customExcludes, showHelp, showVersion);
     }
 
     private static int DetermineWorkerCount(CommandLineOptions parsed, bool isNetwork, bool isRotational)
@@ -103,16 +111,25 @@ public static class Program
     public static async Task Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
-        AnsiConsole.Write(new FigletText("hyperdu").Color(Color.DeepSkyBlue4));
-        AnsiConsole.Write(new Markup("[bold teal]High-Performance Directory Space Analyzer[/]\n\n"));
-
         CommandLineOptions parsed = ParseArguments(args);
+
+        if (parsed.ShowVersion)
+        {
+            PrintVersion();
+            return;
+        }
 
         if (parsed.ShowHelp)
         {
             PrintHelp();
             return;
         }
+
+        AnsiConsole.Write(new FigletText("hyperdu").Color(Color.DeepSkyBlue4));
+        var version = System.Reflection.Assembly.GetEntryAssembly()?
+            .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?
+            .InformationalVersion ?? "1.0.0-local";
+        AnsiConsole.Write(new Markup($"[bold teal]High-Performance Directory Space Analyzer v{version}[/]\n\n"));
 
         string targetPath = parsed.TargetPath;
 
@@ -193,11 +210,20 @@ public static class Program
         AnsiConsole.MarkupLine("");
         AnsiConsole.MarkupLine("[bold]Options:[/]");
         AnsiConsole.MarkupLine("  [cyan]-h, --help[/]         Show this help text");
+        AnsiConsole.MarkupLine("  [cyan]-v, --version[/]      Show version information");
         AnsiConsole.MarkupLine(
             "  [cyan]-t, --threads <N>[/]  Set the number of concurrent worker threads (default: CPU logical cores)");
         AnsiConsole.MarkupLine(
             "  [cyan]-e, --exclude <path>[/] Add a path to the exclusion list (can be specified multiple times. default: /mnt/)");
         AnsiConsole.MarkupLine("  [cyan]--skip-hidden[/]       Skip hidden and system files/folders");
+    }
+
+    private static void PrintVersion()
+    {
+        var version = System.Reflection.Assembly.GetEntryAssembly()?
+            .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?
+            .InformationalVersion ?? "1.0.0-local";
+        AnsiConsole.MarkupLine($"hyperdu version [green]{version}[/]");
     }
 
     private static bool IsNetworkMount(string path)
