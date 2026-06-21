@@ -40,48 +40,19 @@ public class InteractiveNavigator
             AnsiConsole.Live(initialLayout)
                 .StartAsync(async ctx =>
                 {
-                    bool dirChanged = false;
                     while (true)
                     {
-                        if (_scanner != null && _scanner.IsScanning) UpdateScannerPriority(items);
-
-                        while (Console.KeyAvailable)
+                        if (_scanner != null && _scanner.IsScanning)
                         {
-                            ConsoleKeyInfo keyInfo = Console.ReadKey(true);
-                            if (keyInfo.Key == ConsoleKey.Q || keyInfo.Key == ConsoleKey.Escape) return;
-
-                            if (HandleKey(keyInfo.Key, items)) dirChanged = true;
+                            UpdateScannerPriority(items);
                         }
+
+                        bool dirChanged = ProcessConsoleInput(items, out bool exit);
+                        if (exit) return;
 
                         if (dirChanged || (_scanner != null && _scanner.IsScanning))
                         {
-                            string? selectedName = items != null && _selectedIndex >= 0 && _selectedIndex < items.Count
-                                ? items[_selectedIndex].Name
-                                : null;
-                            bool isParentLink = items != null && _selectedIndex >= 0 && _selectedIndex < items.Count &&
-                                               items[_selectedIndex].IsParentLink;
-
-                            items = BuildItemList();
-
-                            if (selectedName != null)
-                            {
-                                int newIndex = items.FindIndex(i =>
-                                    i.Name == selectedName && i.IsParentLink == isParentLink);
-                                if (newIndex >= 0)
-                                {
-                                    _selectedIndex = newIndex;
-                                    if (_selectedIndex < _scrollOffset)
-                                        _scrollOffset = _selectedIndex;
-                                    else if (_selectedIndex >= _scrollOffset + PageSize)
-                                        _scrollOffset = _selectedIndex - PageSize + 1;
-                                }
-                                else
-                                {
-                                    _selectedIndex = Math.Clamp(_selectedIndex, 0, Math.Max(0, items.Count - 1));
-                                }
-                            }
-
-                            dirChanged = false;
+                            AdjustSelectionAfterDirChange(ref items);
                         }
 
                         IRenderable layout = CreateCombinedLayout(renderer, items);
@@ -99,6 +70,64 @@ public class InteractiveNavigator
         }
     }
 
+    private bool ProcessConsoleInput(List<NavigatorItem> items, out bool exit)
+    {
+        bool dirChanged = false;
+        exit = false;
+        while (Console.KeyAvailable)
+        {
+            ConsoleKeyInfo keyInfo = Console.ReadKey(true);
+            if (keyInfo.Key == ConsoleKey.Q || keyInfo.Key == ConsoleKey.Escape)
+            {
+                exit = true;
+                return false;
+            }
+
+            if (HandleKey(keyInfo.Key, items))
+            {
+                dirChanged = true;
+            }
+        }
+        return dirChanged;
+    }
+
+    private void AdjustSelectionAfterDirChange(ref List<NavigatorItem> items)
+    {
+        string? selectedName = items != null && _selectedIndex >= 0 && _selectedIndex < items.Count
+            ? items[_selectedIndex].Name
+            : null;
+        bool isParentLink = items != null && _selectedIndex >= 0 && _selectedIndex < items.Count &&
+                           items[_selectedIndex].IsParentLink;
+
+        items = BuildItemList();
+
+        if (selectedName != null)
+        {
+            int newIndex = items.FindIndex(i => i.Name == selectedName && i.IsParentLink == isParentLink);
+            if (newIndex >= 0)
+            {
+                _selectedIndex = newIndex;
+                KeepSelectionInView();
+            }
+            else
+            {
+                _selectedIndex = Math.Clamp(_selectedIndex, 0, Math.Max(0, items.Count - 1));
+            }
+        }
+    }
+
+    private void KeepSelectionInView()
+    {
+        if (_selectedIndex < _scrollOffset)
+        {
+            _scrollOffset = _selectedIndex;
+        }
+        else if (_selectedIndex >= _scrollOffset + PageSize)
+        {
+            _scrollOffset = _selectedIndex - PageSize + 1;
+        }
+    }
+
     private IRenderable CreateCombinedLayout(ExplorerRenderer renderer, List<NavigatorItem> items)
     {
         Table explorerTable = renderer.Render(_current, items, _selectedIndex, _scrollOffset, PageSize, _scanner);
@@ -108,7 +137,7 @@ public class InteractiveNavigator
         return new Rows(progressPanel, explorerTable);
     }
 
-    private Panel CreateProgressPanel(ParallelScanner scanner)
+    private static Panel CreateProgressPanel(ParallelScanner scanner)
     {
         Table table = new Table().NoBorder().HideHeaders();
         table.AddColumn("Col1");
@@ -203,6 +232,7 @@ public class InteractiveNavigator
                 }
                 catch
                 {
+                    // Ignore exception when querying size of specific files (e.g. system files).
                 }
 
                 files.Add((file.Name, size));
@@ -212,6 +242,7 @@ public class InteractiveNavigator
         }
         catch
         {
+            // Ignore directory listing exceptions during file caching.
         }
 
         _cachedFileDirPath = dirPath;
@@ -221,55 +252,75 @@ public class InteractiveNavigator
 
     private bool HandleKey(ConsoleKey key, List<NavigatorItem> items)
     {
-        bool dirChanged = false;
-
         switch (key)
         {
             case ConsoleKey.UpArrow:
-                if (_selectedIndex > 0)
-                {
-                    _selectedIndex--;
-                    if (_selectedIndex < _scrollOffset) _scrollOffset = _selectedIndex;
-                }
-
-                break;
+                return MoveSelectionUp();
 
             case ConsoleKey.DownArrow:
-                if (_selectedIndex < items.Count - 1)
-                {
-                    _selectedIndex++;
-                    if (_selectedIndex >= _scrollOffset + PageSize) _scrollOffset = _selectedIndex - PageSize + 1;
-                }
-
-                break;
+                return MoveSelectionDown(items.Count);
 
             case ConsoleKey.Enter:
-                NavigatorItem selected = items[_selectedIndex];
-                if (selected.IsParentLink)
-                {
-                    AscendDirectory();
-                    dirChanged = true;
-                }
-                else if (selected.DirNode != null)
-                {
-                    DescendDirectory(selected.DirNode);
-                    dirChanged = true;
-                }
-
-                break;
+                return ExecuteSelection(items[_selectedIndex]);
 
             case ConsoleKey.Backspace:
             case ConsoleKey.LeftArrow:
-                if (_current != _root && _history.Count > 0)
-                {
-                    AscendDirectory();
-                    dirChanged = true;
-                }
+                return AscendIfPossible();
 
-                break;
+            default:
+                return false;
         }
+    }
 
-        return dirChanged;
+    private bool MoveSelectionUp()
+    {
+        if (_selectedIndex > 0)
+        {
+            _selectedIndex--;
+            if (_selectedIndex < _scrollOffset)
+            {
+                _scrollOffset = _selectedIndex;
+            }
+        }
+        return false;
+    }
+
+    private bool MoveSelectionDown(int itemsCount)
+    {
+        if (_selectedIndex < itemsCount - 1)
+        {
+            _selectedIndex++;
+            if (_selectedIndex >= _scrollOffset + PageSize)
+            {
+                _scrollOffset = _selectedIndex - PageSize + 1;
+            }
+        }
+        return false;
+    }
+
+    private bool ExecuteSelection(NavigatorItem selected)
+    {
+        if (selected.IsParentLink)
+        {
+            AscendDirectory();
+            return true;
+        }
+        if (selected.DirNode != null)
+        {
+            DescendDirectory(selected.DirNode);
+            return true;
+        }
+        return false;
+    }
+
+    private bool AscendIfPossible()
+    {
+        if (_current != _root && _history.Count > 0)
+        {
+            AscendDirectory();
+            return true;
+        }
+        return false;
     }
 
     private void DescendDirectory(DirectoryNode subDir)
@@ -412,112 +463,7 @@ public class ExplorerRenderer
             .BorderColor(Color.DeepSkyBlue4)
             .Title($"[bold yellow]hyperdu Explorer[/] - [cyan]{Markup.Escape(current.Path)}[/]{spinnerDisp}");
 
-        int currentSubdirs = current.SubdirectoryCount;
-        int currentFiles = current.FileCount;
-        long currentSize = current.TotalSize;
-
-        if (current.Path != _lastDirPath)
-        {
-            _lastDirPath = current.Path;
-            _lastSubdirs = currentSubdirs;
-            _lastFiles = currentFiles;
-            _lastSize = currentSize;
-
-            _heldAddSubdirs = 0;
-            _heldAddFiles = 0;
-            _heldAddSize = 0;
-
-            _decaySubdirs = 0;
-            _decayFiles = 0;
-            _decaySize = 0;
-        }
-        else
-        {
-            // Subdirectories
-            int diffSubdirs = currentSubdirs - (_lastSubdirs + _heldAddSubdirs);
-            if (diffSubdirs > 0)
-            {
-                _lastSubdirs += _heldAddSubdirs;
-                _heldAddSubdirs = diffSubdirs;
-                _decaySubdirs = 15;
-            }
-            else
-            {
-                if (_decaySubdirs > 0)
-                {
-                    _decaySubdirs--;
-                    if (_decaySubdirs == 0)
-                    {
-                        _lastSubdirs += _heldAddSubdirs;
-                        _heldAddSubdirs = 0;
-                    }
-                }
-            }
-
-            // Files
-            int diffFiles = currentFiles - (_lastFiles + _heldAddFiles);
-            if (diffFiles > 0)
-            {
-                _lastFiles += _heldAddFiles;
-                _heldAddFiles = diffFiles;
-                _decayFiles = 15;
-            }
-            else
-            {
-                if (_decayFiles > 0)
-                {
-                    _decayFiles--;
-                    if (_decayFiles == 0)
-                    {
-                        _lastFiles += _heldAddFiles;
-                        _heldAddFiles = 0;
-                    }
-                }
-            }
-
-            // Size
-            long diffSize = currentSize - (_lastSize + _heldAddSize);
-            if (diffSize > 0)
-            {
-                _lastSize += _heldAddSize;
-                _heldAddSize = diffSize;
-                _decaySize = 15;
-            }
-            else
-            {
-                if (_decaySize > 0)
-                {
-                    _decaySize--;
-                    if (_decaySize == 0)
-                    {
-                        _lastSize += _heldAddSize;
-                        _heldAddSize = 0;
-                    }
-                }
-            }
-
-            // Fallback safety if values decrease (e.g. deletion or recount)
-            if (currentSubdirs < _lastSubdirs)
-            {
-                _lastSubdirs = currentSubdirs;
-                _heldAddSubdirs = 0;
-                _decaySubdirs = 0;
-            }
-
-            if (currentFiles < _lastFiles)
-            {
-                _lastFiles = currentFiles;
-                _heldAddFiles = 0;
-                _decayFiles = 0;
-            }
-
-            if (currentSize < _lastSize)
-            {
-                _lastSize = currentSize;
-                _heldAddSize = 0;
-                _decaySize = 0;
-            }
-        }
+        UpdateDecayAnimations(current);
 
         string subdirsStr = _heldAddSubdirs > 0
             ? $"{_lastSubdirs}+{_heldAddSubdirs}"
@@ -546,7 +492,144 @@ public class ExplorerRenderer
         table.AddColumn("[bold]Visual Usage[/]");
 
         long parentTotalSize = current.TotalSize > 0 ? current.TotalSize : 1;
+        AddTableRows(table, items, scrollOffset, selectedIndex, pageSize, parentTotalSize, scanner, spinner);
+
+        if (items.Count > pageSize)
+        {
+            int visibleCount = Math.Min(pageSize, items.Count - scrollOffset);
+            caption =
+                $"[grey]Showing {scrollOffset + 1}-{scrollOffset + visibleCount} of {items.Count} items. (Scroll active)[/]\n" +
+                caption;
+        }
+
+        table.Caption = new TableTitle(caption, Style.Plain);
+
+        return table;
+    }
+
+    private void UpdateDecayAnimations(DirectoryNode current)
+    {
+        int currentSubdirs = current.SubdirectoryCount;
+        int currentFiles = current.FileCount;
+        long currentSize = current.TotalSize;
+
+        if (current.Path != _lastDirPath)
+        {
+            ResetDecayState(current.Path, currentSubdirs, currentFiles, currentSize);
+        }
+        else
+        {
+            UpdateSubdirsDecay(currentSubdirs);
+            UpdateFilesDecay(currentFiles);
+            UpdateSizeDecay(currentSize);
+            ApplySafetyFallbacks(currentSubdirs, currentFiles, currentSize);
+        }
+    }
+
+    private void ResetDecayState(string path, int subdirs, int files, long size)
+    {
+        _lastDirPath = path;
+        _lastSubdirs = subdirs;
+        _lastFiles = files;
+        _lastSize = size;
+
+        _heldAddSubdirs = 0;
+        _heldAddFiles = 0;
+        _heldAddSize = 0;
+
+        _decaySubdirs = 0;
+        _decayFiles = 0;
+        _decaySize = 0;
+    }
+
+    private void UpdateSubdirsDecay(int currentSubdirs)
+    {
+        int diff = currentSubdirs - (_lastSubdirs + _heldAddSubdirs);
+        if (diff > 0)
+        {
+            _lastSubdirs += _heldAddSubdirs;
+            _heldAddSubdirs = diff;
+            _decaySubdirs = 15;
+        }
+        else if (_decaySubdirs > 0)
+        {
+            _decaySubdirs--;
+            if (_decaySubdirs == 0)
+            {
+                _lastSubdirs += _heldAddSubdirs;
+                _heldAddSubdirs = 0;
+            }
+        }
+    }
+
+    private void UpdateFilesDecay(int currentFiles)
+    {
+        int diff = currentFiles - (_lastFiles + _heldAddFiles);
+        if (diff > 0)
+        {
+            _lastFiles += _heldAddFiles;
+            _heldAddFiles = diff;
+            _decayFiles = 15;
+        }
+        else if (_decayFiles > 0)
+        {
+            _decayFiles--;
+            if (_decayFiles == 0)
+            {
+                _lastFiles += _heldAddFiles;
+                _heldAddFiles = 0;
+            }
+        }
+    }
+
+    private void UpdateSizeDecay(long currentSize)
+    {
+        long diff = currentSize - (_lastSize + _heldAddSize);
+        if (diff > 0)
+        {
+            _lastSize += _heldAddSize;
+            _heldAddSize = diff;
+            _decaySize = 15;
+        }
+        else if (_decaySize > 0)
+        {
+            _decaySize--;
+            if (_decaySize == 0)
+            {
+                _lastSize += _heldAddSize;
+                _heldAddSize = 0;
+            }
+        }
+    }
+
+    private void ApplySafetyFallbacks(int currentSubdirs, int currentFiles, long currentSize)
+    {
+        if (currentSubdirs < _lastSubdirs)
+        {
+            _lastSubdirs = currentSubdirs;
+            _heldAddSubdirs = 0;
+            _decaySubdirs = 0;
+        }
+
+        if (currentFiles < _lastFiles)
+        {
+            _lastFiles = currentFiles;
+            _heldAddFiles = 0;
+            _decayFiles = 0;
+        }
+
+        if (currentSize < _lastSize)
+        {
+            _lastSize = currentSize;
+            _heldAddSize = 0;
+            _decaySize = 0;
+        }
+    }
+
+    private void AddTableRows(Table table, List<NavigatorItem> items, int scrollOffset, int selectedIndex, int pageSize, long parentTotalSize, ParallelScanner? scanner, string spinner)
+    {
         int visibleCount = Math.Min(pageSize, items.Count - scrollOffset);
+        bool parentSelected = selectedIndex >= 0 && selectedIndex < items.Count && items[selectedIndex].IsParentLink;
 
         for (int i = 0; i < visibleCount; i++)
         {
@@ -555,60 +638,9 @@ public class ExplorerRenderer
             bool isSelected = index == selectedIndex;
 
             string selectMarker = isSelected ? "[bold green]>[/]" : " ";
-
-            string rawDisplayName;
-            if (item.IsParentLink)
-            {
-                rawDisplayName = "[bold yellow].. (Parent Directory)[/]";
-            }
-            else if (item.DirNode != null)
-            {
-                string err = item.DirNode.ErrorMessage != null ? $" [red]({item.DirNode.ErrorMessage})[/]" : "";
-                string scanStatus = "";
-                if (scanner != null && scanner.IsScanning && InteractiveNavigator.IsScanningRecursive(item.DirNode))
-                {
-                    bool parentSelected = selectedIndex >= 0 && selectedIndex < items.Count &&
-                                         items[selectedIndex].IsParentLink;
-                    if (parentSelected || isSelected)
-                        scanStatus = $" [bold yellow]⚡[/] [yellow]{spinner}[/]";
-                    else
-                        scanStatus = $" [yellow]{spinner}[/]";
-                }
-
-                rawDisplayName = $"[bold blue]📁 {Markup.Escape(item.DirNode.Name)}[/]{scanStatus}{err}";
-            }
-            else if (item.IsFile)
-            {
-                rawDisplayName = $"[grey]📄 {Markup.Escape(item.Name)}[/]";
-            }
-            else
-            {
-                rawDisplayName = Markup.Escape(item.Name);
-            }
-
-            string displayName = isSelected ? $"[bold reverse]{rawDisplayName}[/]" : rawDisplayName;
-
-            double percent = (double)item.Size / parentTotalSize * 100;
-            string percentStr = item.IsParentLink ? "-" : $"{percent:F1}%";
-
-            string bar = string.Empty;
-            if (!item.IsParentLink)
-            {
-                int barWidth = 10;
-                int filledWidth = (int)Math.Round(percent / 100 * barWidth);
-                filledWidth = Math.Clamp(filledWidth, 0, barWidth);
-                string filled = new string('█', filledWidth);
-                string empty = new string('░', barWidth - filledWidth);
-
-                string barColor = percent switch
-                {
-                    > 70 => "red",
-                    > 40 => "yellow",
-                    _ => "green"
-                };
-
-                bar = $"[{barColor}]{filled}[/][grey]{empty}[/]";
-            }
+            string displayName = GetItemDisplayName(item, isSelected, parentSelected, scanner, spinner);
+            string percentStr = item.IsParentLink ? "-" : $"{((double)item.Size / parentTotalSize * 100):F1}%";
+            string bar = BuildProgressBar(item, parentTotalSize);
 
             table.AddRow(
                 new Markup(selectMarker),
@@ -618,15 +650,64 @@ public class ExplorerRenderer
                 new Markup(bar)
             );
         }
+    }
 
-        if (items.Count > pageSize)
-            caption =
-                $"[grey]Showing {scrollOffset + 1}-{scrollOffset + visibleCount} of {items.Count} items. (Scroll active)[/]\n" +
-                caption;
+    private string GetItemDisplayName(NavigatorItem item, bool isSelected, bool parentSelected, ParallelScanner? scanner, string spinner)
+    {
+        string rawDisplayName;
+        if (item.IsParentLink)
+        {
+            rawDisplayName = "[bold yellow].. (Parent Directory)[/]";
+        }
+        else if (item.DirNode != null)
+        {
+            string err = item.DirNode.ErrorMessage != null ? $" [red]({item.DirNode.ErrorMessage})[/]" : "";
+            string scanStatus = "";
+            if (scanner != null && scanner.IsScanning && InteractiveNavigator.IsScanningRecursive(item.DirNode))
+            {
+                if (parentSelected || isSelected)
+                {
+                    scanStatus = $" [bold yellow]⚡[/] [yellow]{spinner}[/]";
+                }
+                else
+                {
+                    scanStatus = $" [yellow]{spinner}[/]";
+                }
+            }
 
-        table.Caption = new TableTitle(caption, Style.Plain);
+            rawDisplayName = $"[bold blue]📁 {Markup.Escape(item.DirNode.Name)}[/]{scanStatus}{err}";
+        }
+        else if (item.IsFile)
+        {
+            rawDisplayName = $"[grey]📄 {Markup.Escape(item.Name)}[/]";
+        }
+        else
+        {
+            rawDisplayName = Markup.Escape(item.Name);
+        }
 
-        return table;
+        return isSelected ? $"[bold reverse]{rawDisplayName}[/]" : rawDisplayName;
+    }
+
+    private static string BuildProgressBar(NavigatorItem item, long parentTotalSize)
+    {
+        if (item.IsParentLink) return string.Empty;
+
+        double percent = (double)item.Size / parentTotalSize * 100;
+        int barWidth = 10;
+        int filledWidth = (int)Math.Round(percent / 100 * barWidth);
+        filledWidth = Math.Clamp(filledWidth, 0, barWidth);
+        string filled = new string('█', filledWidth);
+        string empty = new string('░', barWidth - filledWidth);
+
+        string barColor = percent switch
+        {
+            > 70 => "red",
+            > 40 => "yellow",
+            _ => "green"
+        };
+
+        return $"[{barColor}]{filled}[/][grey]{empty}[/]";
     }
 
     public static string FormatSize(long bytes)

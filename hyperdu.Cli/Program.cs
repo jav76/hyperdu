@@ -5,47 +5,76 @@ using Spectre.Console;
 
 namespace hyperdu.Cli;
 
-public class Program
+public static class Program
 {
+    private record CommandLineOptions(
+        string TargetPath,
+        int? CustomThreads,
+        bool SkipHidden,
+        List<string> CustomExcludes,
+        bool ShowHelp
+    );
+
+    private static CommandLineOptions ParseArguments(string[] args)
+    {
+        string targetPath = "/";
+        int? customThreads = null;
+        bool skipHidden = false;
+        List<string> customExcludes = new();
+        bool showHelp = false;
+
+        int i = 0;
+        while (i < args.Length)
+        {
+            string arg = args[i];
+            if (arg == "-h" || arg == "--help")
+            {
+                showHelp = true;
+                i++;
+            }
+            else if ((arg == "-t" || arg == "--threads") && i + 1 < args.Length)
+            {
+                if (int.TryParse(args[i + 1], out int threads))
+                {
+                    customThreads = threads;
+                }
+                i += 2;
+            }
+            else if ((arg == "-e" || arg == "--exclude") && i + 1 < args.Length)
+            {
+                customExcludes.Add(args[i + 1]);
+                i += 2;
+            }
+            else if (arg == "--skip-hidden")
+            {
+                skipHidden = true;
+                i++;
+            }
+            else
+            {
+                targetPath = arg;
+                i++;
+            }
+        }
+
+        return new CommandLineOptions(targetPath, customThreads, skipHidden, customExcludes, showHelp);
+    }
+
     public static async Task Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
         AnsiConsole.Write(new FigletText("hyperdu").Color(Color.DeepSkyBlue4));
         AnsiConsole.Write(new Markup("[bold teal]High-Performance Directory Space Analyzer[/]\n\n"));
 
-        string targetPath = "/";
-        int? customThreads = null;
-        bool skipHidden = false;
-        List<string>? customExcludes = null;
+        CommandLineOptions parsed = ParseArguments(args);
 
-        for (int i = 0; i < args.Length; i++)
+        if (parsed.ShowHelp)
         {
-            if (args[i] == "-h" || args[i] == "--help")
-            {
-                PrintHelp();
-                return;
-            }
-
-            if ((args[i] == "-t" || args[i] == "--threads") && i + 1 < args.Length)
-            {
-                if (int.TryParse(args[i + 1], out int threads)) customThreads = threads;
-                i++;
-            }
-            else if ((args[i] == "-e" || args[i] == "--exclude") && i + 1 < args.Length)
-            {
-                if (customExcludes == null) customExcludes = new List<string>();
-                customExcludes.Add(args[i + 1]);
-                i++;
-            }
-            else if (args[i] == "--skip-hidden")
-            {
-                skipHidden = true;
-            }
-            else
-            {
-                targetPath = args[i];
-            }
+            PrintHelp();
+            return;
         }
+
+        string targetPath = parsed.TargetPath;
 
         if (!Directory.Exists(targetPath))
         {
@@ -58,20 +87,25 @@ public class Program
         AnsiConsole.MarkupLine($"Target Directory: [cyan]{Markup.Escape(targetPath)}[/]");
 
         bool isNetwork = IsNetworkMount(targetPath);
-        int finalWorkers = customThreads ??
+        int finalWorkers = parsed.CustomThreads ??
                            (isNetwork ? Math.Max(32, Environment.ProcessorCount * 2) : Environment.ProcessorCount);
 
         ScanOptions options = new ScanOptions
         {
             WorkerCount = finalWorkers,
-            SkipHidden = skipHidden,
+            SkipHidden = parsed.SkipHidden,
             FollowSymlinks = false
         };
-        if (customExcludes != null) options.ExcludedPaths = customExcludes;
+        if (parsed.CustomExcludes.Count > 0)
+        {
+            options.ExcludedPaths = parsed.CustomExcludes;
+        }
 
-        if (isNetwork && customThreads == null)
+        if (isNetwork && parsed.CustomThreads == null)
+        {
             AnsiConsole.MarkupLine(
                 $"[yellow]Network mount detected. Automatically optimized scanner workers to {finalWorkers} to hide latency.[/]");
+        }
 
         AnsiConsole.MarkupLine($"Scanner Workers:  [green]{options.WorkerCount}[/]");
         AnsiConsole.MarkupLine($"Skip Hidden:      [green]{options.SkipHidden}[/]");
@@ -95,6 +129,7 @@ public class Program
             }
             catch (OperationCanceledException)
             {
+                // Expected when scan is canceled.
             }
             catch (Exception ex)
             {
@@ -102,18 +137,22 @@ public class Program
             }
         });
 
-        while (scanner.RootNode == null) await Task.Delay(10);
+        while (scanner.RootNode == null)
+        {
+            await Task.Delay(10);
+        }
 
         InteractiveNavigator navigator = new InteractiveNavigator(scanner.RootNode, scanner);
         navigator.Run();
 
-        scanCts.Cancel();
+        await scanCts.CancelAsync();
         try
         {
             await scanTask;
         }
         catch
         {
+            // Ignore exceptions from task cancellation on cleanup.
         }
     }
 
@@ -150,12 +189,11 @@ public class Program
                 string mountPoint = parts[1];
                 string fsType = parts[2];
 
-                if (fullPath.StartsWith(mountPoint, StringComparison.Ordinal))
-                    if (mountPoint.Length > bestMatchMount.Length)
-                    {
-                        bestMatchMount = mountPoint;
-                        bestMatchFsType = fsType;
-                    }
+                if (fullPath.StartsWith(mountPoint, StringComparison.Ordinal) && mountPoint.Length > bestMatchMount.Length)
+                {
+                    bestMatchMount = mountPoint;
+                    bestMatchFsType = fsType;
+                }
             }
 
             if (!string.IsNullOrEmpty(bestMatchFsType))
@@ -172,6 +210,7 @@ public class Program
         }
         catch
         {
+            // Fallback to false if /proc/mounts cannot be read.
         }
 
         return false;
