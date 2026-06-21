@@ -256,21 +256,28 @@ public class ParallelScanner
         if (localFilesCount > 0) Interlocked.Add(ref _filesScanned, localFilesCount);
         if (localSelfSize > 0) Interlocked.Add(ref _totalBytesFound, localSelfSize);
 
-        if (subdirsToQueue != null && subdirsToQueue.Count > 0)
-        {
-            Interlocked.Add(ref _pendingCount, subdirsToQueue.Count);
-            foreach (DirectoryNode sub in subdirsToQueue) localQueue.Push(sub);
-
-            if (localQueue.Count > 4)
-            {
-                while (localQueue.Count > 2)
-                {
-                    Queue.Enqueue(localQueue.Pop());
-                }
-            }
-        }
+        EnqueueSubdirectories(subdirsToQueue, localQueue);
 
         if (localUpdates.Count >= 50) FlushLocalUpdates(localUpdates);
+    }
+
+    private void EnqueueSubdirectories(List<DirectoryNode>? subdirsToQueue, Stack<DirectoryNode> localQueue)
+    {
+        if (subdirsToQueue == null || subdirsToQueue.Count == 0) return;
+
+        Interlocked.Add(ref _pendingCount, subdirsToQueue.Count);
+        foreach (DirectoryNode sub in subdirsToQueue)
+        {
+            localQueue.Push(sub);
+        }
+
+        if (localQueue.Count > 4)
+        {
+            while (localQueue.Count > 2)
+            {
+                Queue.Enqueue(localQueue.Pop());
+            }
+        }
     }
 
     private static string? ResolveLinkTargetSafely(FileSystemInfo entry)

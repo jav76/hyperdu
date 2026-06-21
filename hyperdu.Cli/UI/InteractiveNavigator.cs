@@ -635,7 +635,7 @@ public class ExplorerRenderer
         }
     }
 
-    private void AddTableRows(Table table, List<NavigatorItem> items, long parentTotalSize, TableRenderContext ctx)
+    private static void AddTableRows(Table table, List<NavigatorItem> items, long parentTotalSize, TableRenderContext ctx)
     {
         int visibleCount = Math.Min(ctx.PageSize, items.Count - ctx.ScrollOffset);
         bool parentSelected = ctx.SelectedIndex >= 0 && ctx.SelectedIndex < items.Count && items[ctx.SelectedIndex].IsParentLink;

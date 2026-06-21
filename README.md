@@ -7,9 +7,12 @@ Designed for massive directory trees and high-latency filesystems, `hyperdu` sca
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20macOS-blue.svg)](#)
 [![Framework](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
-[![Quality Gate Status](https://sonarqube.jav26122.net/api/project_badges/measure?project=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f&metric=alert_status)](https://sonarqube.jav26122.net/dashboard?id=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f)
-
-
+[![Lines of Code](https://sonarqube.jav26122.net/api/project_badges/measure?project=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f&metric=ncloc&token=sqb_26e731c10e8956d411964d75c86646eb43df806e)](https://sonarqube.jav26122.net/dashboard?id=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f)
+[![Maintainability Rating](https://sonarqube.jav26122.net/api/project_badges/measure?project=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f&metric=software_quality_maintainability_rating&token=sqb_26e731c10e8956d411964d75c86646eb43df806e)](https://sonarqube.jav26122.net/dashboard?id=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f)
+[![Reliability Rating](https://sonarqube.jav26122.net/api/project_badges/measure?project=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f&metric=software_quality_reliability_rating&token=sqb_26e731c10e8956d411964d75c86646eb43df806e)](https://sonarqube.jav26122.net/dashboard?id=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f)
+[![Security Rating](https://sonarqube.jav26122.net/api/project_badges/measure?project=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f&metric=software_quality_security_rating&token=sqb_26e731c10e8956d411964d75c86646eb43df806e)](https://sonarqube.jav26122.net/dashboard?id=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f)
+[![Technical Debt](https://sonarqube.jav26122.net/api/project_badges/measure?project=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f&metric=software_quality_maintainability_remediation_effort&token=sqb_26e731c10e8956d411964d75c86646eb43df806e)](https://sonarqube.jav26122.net/dashboard?id=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f)
+[![Quality Gate Status](https://sonarqube.jav26122.net/api/project_badges/measure?project=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f&metric=alert_status&token=sqb_26e731c10e8956d411964d75c86646eb43df806e)](https://sonarqube.jav26122.net/dashboard?id=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f)
 ---
 
 ## User Interface Preview
