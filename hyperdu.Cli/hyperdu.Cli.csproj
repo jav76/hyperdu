@@ -13,6 +13,20 @@
         <TargetFramework>net10.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
+        <PackAsTool>true</PackAsTool>
+        <ToolCommandName>hyperdu</ToolCommandName>
+        <PackageId>hyperdu</PackageId>
+        <Title>hyperdu</Title>
+        <Authors>Jaret Varn</Authors>
+        <Description>A high-performance, cross-platform terminal-based directory space analyzer.</Description>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <RepositoryUrl>https://github.com/jav76/hyperdu</RepositoryUrl>
+        <PackageProjectUrl>https://github.com/jav76/hyperdu</PackageProjectUrl>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
     </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="../README.md" Pack="true" PackagePath="\" />
+    </ItemGroup>
 
 </Project>

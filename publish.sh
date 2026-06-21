@@ -6,7 +6,7 @@ PROJECT="$DIR/hyperdu.Cli/hyperdu.Cli.csproj"
 
 echo "Building cross-platform self-contained executables..."
 
-platforms=("linux-x64" "win-x64" "osx-x64" "osx-arm64")
+platforms=("linux-x64" "linux-arm64" "win-x64" "win-x86" "osx-x64" "osx-arm64")
 
 for platform in "${platforms[@]}"; do
     echo "Publishing for $platform..."

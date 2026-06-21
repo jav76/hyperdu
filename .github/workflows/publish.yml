@@ -14,7 +14,7 @@ jobs:
 
     strategy:
       matrix:
-        platform: [linux-x64, win-x64, osx-x64, osx-arm64]
+        platform: [linux-x64, linux-arm64, win-x64, win-x86, osx-x64, osx-arm64]
 
     steps:
       - name: Checkout Repository
@@ -80,13 +80,66 @@ jobs:
             hyperdu-${{ matrix.platform }}.tar.gz
           if-no-files-found: error
 
+  pack-tool:
+    name: Pack Dotnet Tool
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Parse Version
+        id: versioning
+        shell: bash
+        run: |
+          BASE_VERSION="1.0.0"
+          if [ -f Directory.Build.props ]; then
+            PROP_VERSION=$(grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' Directory.Build.props | head -n 1)
+            if [ -n "$PROP_VERSION" ]; then
+              BASE_VERSION="$PROP_VERSION"
+            fi
+          fi
+          
+          if [[ "${{ github.ref }}" =~ ^refs/tags/v ]]; then
+            TAG_NAME="${{ github.ref_name }}"
+            SEM_VER="${TAG_NAME#v}"
+            echo "version_prefix=${SEM_VER}" >> $GITHUB_OUTPUT
+            echo "version_suffix=" >> $GITHUB_OUTPUT
+          else
+            echo "version_prefix=${BASE_VERSION}" >> $GITHUB_OUTPUT
+            echo "version_suffix=ci.${{ github.run_number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Pack Tool
+        run: |
+          dotnet pack hyperdu.Cli/hyperdu.Cli.csproj \
+            -c Release \
+            -p:VersionPrefix="${{ steps.versioning.outputs.version_prefix }}" \
+            -p:VersionSuffix="${{ steps.versioning.outputs.version_suffix }}" \
+            -p:FileVersion="${{ steps.versioning.outputs.version_prefix }}.${{ github.run_number }}" \
+            -p:InformationalVersion="${{ steps.versioning.outputs.version_prefix }}${{ steps.versioning.outputs.version_suffix != '' && format('-{0}', steps.versioning.outputs.version_suffix) || '' }}+sha.${{ github.sha }}" \
+            -o publish/tool
+
+      - name: Upload Tool Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyperdu-tool
+          path: publish/tool/*.nupkg
+          if-no-files-found: error
+
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, pack-tool]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
+      id-token: write
 
     steps:
       - name: Download Artifacts
@@ -95,12 +148,31 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: NuGet Login
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: 'jav76'
+
+      - name: Publish to NuGet
+        run: |
+          dotnet nuget push artifacts/*.nupkg \
+            --api-key "${{ steps.login.outputs.token }}" \
+            --source "https://api.nuget.org/v3/index.json" \
+            --skip-duplicate
+
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/hyperdu-*.zip
             artifacts/hyperdu-*.tar.gz
+            artifacts/*.nupkg
           generate_release_notes: true
           draft: false
           prerelease: false
