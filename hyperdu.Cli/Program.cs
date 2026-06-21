@@ -60,6 +60,46 @@ public static class Program
         return new CommandLineOptions(targetPath, customThreads, skipHidden, customExcludes, showHelp);
     }
 
+    private static int DetermineWorkerCount(CommandLineOptions parsed, bool isNetwork, bool isRotational)
+    {
+        if (parsed.CustomThreads.HasValue)
+        {
+            return parsed.CustomThreads.Value;
+        }
+        if (isNetwork)
+        {
+            return Math.Max(32, Environment.ProcessorCount * 2);
+        }
+        if (isRotational)
+        {
+            return 1;
+        }
+        return Environment.ProcessorCount;
+    }
+
+    private static void PrintScannerConfig(ScanOptions options, bool isNetwork, bool isRotational, bool isCustomThreads)
+    {
+        if (!isCustomThreads)
+        {
+            if (isNetwork)
+            {
+                AnsiConsole.MarkupLine(
+                    $"[yellow]Network mount detected. Automatically optimized scanner workers to {options.WorkerCount} to hide latency.[/]");
+            }
+            else if (isRotational)
+            {
+                AnsiConsole.MarkupLine(
+                    $"[yellow]Rotational HDD detected. Automatically optimized scanner workers to {options.WorkerCount} to prevent disk head thrashing.[/]");
+            }
+        }
+
+        AnsiConsole.MarkupLine($"Scanner Workers:  [green]{options.WorkerCount}[/]");
+        AnsiConsole.MarkupLine($"Skip Hidden:      [green]{options.SkipHidden}[/]");
+        AnsiConsole.MarkupLine(
+            $"Excluded Paths:   [green]{(options.ExcludedPaths.Count > 0 ? string.Join(", ", options.ExcludedPaths) : "None")}[/]");
+        AnsiConsole.MarkupLine("Press [yellow]Ctrl+C[/] to cancel scan at any time.\n");
+    }
+
     public static async Task Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
@@ -89,23 +129,7 @@ public static class Program
         bool isNetwork = IsNetworkMount(targetPath);
         bool isRotational = !isNetwork && DiskDeviceHelper.IsRotationalDrive(targetPath);
 
-        int finalWorkers;
-        if (parsed.CustomThreads.HasValue)
-        {
-            finalWorkers = parsed.CustomThreads.Value;
-        }
-        else if (isNetwork)
-        {
-            finalWorkers = Math.Max(32, Environment.ProcessorCount * 2);
-        }
-        else if (isRotational)
-        {
-            finalWorkers = 1;
-        }
-        else
-        {
-            finalWorkers = Environment.ProcessorCount;
-        }
+        int finalWorkers = DetermineWorkerCount(parsed, isNetwork, isRotational);
 
         ScanOptions options = new ScanOptions
         {
@@ -118,22 +142,7 @@ public static class Program
             options.ExcludedPaths = parsed.CustomExcludes;
         }
 
-        if (isNetwork && parsed.CustomThreads == null)
-        {
-            AnsiConsole.MarkupLine(
-                $"[yellow]Network mount detected. Automatically optimized scanner workers to {finalWorkers} to hide latency.[/]");
-        }
-        else if (isRotational && parsed.CustomThreads == null)
-        {
-            AnsiConsole.MarkupLine(
-                $"[yellow]Rotational HDD detected. Automatically optimized scanner workers to {finalWorkers} to prevent disk head thrashing.[/]");
-        }
-
-        AnsiConsole.MarkupLine($"Scanner Workers:  [green]{options.WorkerCount}[/]");
-        AnsiConsole.MarkupLine($"Skip Hidden:      [green]{options.SkipHidden}[/]");
-        AnsiConsole.MarkupLine(
-            $"Excluded Paths:   [green]{(options.ExcludedPaths.Count > 0 ? string.Join(", ", options.ExcludedPaths) : "None")}[/]");
-        AnsiConsole.MarkupLine("Press [yellow]Ctrl+C[/] to cancel scan at any time.\n");
+        PrintScannerConfig(options, isNetwork, isRotational, parsed.CustomThreads.HasValue);
 
         // Since scanner workers perform synchronous blocking I/O (stat/network latency),
         // adjust ThreadPool minimum threads to avoid slow ramp-up (ThreadPool starvation).

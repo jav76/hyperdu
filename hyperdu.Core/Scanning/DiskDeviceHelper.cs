@@ -5,10 +5,9 @@ using Microsoft.Win32.SafeHandles;
 
 namespace hyperdu.Core.Scanning;
 
-public static class DiskDeviceHelper
+public static partial class DiskDeviceHelper
 {
     // Windows API Constants
-    private const uint GENERIC_READ = 0x80000000;
     private const uint FILE_SHARE_READ = 0x00000001;
     private const uint FILE_SHARE_WRITE = 0x00000002;
     private const uint OPEN_EXISTING = 3;
@@ -16,25 +15,23 @@ public static class DiskDeviceHelper
 
     // Structs for Windows P/Invoke
     [StructLayout(LayoutKind.Sequential)]
-    private struct STORAGE_PROPERTY_QUERY
+    private struct StoragePropertyQuery
     {
         public uint PropertyId;
         public uint QueryType;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 1)]
-        public byte[] AdditionalParameters;
+        public byte AdditionalParameters;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct DEVICE_SEEK_PENALTY_DESCRIPTOR
+    private struct DeviceSeekPenaltyDescriptor
     {
         public uint Version;
         public uint Size;
-        [MarshalAs(UnmanagedType.I1)]
-        public bool IncursSeekPenalty;
+        public byte IncursSeekPenalty;
     }
 
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-    private static extern SafeFileHandle CreateFile(
+    [LibraryImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    private static partial SafeFileHandle CreateFile(
         string lpFileName,
         uint dwDesiredAccess,
         uint dwShareMode,
@@ -43,13 +40,14 @@ public static class DiskDeviceHelper
         uint dwFlagsAndAttributes,
         IntPtr hTemplateFile);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool DeviceIoControl(
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool DeviceIoControl(
         SafeFileHandle hDevice,
         uint dwIoControlCode,
-        ref STORAGE_PROPERTY_QUERY lpInBuffer,
+        ref StoragePropertyQuery lpInBuffer,
         uint nInBufferSize,
-        ref DEVICE_SEEK_PENALTY_DESCRIPTOR lpOutBuffer,
+        ref DeviceSeekPenaltyDescriptor lpOutBuffer,
         uint nOutBufferSize,
         out uint lpBytesReturned,
         IntPtr lpOverlapped);
@@ -75,7 +73,7 @@ public static class DiskDeviceHelper
             if (string.IsNullOrEmpty(root) || root.Length < 2 || root[1] != ':')
                 return false;
 
-            string volumePath = @"\\.\" + root.Substring(0, 2);
+            string volumePath = string.Concat(@"\\.\", root.AsSpan(0, 2));
 
             using SafeFileHandle handle = CreateFile(
                 volumePath,
@@ -89,14 +87,14 @@ public static class DiskDeviceHelper
             if (handle.IsInvalid)
                 return false;
 
-            var query = new STORAGE_PROPERTY_QUERY
+            var query = new StoragePropertyQuery
             {
                 PropertyId = 7, // StorageDeviceSeekPenaltyProperty
                 QueryType = 0,  // PropertyStandardQuery
-                AdditionalParameters = new byte[1]
+                AdditionalParameters = 0
             };
 
-            var descriptor = new DEVICE_SEEK_PENALTY_DESCRIPTOR();
+            var descriptor = new DeviceSeekPenaltyDescriptor();
             uint bytesReturned = 0;
 
             bool success = DeviceIoControl(
@@ -111,7 +109,7 @@ public static class DiskDeviceHelper
 
             if (success)
             {
-                return descriptor.IncursSeekPenalty;
+                return descriptor.IncursSeekPenalty != 0;
             }
         }
         catch
@@ -175,51 +173,53 @@ public static class DiskDeviceHelper
 
         string name = devicePath.Substring(5); // strip "/dev/"
 
-        // Handle device-mapper / LVM
         if (name.StartsWith("mapper/", StringComparison.Ordinal) || name.StartsWith("dm-", StringComparison.Ordinal))
+        {
+            return ResolveMapperDevice(devicePath, name);
+        }
+
+        if (name.StartsWith("nvme", StringComparison.Ordinal) || name.StartsWith("mmcblk", StringComparison.Ordinal))
+        {
+            return ResolvePartitionedStorageDevice(name);
+        }
+
+        return ResolveStandardDevice(name);
+    }
+
+    private static string ResolveMapperDevice(string devicePath, string name)
+    {
+        if (name.StartsWith("mapper/", StringComparison.Ordinal))
         {
             try
             {
-                if (name.StartsWith("mapper/", StringComparison.Ordinal))
+                var resolvedInfo = File.ResolveLinkTarget(devicePath, true);
+                string resolved = resolvedInfo != null ? resolvedInfo.FullName : devicePath;
+                if (resolved.StartsWith("/dev/", StringComparison.Ordinal))
                 {
-                    var resolvedInfo = File.ResolveLinkTarget(devicePath, true);
-                    string resolved = resolvedInfo != null ? resolvedInfo.FullName : devicePath;
-                    if (resolved.StartsWith("/dev/", StringComparison.Ordinal))
-                    {
-                        name = resolved.Substring(5);
-                    }
+                    return resolved.Substring(5);
                 }
             }
             catch
             {
                 // Ignore symlink resolution failure
             }
-            return name; // e.g. "dm-0"
         }
+        return name; // e.g. "dm-0"
+    }
 
-        // Handle NVMe: nvme0n1p2 -> nvme0n1
-        if (name.StartsWith("nvme", StringComparison.Ordinal))
+    private static string ResolvePartitionedStorageDevice(string name)
+    {
+        int pIndex = name.LastIndexOf('p');
+        int minIndex = name.StartsWith("nvme", StringComparison.Ordinal) ? 4 : 6;
+        if (pIndex > minIndex && char.IsDigit(name[pIndex + 1]))
         {
-            int pIndex = name.LastIndexOf('p');
-            if (pIndex > 4 && char.IsDigit(name[pIndex + 1]))
-            {
-                return name.Substring(0, pIndex);
-            }
-            return name;
+            return name.Substring(0, pIndex);
         }
+        return name;
+    }
 
-        // Handle mmcblk: mmcblk0p2 -> mmcblk0
-        if (name.StartsWith("mmcblk", StringComparison.Ordinal))
-        {
-            int pIndex = name.LastIndexOf('p');
-            if (pIndex > 6 && char.IsDigit(name[pIndex + 1]))
-            {
-                return name.Substring(0, pIndex);
-            }
-            return name;
-        }
-
-        // Handle standard sdX / vdX: sdb2 -> sdb
+    private static string ResolveStandardDevice(string name)
+    {
         int lastCharIndex = name.Length - 1;
         while (lastCharIndex >= 0 && char.IsDigit(name[lastCharIndex]))
         {
@@ -229,7 +229,6 @@ public static class DiskDeviceHelper
         {
             return name.Substring(0, lastCharIndex + 1);
         }
-
         return name;
     }
 }

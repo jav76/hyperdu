@@ -2,10 +2,10 @@ using System.IO;
 
 namespace hyperdu.Core.Scanning;
 
-public struct LightweightEntry
+public readonly struct LightweightEntry
 {
-    public string Name; // Allocated only for directories we want to queue
-    public bool IsDirectory;
-    public long Length;
-    public FileAttributes Attributes;
+    public string Name { get; init; } // Allocated only for directories we want to queue
+    public bool IsDirectory { get; init; }
+    public long Length { get; init; }
+    public FileAttributes Attributes { get; init; }
 }
