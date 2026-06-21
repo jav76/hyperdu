@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -e
 
-# Resolve script directory
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT="$DIR/hyperdu.Cli/hyperdu.Cli.csproj"
 

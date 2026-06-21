@@ -1,22 +1,19 @@
-using System;
-using System.Collections.Generic;
-using System.Threading;
-using System.Threading.Tasks;
+using hyperdu.Core.Models;
 
 namespace hyperdu.Core.Scanning;
 
 public class PrioritizedQueue
 {
-    private readonly Queue<string> _highQueue = new();    // Priority 2 (selected path)
-    private readonly Queue<string> _mediumQueue = new();  // Priority 1 (current path)
-    private readonly Queue<string> _lowQueue = new();     // Priority 0 (other paths)
-    private readonly HashSet<string> _inQueue = new();
-    private readonly SemaphoreSlim _semaphore = new(0);
+    private readonly Queue<DirectoryNode> _highQueue = new(); // Priority 2 (selected path)
+    private readonly HashSet<DirectoryNode> _inQueue = new(ReferenceEqualityComparer.Instance);
     private readonly object _lock = new();
+    private readonly Queue<DirectoryNode> _lowQueue = new(); // Priority 0 (other paths)
+    private readonly Queue<DirectoryNode> _mediumQueue = new(); // Priority 1 (current path)
+    private readonly SemaphoreSlim _semaphore = new(0);
     private bool _isCompleted;
-    private Func<string, int>? _priorityEvaluator;
+    private Func<DirectoryNode, int>? _priorityEvaluator;
 
-    public void SetPriorityEvaluator(Func<string, int> priorityEvaluator)
+    public void SetPriorityEvaluator(Func<DirectoryNode, int> priorityEvaluator)
     {
         lock (_lock)
         {
@@ -34,38 +31,30 @@ public class PrioritizedQueue
             _lowQueue.Clear();
             _inQueue.Clear();
             _isCompleted = false;
-            while (_semaphore.CurrentCount > 0)
-            {
-                _semaphore.Wait(0);
-            }
+            while (_semaphore.CurrentCount > 0) _semaphore.Wait(0);
         }
     }
 
-    public void Enqueue(string path)
+    public void Enqueue(DirectoryNode node)
     {
         lock (_lock)
         {
             if (_isCompleted) return;
-            if (!_inQueue.Add(path)) return; // Already in queue
+            if (!_inQueue.Add(node)) return;
 
-            int priority = _priorityEvaluator?.Invoke(path) ?? 0;
+            int priority = _priorityEvaluator?.Invoke(node) ?? 0;
             if (priority >= 2)
-            {
-                _highQueue.Enqueue(path);
-            }
+                _highQueue.Enqueue(node);
             else if (priority == 1)
-            {
-                _mediumQueue.Enqueue(path);
-            }
+                _mediumQueue.Enqueue(node);
             else
-            {
-                _lowQueue.Enqueue(path);
-            }
+                _lowQueue.Enqueue(node);
         }
+
         _semaphore.Release();
     }
 
-    public async Task<(bool Success, string Path)> DequeueAsync(CancellationToken cancellationToken)
+    public async Task<(bool Success, DirectoryNode? Node)> DequeueAsync(CancellationToken cancellationToken)
     {
         while (true)
         {
@@ -75,27 +64,26 @@ public class PrioritizedQueue
             {
                 if (_highQueue.Count > 0)
                 {
-                    string path = _highQueue.Dequeue();
-                    _inQueue.Remove(path);
-                    return (true, path);
-                }
-                if (_mediumQueue.Count > 0)
-                {
-                    string path = _mediumQueue.Dequeue();
-                    _inQueue.Remove(path);
-                    return (true, path);
-                }
-                if (_lowQueue.Count > 0)
-                {
-                    string path = _lowQueue.Dequeue();
-                    _inQueue.Remove(path);
-                    return (true, path);
+                    DirectoryNode node = _highQueue.Dequeue();
+                    _inQueue.Remove(node);
+                    return (true, node);
                 }
 
-                if (_isCompleted)
+                if (_mediumQueue.Count > 0)
                 {
-                    return (false, string.Empty);
+                    DirectoryNode node = _mediumQueue.Dequeue();
+                    _inQueue.Remove(node);
+                    return (true, node);
                 }
+
+                if (_lowQueue.Count > 0)
+                {
+                    DirectoryNode node = _lowQueue.Dequeue();
+                    _inQueue.Remove(node);
+                    return (true, node);
+                }
+
+                if (_isCompleted) return (false, null);
             }
         }
     }
@@ -106,36 +94,29 @@ public class PrioritizedQueue
         {
             _isCompleted = true;
         }
-        _semaphore.Release(100); // Wake up all waiting worker tasks
+
+        _semaphore.Release(100);
     }
 
     private void ReprioritizeQueue()
     {
         if (_priorityEvaluator == null) return;
 
-        // Collect all items currently in the queues
-        var allItems = new List<string>(_highQueue.Count + _mediumQueue.Count + _lowQueue.Count);
-        
+        List<DirectoryNode> allItems = new List<DirectoryNode>(_highQueue.Count + _mediumQueue.Count + _lowQueue.Count);
+
         while (_highQueue.Count > 0) allItems.Add(_highQueue.Dequeue());
         while (_mediumQueue.Count > 0) allItems.Add(_mediumQueue.Dequeue());
         while (_lowQueue.Count > 0) allItems.Add(_lowQueue.Dequeue());
 
-        // Re-enqueue them into the correct buckets
-        foreach (var path in allItems)
+        foreach (DirectoryNode node in allItems)
         {
-            int priority = _priorityEvaluator(path);
+            int priority = _priorityEvaluator(node);
             if (priority >= 2)
-            {
-                _highQueue.Enqueue(path);
-            }
+                _highQueue.Enqueue(node);
             else if (priority == 1)
-            {
-                _mediumQueue.Enqueue(path);
-            }
+                _mediumQueue.Enqueue(node);
             else
-            {
-                _lowQueue.Enqueue(path);
-            }
+                _lowQueue.Enqueue(node);
         }
     }
 }

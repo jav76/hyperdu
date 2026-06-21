@@ -1,4 +1,4 @@
 <Solution>
-  <Project Path="hyperdu.Cli/hyperdu.Cli.csproj" />
-  <Project Path="hyperdu.Core/hyperdu.Core.csproj" />
+    <Project Path="hyperdu.Cli/hyperdu.Cli.csproj"/>
+    <Project Path="hyperdu.Core/hyperdu.Core.csproj"/>
 </Solution>

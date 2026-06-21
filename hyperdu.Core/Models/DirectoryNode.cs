@@ -1,51 +1,78 @@
-using System.Collections.Generic;
-using System.IO;
-using System.Threading;
-
 namespace hyperdu.Core.Models;
 
 public class DirectoryNode
 {
+    private long _endTicks;
+
+    internal int _fileCount;
+
+    internal int _selfFileCount;
+
+    private int _scanClaimed;
+
+    private long _startTicks;
+
+    internal int _subdirectoryCount;
+
+    internal long _totalSize;
+
+    public DirectoryNode(string path, DirectoryNode? parent = null)
+    {
+        Path = path;
+        Name = System.IO.Path.GetFileName(path) is { Length: > 0 } name ? name : path;
+        Parent = parent;
+    }
+
     public string Path { get; }
     public string Name { get; }
     public DirectoryNode? Parent { get; }
     public long SelfSize { get; set; }
 
-    internal long _totalSize;
     public long TotalSize
     {
         get => Volatile.Read(ref _totalSize);
         set => Volatile.Write(ref _totalSize, value);
     }
 
-    internal int _subdirectoryCount;
     public int SubdirectoryCount
     {
         get => Volatile.Read(ref _subdirectoryCount);
         set => Volatile.Write(ref _subdirectoryCount, value);
     }
 
-    internal int _fileCount;
     public int FileCount
     {
         get => Volatile.Read(ref _fileCount);
         set => Volatile.Write(ref _fileCount, value);
     }
 
+    /// <summary>
+    /// Number of immediate files in this directory (not recursive).
+    /// Files are not stored in memory; this counter enables display without heap allocations.
+    /// </summary>
+    public int SelfFileCount
+    {
+        get => Volatile.Read(ref _selfFileCount);
+        set => Volatile.Write(ref _selfFileCount, value);
+    }
+
     public List<DirectoryNode> Subdirectories { get; } = new();
-    public List<FileNode> Files { get; } = new();
     public string? ErrorMessage { get; set; }
 
     public bool IsScanned { get; set; }
 
-    private long _startTicks;
+    /// <summary>
+    /// Atomically claims this node for scanning. Returns true if this caller won the claim.
+    /// Replaces the scannedPaths ConcurrentDictionary for deduplication.
+    /// </summary>
+    public bool TryClaimForScan() => Interlocked.CompareExchange(ref _scanClaimed, 1, 0) == 0;
+
     public long StartTicks
     {
         get => Volatile.Read(ref _startTicks);
         set => Volatile.Write(ref _startTicks, value);
     }
 
-    private long _endTicks;
     public long EndTicks
     {
         get => Volatile.Read(ref _endTicks);
@@ -70,23 +97,28 @@ public class DirectoryNode
         {
             subs = Subdirectories.ToArray();
         }
-        foreach (var sub in subs)
+
+        foreach (DirectoryNode sub in subs)
         {
             long subMax = sub.GetMaxEndTicksRecursive();
-            if (subMax > maxEnd)
-            {
-                maxEnd = subMax;
-            }
+            if (subMax > maxEnd) maxEnd = subMax;
         }
+
         return maxEnd;
     }
 
-    public DirectoryNode(string path, DirectoryNode? parent = null)
+    /// <summary>
+    /// Recursively trims over-allocated List backing arrays after scanning completes.
+    /// Reclaims ~50% of wasted capacity from List doubling growth strategy.
+    /// </summary>
+    public void Compact()
     {
-        Path = path;
-        Name = System.IO.Path.GetFileName(path) is { Length: > 0 } name ? name : path;
-        Parent = parent;
+        lock (Subdirectories)
+        {
+            Subdirectories.TrimExcess();
+        }
+
+        foreach (DirectoryNode sub in Subdirectories)
+            sub.Compact();
     }
 }
-
-public record FileNode(string Name, long Size);

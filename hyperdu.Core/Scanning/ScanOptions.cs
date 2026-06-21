@@ -1,6 +1,3 @@
-using System;
-using System.Collections.Generic;
-
 namespace hyperdu.Core.Scanning;
 
 public class ScanOptions
