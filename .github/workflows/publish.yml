@@ -66,6 +66,7 @@ jobs:
           fi
 
       - name: Publish Profile (${{ matrix.platform }})
+        shell: bash
         run: |
           dotnet publish hyperdu.Cli/hyperdu.Cli.csproj \
             -c Release \
