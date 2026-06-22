@@ -6,6 +6,7 @@
 
     <ItemGroup>
         <PackageReference Include="Spectre.Console" Version="0.57.0"/>
+        <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All"/>
     </ItemGroup>
 
     <PropertyGroup>
@@ -21,8 +22,15 @@
         <Description>A high-performance, cross-platform terminal-based directory space analyzer.</Description>
         <PackageLicenseExpression>MIT</PackageLicenseExpression>
         <RepositoryUrl>https://github.com/jav76/hyperdu</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
         <PackageProjectUrl>https://github.com/jav76/hyperdu</PackageProjectUrl>
         <PackageReadmeFile>README.md</PackageReadmeFile>
+        
+        <!-- SourceLink Configuration -->
+        <PublishRepositoryUrl>true</PublishRepositoryUrl>
+        <EmbedUntrackedSources>true</EmbedUntrackedSources>
+        <IncludeSymbols>true</IncludeSymbols>
+        <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     </PropertyGroup>
 
     <ItemGroup>
