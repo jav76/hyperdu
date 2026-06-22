@@ -156,7 +156,19 @@ public class InteractiveNavigator
         table.AddColumn("Col2");
         table.AddColumn("Col3");
 
-        string statusText = scanner.IsScanning ? "[bold yellow]Scanning...[/]" : "[bold green]Completed[/]";
+        string statusText;
+        if (scanner.IsPaused)
+        {
+            statusText = "[bold yellow]Paused[/]";
+        }
+        else if (scanner.IsScanning)
+        {
+            statusText = "[bold yellow]Scanning...[/]";
+        }
+        else
+        {
+            statusText = "[bold green]Completed[/]";
+        }
         table.AddRow(
             new Markup($"[bold grey]Dirs:[/] [bold cyan]{scanner.DirectoriesScanned:n0}[/]"),
             new Markup($"[bold grey]Files:[/] [bold cyan]{scanner.FilesScanned:n0}[/]"),
@@ -279,6 +291,10 @@ public class InteractiveNavigator
             case ConsoleKey.LeftArrow:
                 return AscendIfPossible();
 
+            case ConsoleKey.Spacebar:
+                TogglePause();
+                return true;
+
             default:
                 if (keyInfo.Key == ConsoleKey.R || keyInfo.KeyChar == 'r' || keyInfo.KeyChar == 'R')
                 {
@@ -290,6 +306,22 @@ public class InteractiveNavigator
                 }
                 return false;
         }
+    }
+
+    private void TogglePause()
+    {
+        ParallelScanner? activeScanner = _activeRescanScanner ?? _scanner;
+        if (activeScanner == null || !activeScanner.IsScanning) return;
+
+        if (activeScanner.IsPaused)
+        {
+            activeScanner.Resume();
+        }
+        else
+        {
+            activeScanner.Pause();
+        }
+        _needsRefresh = true;
     }
 
     private bool MoveSelectionUp()
@@ -606,7 +638,16 @@ public class ExplorerRenderer
 
         string titleSpinner = "";
         if (scanner != null && scanner.IsScanning && InteractiveNavigator.IsScanningRecursive(current))
-            titleSpinner = $"[bold green]⚡[/] [yellow]{spinner}[/]";
+        {
+            if (scanner.IsPaused)
+            {
+                titleSpinner = "[bold yellow]⏸ Paused[/]";
+            }
+            else
+            {
+                titleSpinner = $"[bold green]⚡[/] [yellow]{spinner}[/]";
+            }
+        }
 
         string spinnerDisp = string.IsNullOrEmpty(titleSpinner) ? "" : $" {titleSpinner}";
         Table table = new Table()
@@ -634,7 +675,7 @@ public class ExplorerRenderer
         string caption = $"[{statsColor}]Total Size: {sizeStr} | Subdirectories: {subdirsStr} | Files: {filesStr}[/]";
         if (statsColor == "#ffffff") caption += $"\n[bold white]Scan Time: {FormatTime(current.TotalScanTime)}[/]";
         caption +=
-            "\n[bold green]↑/↓[/] Navigate | [bold green]Enter[/] Open | [bold green]Backspace/←[/] Up | [bold green]R[/] Rescan | [bold green]Q/Esc[/] Exit";
+            "\n[bold green]↑/↓[/] Navigate | [bold green]Enter[/] Open | [bold green]Backspace/←[/] Up | [bold green]Space[/] Pause/Resume | [bold green]R[/] Rescan | [bold green]Q/Esc[/] Exit";
 
         table.AddColumn("[bold]Sel[/]");
         table.AddColumn("[bold]Name[/]");
@@ -817,7 +858,11 @@ public class ExplorerRenderer
             string scanStatus = "";
             if (scanner != null && scanner.IsScanning && InteractiveNavigator.IsScanningRecursive(item.DirNode))
             {
-                if (parentSelected || isSelected)
+                if (scanner.IsPaused)
+                {
+                    scanStatus = " [bold yellow]⏸[/]";
+                }
+                else if (parentSelected || isSelected)
                 {
                     scanStatus = $" [bold green]⚡[/] [yellow]{spinner}[/]";
                 }

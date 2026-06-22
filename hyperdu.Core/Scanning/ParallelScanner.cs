@@ -21,10 +21,31 @@ public class ParallelScanner
         _options = options ?? new ScanOptions();
     }
 
+    private readonly ManualResetEventSlim _pauseEvent = new ManualResetEventSlim(true);
+
     public DirectoryNode? RootNode { get; private set; }
     public bool IsScanning { get; private set; }
+    public bool IsPaused { get; private set; }
     public ScanOptions Options => _options;
     public PrioritizedQueue Queue { get; } = new();
+
+    public void Pause()
+    {
+        if (IsScanning && !IsPaused)
+        {
+            IsPaused = true;
+            _pauseEvent.Reset();
+        }
+    }
+
+    public void Resume()
+    {
+        if (IsScanning && IsPaused)
+        {
+            IsPaused = false;
+            _pauseEvent.Set();
+        }
+    }
 
     public long DirectoriesScanned => Volatile.Read(ref _directoriesScanned);
     public long FilesScanned => Volatile.Read(ref _filesScanned);
@@ -76,6 +97,8 @@ public class ParallelScanner
         DirectoryNode rootNode = new DirectoryNode(rootPath);
         RootNode = rootNode;
         IsScanning = true;
+        IsPaused = false;
+        _pauseEvent.Set();
 
         try
         {
@@ -154,6 +177,8 @@ public class ParallelScanner
         finally
         {
             IsScanning = false;
+            IsPaused = false;
+            _pauseEvent.Set();
         }
     }
 
@@ -175,6 +200,7 @@ public class ParallelScanner
         {
             while (true)
             {
+                _pauseEvent.Wait(cancellationToken);
                 (bool success, DirectoryNode? node) = await DequeueWorkAsync();
                 if (!success || node == null) break;
 
@@ -234,6 +260,7 @@ public class ParallelScanner
             while (enumerator.MoveNext())
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                _pauseEvent.Wait(cancellationToken);
                 LightweightEntry entry = enumerator.Current;
 
                 bool isSymlink = entry.Attributes.HasFlag(FileAttributes.ReparsePoint);
