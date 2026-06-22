@@ -61,3 +61,8 @@ nunit-*.xml
 
 # SonarQube
 .sonarqube
+
+# JetBrains Rider
+.idea/
+*.sln.DotSettings.user
+

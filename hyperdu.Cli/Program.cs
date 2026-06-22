@@ -19,7 +19,7 @@ public static class Program
 
     private static CommandLineOptions ParseArguments(string[] args)
     {
-        string targetPath = "/";
+        string targetPath = Directory.GetCurrentDirectory();
         int? customThreads = null;
         bool skipHidden = false;
         List<string> customExcludes = new();
