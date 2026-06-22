@@ -645,7 +645,7 @@ public class ExplorerRenderer
             }
             else
             {
-                titleSpinner = $"[bold green]⚡[/] [yellow]{spinner}[/]";
+                titleSpinner = $"[bold green]⚡[/][yellow]{spinner}[/]";
             }
         }
 

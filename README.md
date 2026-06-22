@@ -52,7 +52,8 @@ Press Ctrl+C to cancel scan at any time.
 ╰─────┴───────────────────────────────┴───────────┴────────────┴──────────────╯ 
                    Showing 1-15 of 17 items. (Scroll active)                    
  Total Size: 2.96 TB +6.01 MB | Subdirectories: 998868+35 | Files: 2567013+128  
-            ↑/↓ Navigate | Enter Open | Backspace/← Up | Q/Esc Exit             
+ ↑/↓ Navigate | Enter Open | Backspace/← Up | Space Pause/Resume | R Rescan |  
+                                  Q/Esc Exit
 ```
 
 ---
@@ -62,6 +63,8 @@ Press Ctrl+C to cancel scan at any time.
 * **High-Performance Parallel Scanner**: Leverages a configurable pool of concurrent workers (`WorkerCount`) utilizing programmatically managed non-recursive directory traversal to avoid OS stack limitations.
 * **Dynamic Queue Prioritization**: Uses a custom **3-tier prioritized queue** (High, Medium, Low). As you navigate or hover over folders in the interactive terminal, the queue priorities are re-evaluated instantly to focus scanning threads on your active view.
   * **Prioritization Indicator**: A yellow lightning bolt symbol (`⚡`) is displayed in the UI next to the folder currently selected and any actively prioritized directories. This visually indicates that scanning resources are actively focused on that path, yielding instantaneous response times.
+* **Pause & Resume Scanning**: Pause all active scanners dynamically with the Spacebar to temporarily free up disk/CPU resources, and resume them at any time.
+* **On-Demand Directory Rescanning**: Press `R` to force a rescan of the selected directory (or the current directory if nothing is highlighted) to update its size and contents without restarting the application.
 * **Latency-Aware & Device-Optimized Thread Scaling**: Automatically detects network mounts on Linux (e.g. NFS, CIFS, SMB, SSHFS) and scales up worker thread count (max(32, 2*Cores)) to hide remote latency. It also automatically detects rotational drives (HDDs) and scales the worker thread count down to `1` to prevent disk head thrashing and maximize performance.
 * **Visual Terminal Explorer**: Built with Spectre.Console, featuring:
   * Colorful HSL-based progress/bar graphs representing disk usage percent.
@@ -102,6 +105,8 @@ When running `hyperdu`, you can navigate the disk structure instantly using the 
 | `↑` / `↓` | Select/highlight subdirectories or files. |
 | `Enter` | Descend into the highlighted subdirectory (focuses scanner prioritization here). |
 | `Backspace` / `←` | Ascend to the parent directory. |
+| `Space` | Pause/Resume scanning. |
+| `R` | Rescan/refresh the selected directory (or the current directory if nothing is highlighted). |
 | `Q` / `Esc` | Quit the application gracefully. |
 
 ---
