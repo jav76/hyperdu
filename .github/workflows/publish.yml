@@ -10,11 +10,23 @@ on:
 jobs:
   build:
     name: Build and Publish (${{ matrix.platform }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
 
     strategy:
       matrix:
-        platform: [linux-x64, linux-arm64, win-x64, win-x86, osx-x64, osx-arm64]
+        include:
+          - platform: linux-x64
+            os: ubuntu-latest
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+          - platform: win-x64
+            os: windows-latest
+          - platform: win-x86
+            os: windows-latest
+          - platform: osx-x64
+            os: macos-13
+          - platform: osx-arm64
+            os: macos-14
 
     steps:
       - name: Checkout Repository
@@ -24,6 +36,12 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+
+      - name: Install Native AOT Build Dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang zlib1g-dev
 
       - name: Parse Version
         id: versioning
@@ -52,24 +70,25 @@ jobs:
           dotnet publish hyperdu.Cli/hyperdu.Cli.csproj \
             -c Release \
             -r ${{ matrix.platform }} \
-            --self-contained true \
-            -p:PublishSingleFile=true \
-            -p:PublishTrimmed=true \
+            -p:PublishAot=true \
             -p:VersionPrefix="${{ steps.versioning.outputs.version_prefix }}" \
             -p:VersionSuffix="${{ steps.versioning.outputs.version_suffix }}" \
             -p:FileVersion="${{ steps.versioning.outputs.version_prefix }}.${{ github.run_number }}" \
             -p:InformationalVersion="${{ steps.versioning.outputs.version_prefix }}${{ steps.versioning.outputs.version_suffix != '' && format('-{0}', steps.versioning.outputs.version_suffix) || '' }}+sha.${{ github.sha }}" \
             -o publish/${{ matrix.platform }}
 
-      - name: Compress Executables
+      - name: Compress Executables (Windows)
+        if: ${{ startsWith(matrix.platform, 'win-') }}
+        shell: pwsh
+        run: |
+          Compress-Archive -Path publish/${{ matrix.platform }}/* -DestinationPath hyperdu-${{ matrix.platform }}.zip
+
+      - name: Compress Executables (Non-Windows)
+        if: ${{ !startsWith(matrix.platform, 'win-') }}
         shell: bash
         run: |
           cd publish/${{ matrix.platform }}
-          if [[ "${{ matrix.platform }}" == win-* ]]; then
-            zip -j ../../hyperdu-${{ matrix.platform }}.zip *
-          else
-            tar -czf ../../hyperdu-${{ matrix.platform }}.tar.gz *
-          fi
+          tar -czf ../../hyperdu-${{ matrix.platform }}.tar.gz *
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4

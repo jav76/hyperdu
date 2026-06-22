@@ -1,5 +1,9 @@
 <Project>
     <PropertyGroup>
         <VersionPrefix>0.1.0</VersionPrefix>
+        <Company>Jaret Varn</Company>
+        <Product>hyperdu</Product>
+        <Copyright>Copyright © 2026 Jaret Varn</Copyright>
+        <Description>A high-performance, cross-platform terminal-based directory space analyzer.</Description>
     </PropertyGroup>
 </Project>
