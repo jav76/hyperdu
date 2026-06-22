@@ -5,6 +5,7 @@
 Designed for massive directory trees and high-latency filesystems, `hyperdu` scans your disk using a custom multi-threaded engine that **dynamically prioritizes scan queues** based on your interactive navigation. If you focus on a subdirectory in the UI, the background scanning workers immediately deprioritize other directories and shift their CPU/disk I/O resources to scan your current view first.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![NuGet Version](https://img.shields.io/nuget/v/hyperdu.svg)](https://www.nuget.org/packages/hyperdu/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20macOS-blue.svg)](#)
 [![Framework](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
 [![Lines of Code](https://sonarqube.jav26122.net/api/project_badges/measure?project=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f&metric=ncloc&token=sqb_26e731c10e8956d411964d75c86646eb43df806e)](https://sonarqube.jav26122.net/dashboard?id=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f)
@@ -61,7 +62,7 @@ Press Ctrl+C to cancel scan at any time.
 * **High-Performance Parallel Scanner**: Leverages a configurable pool of concurrent workers (`WorkerCount`) utilizing programmatically managed non-recursive directory traversal to avoid OS stack limitations.
 * **Dynamic Queue Prioritization**: Uses a custom **3-tier prioritized queue** (High, Medium, Low). As you navigate or hover over folders in the interactive terminal, the queue priorities are re-evaluated instantly to focus scanning threads on your active view.
   * **Prioritization Indicator**: A yellow lightning bolt symbol (`⚡`) is displayed in the UI next to the folder currently selected and any actively prioritized directories. This visually indicates that scanning resources are actively focused on that path, yielding instantaneous response times.
-* **Latency-Aware Network Mount Detection**: Automatically detects network mounts on Linux (e.g. NFS, CIFS, SMB, SSHFS) and scales up the worker thread count to hide remote network latency.
+* **Latency-Aware & Device-Optimized Thread Scaling**: Automatically detects network mounts on Linux (e.g. NFS, CIFS, SMB, SSHFS) and scales up worker thread count (max(32, 2*Cores)) to hide remote latency. It also automatically detects rotational drives (HDDs) and scales the worker thread count down to `1` to prevent disk head thrashing and maximize performance.
 * **Visual Terminal Explorer**: Built with Spectre.Console, featuring:
   * Colorful HSL-based progress/bar graphs representing disk usage percent.
   * Real-time "+X size" / "+Y files" live animations for folders being actively scanned.
@@ -110,7 +111,19 @@ When running `hyperdu`, you can navigate the disk structure instantly using the 
 ### Prerequisites
 * [.NET 10.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0)
 
-### Clone & Build
+### Install via NuGet (.NET Tool)
+
+You can install `hyperdu` directly as a .NET global tool:
+```bash
+dotnet tool install -g hyperdu
+```
+
+Once installed, you can run the tool from anywhere:
+```bash
+hyperdu [target_path] [options]
+```
+
+### Clone & Build (Manual)
 ```bash
 git clone https://github.com/jav76/hyperdu.git
 cd hyperdu
@@ -130,7 +143,9 @@ The project includes a `publish.sh` script to build self-contained, trimmed, sin
 ```
 This generates binaries in the `publish/` directory for the following targets:
 - `linux-x64`
+- `linux-arm64`
 - `win-x64`
+- `win-x86`
 - `osx-x64`
 - `osx-arm64`
 
@@ -145,8 +160,9 @@ hyperdu [path] [options]
 | Option | Alias | Description | Default |
 |---|---|---|---|
 | `--help` | `-h` | Prints help and usage instructions. | - |
-| `--threads <N>` | `-t <N>` | Explicitly sets the number of concurrent worker threads. | Logical core count (scales to max(32, 2*Cores) on network mounts) |
-| `--exclude <path>` | `-e <path>` | Excludes specific paths/sub-paths from scanning (can specify multiple times). | `/mnt/` |
+| `--version` | `-v` | Prints version information. | - |
+| `--threads <N>` | `-t <N>` | Explicitly sets the number of concurrent worker threads. | Logical core count (scales to max(32, 2*Cores) on network mounts, and down to 1 on rotational HDDs) |
+| `--exclude <path>` | `-e <path>` | Excludes specific paths/sub-paths from scanning (can specify multiple times). | None |
 | `--skip-hidden` | - | Skips hidden and system files/folders during traversal. | `false` |
 
 ---

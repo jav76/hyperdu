@@ -214,7 +214,7 @@ public static class Program
         AnsiConsole.MarkupLine(
             "  [cyan]-t, --threads <N>[/]  Set the number of concurrent worker threads (default: CPU logical cores)");
         AnsiConsole.MarkupLine(
-            "  [cyan]-e, --exclude <path>[/] Add a path to the exclusion list (can be specified multiple times. default: /mnt/)");
+            "  [cyan]-e, --exclude <path>[/] Add a path to the exclusion list (can be specified multiple times. default: None)");
         AnsiConsole.MarkupLine("  [cyan]--skip-hidden[/]       Skip hidden and system files/folders");
     }
 
