@@ -463,7 +463,7 @@ public class ExplorerRenderer
 
         string titleSpinner = "";
         if (scanner != null && scanner.IsScanning && InteractiveNavigator.IsScanningRecursive(current))
-            titleSpinner = $"[bold yellow]⚡[/] [yellow]{spinner}[/]";
+            titleSpinner = $"[bold green]⚡[/] [yellow]{spinner}[/]";
 
         string spinnerDisp = string.IsNullOrEmpty(titleSpinner) ? "" : $" {titleSpinner}";
         Table table = new Table()
@@ -676,7 +676,7 @@ public class ExplorerRenderer
             {
                 if (parentSelected || isSelected)
                 {
-                    scanStatus = $" [bold yellow]⚡[/] [yellow]{spinner}[/]";
+                    scanStatus = $" [bold green]⚡[/] [yellow]{spinner}[/]";
                 }
                 else
                 {
