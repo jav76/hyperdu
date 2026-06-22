@@ -23,6 +23,7 @@ public class ParallelScanner
 
     public DirectoryNode? RootNode { get; private set; }
     public bool IsScanning { get; private set; }
+    public ScanOptions Options => _options;
     public PrioritizedQueue Queue { get; } = new();
 
     public long DirectoriesScanned => Volatile.Read(ref _directoriesScanned);

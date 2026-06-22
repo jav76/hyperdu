@@ -9,7 +9,7 @@ public class InteractiveNavigator
 {
     private const int PageSize = 15; // Limit the number of visible items to avoid scroll overflow in small terminals
     private readonly Stack<DirectoryNode> _history = new();
-    private readonly DirectoryNode _root;
+    private DirectoryNode _root;
     private readonly ParallelScanner? _scanner;
     private DirectoryNode _current;
 
@@ -19,6 +19,9 @@ public class InteractiveNavigator
     private DirectoryNode? _lastPrioritySelectedNode;
     private int _scrollOffset;
     private int _selectedIndex;
+    private bool _needsRefresh;
+    private CancellationTokenSource? _rescanCts;
+    private ParallelScanner? _activeRescanScanner;
 
     public InteractiveNavigator(DirectoryNode root, ParallelScanner? scanner = null)
     {
@@ -42,7 +45,7 @@ public class InteractiveNavigator
                 {
                     while (true)
                     {
-                        if (_scanner != null && _scanner.IsScanning)
+                        if ((_scanner != null && _scanner.IsScanning) || (_activeRescanScanner != null && _activeRescanScanner.IsScanning))
                         {
                             UpdateScannerPriority(items);
                         }
@@ -50,7 +53,13 @@ public class InteractiveNavigator
                         bool dirChanged = ProcessConsoleInput(items, out bool exit);
                         if (exit) return;
 
-                        if (dirChanged || (_scanner != null && _scanner.IsScanning))
+                        bool needsRefresh = _needsRefresh;
+                        if (needsRefresh)
+                        {
+                            _needsRefresh = false;
+                        }
+
+                        if (dirChanged || (_scanner != null && _scanner.IsScanning) || (_activeRescanScanner != null && _activeRescanScanner.IsScanning) || needsRefresh)
                         {
                             AdjustSelectionAfterDirChange(ref items);
                         }
@@ -64,6 +73,8 @@ public class InteractiveNavigator
         }
         finally
         {
+            _rescanCts?.Cancel();
+            _rescanCts?.Dispose();
             AnsiConsole.Cursor.Show(true);
             AnsiConsole.Clear();
             AnsiConsole.Write(new Markup("[bold green]Thank you for using hyperdu![/]\n"));
@@ -77,13 +88,13 @@ public class InteractiveNavigator
         while (Console.KeyAvailable)
         {
             ConsoleKeyInfo keyInfo = Console.ReadKey(true);
-            if (keyInfo.Key == ConsoleKey.Q || keyInfo.Key == ConsoleKey.Escape)
+            if (keyInfo.Key == ConsoleKey.Q || keyInfo.KeyChar == 'q' || keyInfo.KeyChar == 'Q' || keyInfo.Key == ConsoleKey.Escape)
             {
                 exit = true;
                 return false;
             }
 
-            if (HandleKey(keyInfo.Key, items))
+            if (HandleKey(keyInfo, items))
             {
                 dirChanged = true;
             }
@@ -130,10 +141,11 @@ public class InteractiveNavigator
 
     private IRenderable CreateCombinedLayout(ExplorerRenderer renderer, List<NavigatorItem> items)
     {
-        Table explorerTable = renderer.Render(_current, items, _selectedIndex, _scrollOffset, PageSize, _scanner);
-        if (_scanner == null || !_scanner.IsScanning) return explorerTable;
+        ParallelScanner? activeScanner = _activeRescanScanner ?? _scanner;
+        Table explorerTable = renderer.Render(_current, items, _selectedIndex, _scrollOffset, PageSize, activeScanner);
+        if (activeScanner == null || !activeScanner.IsScanning) return explorerTable;
 
-        Panel progressPanel = CreateProgressPanel(_scanner);
+        Panel progressPanel = CreateProgressPanel(activeScanner);
         return new Rows(progressPanel, explorerTable);
     }
 
@@ -250,9 +262,9 @@ public class InteractiveNavigator
         return files;
     }
 
-    private bool HandleKey(ConsoleKey key, List<NavigatorItem> items)
+    private bool HandleKey(ConsoleKeyInfo keyInfo, List<NavigatorItem> items)
     {
-        switch (key)
+        switch (keyInfo.Key)
         {
             case ConsoleKey.UpArrow:
                 return MoveSelectionUp();
@@ -268,6 +280,14 @@ public class InteractiveNavigator
                 return AscendIfPossible();
 
             default:
+                if (keyInfo.Key == ConsoleKey.R || keyInfo.KeyChar == 'r' || keyInfo.KeyChar == 'R')
+                {
+                    if (_scanner != null && (_activeRescanScanner == null || !_activeRescanScanner.IsScanning))
+                    {
+                        StartRescan(items);
+                        return true;
+                    }
+                }
                 return false;
         }
     }
@@ -391,7 +411,8 @@ public class InteractiveNavigator
 
     private void UpdateScannerPriority(List<NavigatorItem> items)
     {
-        if (_scanner == null || !_scanner.IsScanning)
+        ParallelScanner? scanner = _activeRescanScanner ?? _scanner;
+        if (scanner == null || !scanner.IsScanning)
             return;
 
         DirectoryNode? selectedNode = null;
@@ -412,12 +433,134 @@ public class InteractiveNavigator
         DirectoryNode capturedCurrent = _current;
         DirectoryNode? capturedSelected = selectedNode;
 
-        _scanner.Queue.SetPriorityEvaluator(node =>
+        scanner.Queue.SetPriorityEvaluator(node =>
         {
             if (capturedSelected != null && IsDescendantOrSelf(node, capturedSelected)) return 2;
             if (IsDescendantOrSelf(node, capturedCurrent)) return 1;
             return 0;
         });
+    }
+
+    private DirectoryNode? GetDirectoryToRescan(List<NavigatorItem> items)
+    {
+        if (_selectedIndex < 0 || _selectedIndex >= items.Count)
+        {
+            return _current;
+        }
+
+        NavigatorItem selected = items[_selectedIndex];
+        if (selected.DirNode != null)
+        {
+            return selected.DirNode;
+        }
+
+        return _current;
+    }
+
+    private void ResetNodeStatistics(DirectoryNode node)
+    {
+        long oldSize = node.TotalSize;
+        int oldFiles = node.FileCount;
+        int oldSubdirs = node.SubdirectoryCount;
+
+        node.TotalSize = 0;
+        node.FileCount = 0;
+        node.SubdirectoryCount = 0;
+        node.SelfSize = 0;
+        node.SelfFileCount = 0;
+        node.IsScanned = false;
+        node.ErrorMessage = null;
+
+        lock (node.Subdirectories)
+        {
+            node.Subdirectories.Clear();
+        }
+
+        DirectoryNode? currentAncestor = node.Parent;
+        while (currentAncestor != null)
+        {
+            currentAncestor.AddDelta(-oldSize, -oldSubdirs, -oldFiles);
+            currentAncestor = currentAncestor.Parent;
+        }
+    }
+
+    private void StartRescan(List<NavigatorItem> items)
+    {
+        DirectoryNode? targetNode = GetDirectoryToRescan(items);
+        if (targetNode == null) return;
+
+        _cachedFileDirPath = null;
+        _cachedFileList = null;
+
+        ResetNodeStatistics(targetNode);
+        _needsRefresh = true;
+
+        _rescanCts?.Cancel();
+        _rescanCts?.Dispose();
+        _rescanCts = new CancellationTokenSource();
+        CancellationToken token = _rescanCts.Token;
+
+        var rescanScanner = new ParallelScanner(_scanner?.Options);
+        _activeRescanScanner = rescanScanner;
+
+        Task.Run(async () =>
+        {
+            try
+            {
+                DirectoryNode newSubNode = await rescanScanner.ScanAsync(targetNode.Path, null, token);
+                ReplaceNodeInTree(targetNode, newSubNode);
+            }
+            catch (Exception)
+            {
+                // Ignore cancellation and other scan errors.
+            }
+            finally
+            {
+                _needsRefresh = true;
+                if (ReferenceEquals(_activeRescanScanner, rescanScanner))
+                {
+                    _activeRescanScanner = null;
+                }
+            }
+        });
+    }
+
+    private void ReplaceNodeInTree(DirectoryNode oldNode, DirectoryNode newNode)
+    {
+        DirectoryNode? parent = oldNode.Parent;
+        newNode.Parent = parent;
+
+        long sizeDelta = newNode.TotalSize - oldNode.TotalSize;
+        int filesDelta = newNode.FileCount - oldNode.FileCount;
+        int subdirsDelta = newNode.SubdirectoryCount - oldNode.SubdirectoryCount;
+
+        if (parent != null)
+        {
+            lock (parent.Subdirectories)
+            {
+                int index = parent.Subdirectories.IndexOf(oldNode);
+                if (index >= 0)
+                {
+                    parent.Subdirectories[index] = newNode;
+                }
+            }
+
+            DirectoryNode? currentAncestor = parent;
+            while (currentAncestor != null)
+            {
+                currentAncestor.AddDelta(sizeDelta, subdirsDelta, filesDelta);
+                currentAncestor = currentAncestor.Parent;
+            }
+        }
+        else
+        {
+            _root = newNode;
+        }
+
+        if (ReferenceEquals(_current, oldNode))
+        {
+            _current = newNode;
+        }
     }
 }
 
@@ -491,7 +634,7 @@ public class ExplorerRenderer
         string caption = $"[{statsColor}]Total Size: {sizeStr} | Subdirectories: {subdirsStr} | Files: {filesStr}[/]";
         if (statsColor == "#ffffff") caption += $"\n[bold white]Scan Time: {FormatTime(current.TotalScanTime)}[/]";
         caption +=
-            "\n[bold green]↑/↓[/] Navigate | [bold green]Enter[/] Open | [bold green]Backspace/←[/] Up | [bold green]Q/Esc[/] Exit";
+            "\n[bold green]↑/↓[/] Navigate | [bold green]Enter[/] Open | [bold green]Backspace/←[/] Up | [bold green]R[/] Rescan | [bold green]Q/Esc[/] Exit";
 
         table.AddColumn("[bold]Sel[/]");
         table.AddColumn("[bold]Name[/]");

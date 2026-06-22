@@ -25,7 +25,7 @@ public class DirectoryNode
 
     public string Path { get; }
     public string Name { get; }
-    public DirectoryNode? Parent { get; }
+    public DirectoryNode? Parent { get; set; }
     public long SelfSize { get; set; }
 
     public long TotalSize
@@ -120,5 +120,15 @@ public class DirectoryNode
 
         foreach (DirectoryNode sub in Subdirectories)
             sub.Compact();
+    }
+
+    /// <summary>
+    /// Thread-safely updates the size, subdirectory count, and file count of this node.
+    /// </summary>
+    public void AddDelta(long sizeDelta, int subdirsDelta, int filesDelta)
+    {
+        if (sizeDelta != 0) Interlocked.Add(ref _totalSize, sizeDelta);
+        if (subdirsDelta != 0) Interlocked.Add(ref _subdirectoryCount, subdirsDelta);
+        if (filesDelta != 0) Interlocked.Add(ref _fileCount, filesDelta);
     }
 }
