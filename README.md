@@ -6,6 +6,7 @@ Designed for massive directory trees and high-latency filesystems, `hyperdu` sca
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![NuGet Version](https://img.shields.io/nuget/v/hyperdu.svg)](https://www.nuget.org/packages/hyperdu/)
+[![WinGet Package](https://img.shields.io/winget/v/JaretVarn.hyperdu)](https://github.com/microsoft/winget-pkgs/tree/master/manifests/j/JaretVarn/hyperdu)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20macOS-blue.svg)](#)
 [![Framework](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
 [![Lines of Code](https://sonarqube.jav26122.net/api/project_badges/measure?project=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f&metric=ncloc&token=sqb_26e731c10e8956d411964d75c86646eb43df806e)](https://sonarqube.jav26122.net/dashboard?id=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f)
@@ -115,6 +116,13 @@ When running `hyperdu`, you can navigate the disk structure instantly using the 
 
 ### Prerequisites
 * [.NET 10.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0)
+
+### Install via WinGet (Windows)
+
+You can install `hyperdu` using the Windows Package Manager (WinGet):
+```powershell
+winget install JaretVarn.hyperdu
+```
 
 ### Install via NuGet (.NET Tool)
 
