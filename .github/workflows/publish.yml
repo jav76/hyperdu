@@ -213,10 +213,7 @@ jobs:
           prerelease: false
 
       - name: Update WinGet Package
-        uses: microsoft/winget-create-action@v2
+        uses: vedantmgoyal9/winget-releaser@v2
         with:
-          package-identifier: JaretVarn.hyperdu
+          identifier: JaretVarn.hyperdu
           token: ${{ secrets.WINGET_TOKEN }}
-          urls: |
-            https://github.com/jav76/hyperdu/releases/download/${{ github.ref_name }}/hyperdu-win-x64.zip
-            https://github.com/jav76/hyperdu/releases/download/${{ github.ref_name }}/hyperdu-win-x86.zip
