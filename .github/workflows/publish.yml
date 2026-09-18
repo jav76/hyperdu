@@ -8,9 +8,36 @@ on:
       - 'v*'
 
 jobs:
+  # Creates the draft release up front so each build job can upload its own
+  # assets straight to it, instead of round-tripping hundreds of MB through
+  # artifact storage. Always runs (a skipped job would skip its dependents);
+  # the step inside is what is tag-gated.
+  prepare-release:
+    name: Prepare Draft Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create draft release if missing
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; assets will be added to it."
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --draft --generate-notes --title "$TAG"
+          fi
+
   build:
     name: Build and Publish (${{ matrix.platform }})
+    needs: [prepare-release]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
 
     strategy:
       matrix:
@@ -91,13 +118,33 @@ jobs:
           cd publish/${{ matrix.platform }}
           tar -czf ../../hyperdu-${{ matrix.platform }}.tar.gz *
 
-      - name: Upload Artifact
+      - name: Upload Release Assets (tag builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          found=()
+          for f in "hyperdu-${{ matrix.platform }}.zip" "hyperdu-${{ matrix.platform }}.tar.gz"; do
+            [ -f "$f" ] && found+=("$f")
+          done
+          if [ ${#found[@]} -eq 0 ]; then
+            echo "::error::No package produced for ${{ matrix.platform }}"
+            exit 1
+          fi
+          gh release upload "$TAG" "${found[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Upload CI Artifact (non-tag builds)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: actions/upload-artifact@v4
         with:
           name: hyperdu-${{ matrix.platform }}
           path: |
             hyperdu-${{ matrix.platform }}.zip
             hyperdu-${{ matrix.platform }}.tar.gz
+          retention-days: 7
           if-no-files-found: error
 
   pack-tool:
@@ -150,6 +197,7 @@ jobs:
         with:
           name: hyperdu-tool
           path: publish/tool/*.nupkg
+          retention-days: 7
           if-no-files-found: error
 
   release:
@@ -163,11 +211,13 @@ jobs:
       packages: write
 
     steps:
-      - name: Download Artifacts
+      # Only the nupkg still travels through artifact storage; the platform
+      # binaries are already attached to the draft release by the build jobs.
+      - name: Download Tool Package
         uses: actions/download-artifact@v4
         with:
+          name: hyperdu-tool
           path: artifacts
-          merge-multiple: true
 
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
@@ -201,22 +251,34 @@ jobs:
             --api-key "${{ secrets.GITHUB_TOKEN }}" \
             --skip-duplicate
 
-      - name: Create Release and Upload Assets
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            artifacts/hyperdu-*.zip
-            artifacts/hyperdu-*.tar.gz
-            artifacts/*.nupkg
-          generate_release_notes: true
-          draft: false
-          prerelease: false
+      - name: Attach Tool Package and Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" artifacts/*.nupkg --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          {
+            echo "### Published $TAG"
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[] | "- \(.name) (\(.size) bytes)"'
+          } >> "$GITHUB_STEP_SUMMARY"
 
+  # Package-manager submission is a nice-to-have. In its own non-blocking job,
+  # a broken or renamed action can no longer stop the release assets from being
+  # published - which is exactly how v1.1.1 shipped with zero assets.
+  winget:
+    name: Update WinGet Package
+    runs-on: ubuntu-latest
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    continue-on-error: true
+    steps:
       - name: Update WinGet Package
-        uses: microsoft/winget-create-action@v2
+        uses: vedantmgoyal9/winget-releaser@v2
         with:
-          package-identifier: JaretVarn.hyperdu
+          identifier: JaretVarn.hyperdu
+          release-tag: ${{ github.ref_name }}
+          installers-regex: 'hyperdu-win-(x64|x86)\.zip$'
           token: ${{ secrets.WINGET_TOKEN }}
-          urls: |
-            https://github.com/jav76/hyperdu/releases/download/${{ github.ref_name }}/hyperdu-win-x64.zip
-            https://github.com/jav76/hyperdu/releases/download/${{ github.ref_name }}/hyperdu-win-x86.zip
