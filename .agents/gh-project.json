@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "repo": "jav76/hyperdu",
+  "project": {
+    "owner": "jav76",
+    "number": 4,
+    "id": "PVT_kwHOBC_e9M4BpoTa",
+    "title": "hyperdu",
+    "url": "https://github.com/users/jav76/projects/4"
+  },
+  "status_field": "Status",
+  "states": {
+    "backlog": "Todo",
+    "ready": "Todo",
+    "in_progress": "In Progress",
+    "in_review": null,
+    "done": "Done"
+  },
+  "priority_field": null,
+  "size_field": null,
+  "fields": {
+    "Title": {
+      "id": "PVTF_lAHOBC_e9M4BpoTazhoDCrc",
+      "type": "TITLE"
+    },
+    "Assignees": {
+      "id": "PVTF_lAHOBC_e9M4BpoTazhoDCrg",
+      "type": "ASSIGNEES"
+    },
+    "Status": {
+      "id": "PVTSSF_lAHOBC_e9M4BpoTazhoDCrk",
+      "type": "SINGLE_SELECT",
+      "options": [
+        {
+          "name": "Todo",
+          "id": "f75ad846"
+        },
+        {
+          "name": "In Progress",
+          "id": "47fc9ee4"
+        },
+        {
+          "name": "Done",
+          "id": "98236657"
+        }
+      ]
+    },
+    "Labels": {
+      "id": "PVTF_lAHOBC_e9M4BpoTazhoDCro",
+      "type": "LABELS"
+    },
+    "Linked pull requests": {
+      "id": "PVTF_lAHOBC_e9M4BpoTazhoDCrs",
+      "type": "LINKED_PULL_REQUESTS"
+    },
+    "Milestone": {
+      "id": "PVTF_lAHOBC_e9M4BpoTazhoDCrw",
+      "type": "MILESTONE"
+    },
+    "Repository": {
+      "id": "PVTF_lAHOBC_e9M4BpoTazhoDCr0",
+      "type": "REPOSITORY"
+    },
+    "Reviewers": {
+      "id": "PVTF_lAHOBC_e9M4BpoTazhoDCr8",
+      "type": "REVIEWERS"
+    },
+    "Parent issue": {
+      "id": "PVTF_lAHOBC_e9M4BpoTazhoDCsA",
+      "type": "PARENT_ISSUE"
+    },
+    "Sub-issues progress": {
+      "id": "PVTF_lAHOBC_e9M4BpoTazhoDCsE",
+      "type": "SUB_ISSUES_PROGRESS"
+    },
+    "Created": {
+      "id": "PVTF_lAHOBC_e9M4BpoTazhoDCsI",
+      "type": "CREATED"
+    },
+    "Updated": {
+      "id": "PVTF_lAHOBC_e9M4BpoTazhoDCsM",
+      "type": "UPDATED"
+    },
+    "Closed": {
+      "id": "PVTF_lAHOBC_e9M4BpoTazhoDCsQ",
+      "type": "CLOSED"
+    }
+  }
+}
