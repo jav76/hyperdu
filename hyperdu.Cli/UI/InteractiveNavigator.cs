@@ -67,7 +67,7 @@ public class InteractiveNavigator
                         IRenderable layout = CreateCombinedLayout(renderer, items);
                         ctx.UpdateTarget(layout);
 
-                        await Task.Delay(100);
+                        await Task.Delay(100, CancellationToken.None);
                     }
                 }).GetAwaiter().GetResult();
         }
@@ -282,13 +282,11 @@ public class InteractiveNavigator
                 return true;
 
             default:
-                if (keyInfo.Key == ConsoleKey.R || keyInfo.KeyChar == 'r' || keyInfo.KeyChar == 'R')
+                if ((keyInfo.Key == ConsoleKey.R || keyInfo.KeyChar == 'r' || keyInfo.KeyChar == 'R') &&
+                    _scanner != null && (_activeRescanScanner == null || !_activeRescanScanner.IsScanning))
                 {
-                    if (_scanner != null && (_activeRescanScanner == null || !_activeRescanScanner.IsScanning))
-                    {
-                        StartRescan(items);
-                        return true;
-                    }
+                    StartRescan(items);
+                    return true;
                 }
                 return false;
         }
@@ -475,7 +473,7 @@ public class InteractiveNavigator
         return _current;
     }
 
-    private void ResetNodeStatistics(DirectoryNode node)
+    private static void ResetNodeStatistics(DirectoryNode node)
     {
         long oldSize = node.TotalSize;
         int oldFiles = node.FileCount;
@@ -540,7 +538,7 @@ public class InteractiveNavigator
                     _activeRescanScanner = null;
                 }
             }
-        });
+        }, token);
     }
 
     private void ReplaceNodeInTree(DirectoryNode oldNode, DirectoryNode newNode)
