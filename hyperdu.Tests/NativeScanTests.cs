@@ -8,6 +8,8 @@ namespace hyperdu.Tests;
 [UnsupportedOSPlatform("windows")]
 public class NativeScanTests
 {
+    private const string NeedsByteNames = "APFS and NTFS reject file names that are not valid UTF-8.";
+
     private static readonly byte[] InvalidUtf8Name = [(byte)'d', (byte)'i', (byte)'r', 0xFE];
 
     [UnixFact]
@@ -54,7 +56,7 @@ public class NativeScanTests
         Assert.Equal(500 + "real".Length, root.TotalSize);
     }
 
-    [UnixFact]
+    [LinuxFact(NeedsByteNames)]
     public async Task NonUtf8DirectoryName_IsTraversed()
     {
         using TempTree tree = new TempTree();
@@ -77,7 +79,7 @@ public class NativeScanTests
         }
     }
 
-    [UnixFact]
+    [LinuxFact(NeedsByteNames)]
     public async Task RescanOfNonUtf8Node_UsesTheExactPath()
     {
         using TempTree tree = new TempTree();
@@ -101,7 +103,7 @@ public class NativeScanTests
         }
     }
 
-    [UnixFact]
+    [LinuxFact(NeedsByteNames)]
     public async Task FileListing_WorksInNonUtf8Directory()
     {
         using TempTree tree = new TempTree();

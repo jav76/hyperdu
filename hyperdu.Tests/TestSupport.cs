@@ -11,6 +11,15 @@ public sealed class UnixFactAttribute : FactAttribute
     }
 }
 
+public sealed class LinuxFactAttribute : FactAttribute
+{
+    public LinuxFactAttribute(string reason)
+    {
+        if (!OperatingSystem.IsLinux())
+            Skip = reason;
+    }
+}
+
 internal sealed class TempTree : IDisposable
 {
     public TempTree()
