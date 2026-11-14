@@ -53,7 +53,7 @@ jobs:
           - platform: osx-x64
             os: macos-15-intel
           - platform: osx-arm64
-            os: macos-14
+            os: macos-15
 
     steps:
       - name: Checkout Repository

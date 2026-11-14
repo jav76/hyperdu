@@ -178,6 +178,10 @@ hyperdu [path] [options]
 | `--exclude <path>` | `-e <path>` | Excludes specific paths/sub-paths from scanning (can specify multiple times). | None |
 | `--skip-hidden` | - | Skips hidden and system files/folders during traversal. | `false` |
 
+| Environment variable | Description |
+|---|---|
+| `HYPERDU_NATIVE_IO=0` | Disables the direct libc reader on Linux and macOS and uses the .NET enumerator instead (slower, and cannot open names that are not valid UTF-8). |
+
 ---
 
 ## License

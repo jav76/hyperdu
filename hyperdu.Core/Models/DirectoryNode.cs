@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace hyperdu.Core.Models;
 
 public class DirectoryNode
@@ -16,15 +18,34 @@ public class DirectoryNode
 
     internal long _totalSize;
 
-    public DirectoryNode(string path, DirectoryNode? parent = null)
+    public DirectoryNode(string path, DirectoryNode? parent = null) : this(path, parent, null, null)
+    {
+    }
+
+    internal DirectoryNode(string path, DirectoryNode? parent, byte[]? nativeName, byte[]? nativeRootPath)
     {
         Path = path;
         Name = System.IO.Path.GetFileName(path) is { Length: > 0 } name ? name : path;
         Parent = parent;
+        NativeName = nativeName;
+        _nativeRootPath = nativeRootPath;
+        HasNativeAncestry = nativeName != null || nativeRootPath != null || parent?.HasNativeAncestry == true;
     }
 
     public string Path { get; }
     public string Name { get; }
+
+    /// <summary>
+    /// Raw name bytes, set only when the name is not valid UTF-8 and so cannot be recovered from <see cref="Name"/>.
+    /// </summary>
+    internal byte[]? NativeName { get; }
+
+    /// <summary>
+    /// True when this node or an ancestor has a name that <see cref="Path"/> cannot represent exactly.
+    /// </summary>
+    internal bool HasNativeAncestry { get; }
+
+    private readonly byte[]? _nativeRootPath;
     public DirectoryNode? Parent { get; set; }
     public long SelfSize { get; set; }
 
@@ -120,6 +141,38 @@ public class DirectoryNode
 
         foreach (DirectoryNode sub in Subdirectories)
             sub.Compact();
+    }
+
+    /// <summary>
+    /// Exact path bytes for native calls. Rebuilt from the parent chain only when some name on it is not valid UTF-8.
+    /// </summary>
+    internal byte[] GetNativePath(bool nullTerminated = true)
+    {
+        if (!HasNativeAncestry)
+        {
+            int length = Encoding.UTF8.GetByteCount(Path);
+            byte[] bytes = new byte[nullTerminated ? length + 1 : length];
+            Encoding.UTF8.GetBytes(Path, bytes);
+            return bytes;
+        }
+
+        List<byte> buffer = new List<byte>(Path.Length + 1);
+        AppendNativePath(buffer);
+        if (nullTerminated) buffer.Add(0);
+        return buffer.ToArray();
+    }
+
+    private void AppendNativePath(List<byte> buffer)
+    {
+        if (Parent == null || !HasNativeAncestry)
+        {
+            buffer.AddRange(_nativeRootPath ?? Encoding.UTF8.GetBytes(Path));
+            return;
+        }
+
+        Parent.AppendNativePath(buffer);
+        if (buffer.Count == 0 || buffer[^1] != (byte)'/') buffer.Add((byte)'/');
+        buffer.AddRange(NativeName ?? Encoding.UTF8.GetBytes(Name));
     }
 
     /// <summary>

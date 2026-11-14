@@ -225,7 +225,7 @@ public class InteractiveNavigator
 
         if (_current.IsScanned)
         {
-            List<(string Name, long Size)> files = GetCachedFiles(_current.Path);
+            List<(string Name, long Size)> files = GetCachedFiles(_current);
             foreach ((string name, long size) in files)
                 list.Add(new NavigatorItem
                 {
@@ -238,30 +238,16 @@ public class InteractiveNavigator
         return list;
     }
 
-    private List<(string Name, long Size)> GetCachedFiles(string dirPath)
+    private List<(string Name, long Size)> GetCachedFiles(DirectoryNode dir)
     {
+        string dirPath = dir.Path;
         if (_cachedFileDirPath == dirPath && _cachedFileList != null)
             return _cachedFileList;
 
         List<(string Name, long Size)> files = new List<(string Name, long Size)>();
         try
         {
-            DirectoryInfo dirInfo = new DirectoryInfo(dirPath);
-            foreach (FileInfo file in dirInfo.EnumerateFiles())
-            {
-                long size = 0;
-                try
-                {
-                    size = file.Length;
-                }
-                catch
-                {
-                    // Ignore exception when querying size of specific files (e.g. system files).
-                }
-
-                files.Add((file.Name, size));
-            }
-
+            files = DirectoryListing.ListFiles(dir, _scanner?.Options.UseNativeIo ?? true);
             files.Sort((a, b) => b.Size.CompareTo(a.Size));
         }
         catch
@@ -539,7 +525,7 @@ public class InteractiveNavigator
         {
             try
             {
-                DirectoryNode newSubNode = await rescanScanner.ScanAsync(targetNode.Path, null, token);
+                DirectoryNode newSubNode = await rescanScanner.ScanAsync(targetNode, null, token);
                 ReplaceNodeInTree(targetNode, newSubNode);
             }
             catch (Exception)

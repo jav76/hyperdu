@@ -152,7 +152,8 @@ public static class Program
         {
             WorkerCount = finalWorkers,
             SkipHidden = parsed.SkipHidden,
-            FollowSymlinks = false
+            FollowSymlinks = false,
+            UseNativeIo = Environment.GetEnvironmentVariable("HYPERDU_NATIVE_IO") != "0"
         };
         if (parsed.CustomExcludes.Count > 0)
         {
