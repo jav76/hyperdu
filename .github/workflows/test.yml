@@ -17,8 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-14 is arm64 and macos-15-intel is x64: they cover both libc entry-point sets.
-        os: [ubuntu-latest, macos-14, macos-15-intel, windows-latest]
+        # macos-15 is arm64 and macos-15-intel is x64: they cover both libc entry-point sets.
+        os: [ubuntu-latest, macos-15, macos-15-intel, windows-latest]
 
     steps:
       - name: Checkout Repository
