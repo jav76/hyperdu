@@ -6,14 +6,16 @@
 
     <ItemGroup>
         <PackageReference Include="Spectre.Console" Version="0.57.0"/>
-        <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All"/>
     </ItemGroup>
 
     <PropertyGroup>
         <OutputType>Exe</OutputType>
         <TargetFramework>net10.0</TargetFramework>
+        <AssemblyName>hyperdu</AssemblyName>
+        <RootNamespace>hyperdu.Cli</RootNamespace>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
+        <InvariantGlobalization>true</InvariantGlobalization>
         <PackAsTool>true</PackAsTool>
         <ToolCommandName>hyperdu</ToolCommandName>
         <PackageId>hyperdu</PackageId>

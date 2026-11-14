@@ -114,8 +114,17 @@ When running `hyperdu`, you can navigate the disk structure instantly using the 
 
 ## Installation & Building
 
-### Prerequisites
-* [.NET 10.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0)
+### Download a Release Binary
+
+Self-contained Native AOT binaries for Linux and macOS (x64, arm64) and Windows (x64, x86) are attached to each [GitHub Release](https://github.com/jav76/hyperdu/releases), along with a `SHA256SUMS` file. They need no .NET runtime and no ICU library.
+
+* Linux binaries need glibc 2.28 or newer (RHEL/Alma/Rocky 8, Debian 10, Ubuntu 20.04 and later).
+* macOS binaries are not notarized. If Gatekeeper blocks a browser download, run `xattr -d com.apple.quarantine hyperdu`.
+
+```bash
+tar -xzf hyperdu-linux-x64.tar.gz
+./hyperdu --version
+```
 
 ### Install via WinGet (Windows)
 
@@ -137,6 +146,7 @@ hyperdu [target_path] [options]
 ```
 
 ### Clone & Build (Manual)
+Requires the [.NET 10.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0).
 ```bash
 git clone https://github.com/jav76/hyperdu.git
 cd hyperdu
@@ -144,7 +154,7 @@ dotnet build
 ```
 
 ### Run Locally
-To run `hyperdu` against a directory (defaulting to `/` if unspecified):
+To run `hyperdu` against a directory (defaulting to the current directory if unspecified):
 ```bash
 dotnet run --project hyperdu.Cli/hyperdu.Cli.csproj -- [target_path] [options]
 ```
@@ -161,6 +171,9 @@ This generates binaries in the `publish/` directory for the following targets:
 - `win-x86`
 - `osx-x64`
 - `osx-arm64`
+
+### Versioning & Releases
+Versions come from git tags via [MinVer](https://github.com/adamralph/minver): a commit tagged `v1.2.0` builds as `1.2.0`, later commits as `1.2.1-alpha.0.N`. Do not set `Version` in project files: MinVer overrides `-p:Version` and `-p:InformationalVersion`. To build from a source tarball with no `.git` (distro or Nix packaging), pass `-p:MinVerVersionOverride=X.Y.Z` instead. Pushing a `vX.Y.Z` tag runs `.github/workflows/publish.yml`, which publishes the release assets, `SHA256SUMS`, the NuGet tool and (for stable tags) a WinGet update.
 
 ---
 

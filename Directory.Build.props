@@ -1,9 +1,22 @@
 <Project>
     <PropertyGroup>
-        <VersionPrefix>0.1.0</VersionPrefix>
         <Company>Jaret Varn</Company>
         <Product>hyperdu</Product>
         <Copyright>Copyright © 2026 Jaret Varn</Copyright>
         <Description>A high-performance, cross-platform terminal-based directory space analyzer.</Description>
+        <!-- The version comes only from git tags (vX.Y.Z). Do not set Version/VersionPrefix here or via -p:. -->
+        <MinVerTagPrefix>v</MinVerTagPrefix>
     </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="MinVer" Version="8.0.0" PrivateAssets="all" />
+    </ItemGroup>
+
+    <!-- MinVer silently falls back to 0.0.0-alpha.0 when it cannot see tags (shallow clone, git safe.directory). Fail CI instead of shipping that. -->
+    <Target Name="VerifyMinVerVersion" AfterTargets="MinVer" Condition="'$(CI)' == 'true' And '$(MinVerVersion)' != '' And '$(MinVerVersionOverride)' == ''">
+        <Error Condition="$(MinVerVersion.StartsWith('0.0.0-alpha.0'))"
+               Text="MinVer found no v* tag reachable from HEAD (got $(MinVerVersion)). Check out with fetch-depth: 0, and in containers mark the checkout as a git safe.directory. Builds without .git must pass -p:MinVerVersionOverride=X.Y.Z." />
+        <Error Condition="'$(GITHUB_REF_TYPE)' == 'tag' And 'v$(MinVerVersion)' != '$(GITHUB_REF_NAME)'"
+               Text="MinVer version v$(MinVerVersion) does not match the pushed tag $(GITHUB_REF_NAME)." />
+    </Target>
 </Project>
