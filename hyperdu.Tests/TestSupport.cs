@@ -58,19 +58,15 @@ internal sealed class TempTree : IDisposable
     }
 }
 
-internal static unsafe partial class TestLibc
+internal static partial class TestLibc
 {
     [LibraryImport("libc", SetLastError = true)]
-    private static partial int rename(byte* from, byte* to);
+    private static partial int rename(byte[] from, byte[] to);
 
     public static void Rename(byte[] from, byte[] to)
     {
-        fixed (byte* f = NullTerminated(from))
-        fixed (byte* t = NullTerminated(to))
-        {
-            if (rename(f, t) != 0)
-                throw new IOException($"rename failed with errno {Marshal.GetLastPInvokeError()}");
-        }
+        if (rename(NullTerminated(from), NullTerminated(to)) != 0)
+            throw new IOException($"rename failed with errno {Marshal.GetLastPInvokeError()}");
     }
 
     private static byte[] NullTerminated(byte[] bytes) => [.. bytes, 0];
