@@ -78,7 +78,7 @@ internal sealed unsafe class NativeDirectory : IDisposable
     public void Dispose()
     {
         if (_dir == 0) return;
-        Libc.closedir(_dir);
+        _ = Libc.closedir(_dir);
         _dir = 0;
     }
 }
