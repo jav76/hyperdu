@@ -66,3 +66,6 @@ nunit-*.xml
 .idea/
 *.sln.DotSettings.user
 
+
+# Architecture decision records stay local (public repo)
+docs/adr/
