@@ -1,6 +1,6 @@
 # hyperdu: Status, Roadmap and Publishing Guide
 
-Snapshot taken 2026-11-14 against `main` at `2c7643f` (after PR #6, "upload release assets directly").
+Snapshot taken 2026-11-14 against `main` at `2c7643f` (after PR #6, "upload release assets directly"). Since then PR #21 added a direct libc reader (`statx`/`readdir` on Linux, `fstatat` on macOS) and an xUnit project with a cross-OS `test.yml`; notes below call this out where it matters.
 
 **Phase 0 status:** F1-F7 are implemented on branch `claude/hyperdu-publishing-guide-c54911` and verified locally (section 4). F8, the first release through the new pipeline, has not been cut. Sections 1-2 describe `main` before Phase 0.
 
@@ -101,7 +101,7 @@ These matter for packaging, so most are prerequisites in section 4.
 | G6 | glibc baseline is 2.34 | `objdump -T` max symbol `GLIBC_2.34` (built on `ubuntu-latest`). Any build host with glibc 2.34+ binds `pthread_*`/`dl*` to 2.34, so `ubuntu-22.04` would not help | Works on Ubuntu 22.04+, Debian 12+, RHEL 9+. Fails on Debian 11, RHEL 8 |
 | G7 | No checksums file | Release has no `SHA256SUMS` | Homebrew, Scoop, AUR, Nix all need hashes; today they must be computed by hand |
 | G8 | NuGet tool is framework-dependent | `pack-tool` runs plain `dotnet pack` | `dotnet tool install` users need the .NET 10 runtime and get the slower JIT build |
-| G9 | No tests | No test project in `hyperdu.slnx` | Package-manager `test` blocks only smoke-test `--version` |
+| G9 | No tests (at `2c7643f`) | No test project in `hyperdu.slnx` | Fixed by PR #21 (`hyperdu.Tests`, `test.yml`). Package-manager `test` blocks still only smoke-test `--version` |
 | G10 | Lenient arg parsing | Unknown flags become the target path; `-t abc` is silently ignored | Typos produce "directory does not exist" instead of a usage error |
 | G11 | README drift | README says the default target is `/`; code uses the current directory | Minor doc fix |
 | G12 | Unsigned binaries | No codesign / notarization / Authenticode | macOS Gatekeeper blocks browser-downloaded binaries; SmartScreen warns on Windows |
@@ -155,7 +155,7 @@ Effort: **S** = an evening, **M** = a few days, **L** = a larger project.
 
 | Enhancement | Effort | Why |
 | :--- | :---: | :--- |
-| xUnit test project: `PrioritizedQueue`, exclusion matching, `DiskDeviceHelper` device-name parsing, scanner on a temp tree | M | Safety net before larger changes |
+| Extend `hyperdu.Tests` (PR #21 covers the native reader and scanner): `PrioritizedQueue`, exclusion matching, `DiskDeviceHelper` device-name parsing | M | Safety net before larger changes |
 | BenchmarkDotNet or scripted benchmark on a generated tree | S | Proves performance claims release over release |
 | Fix the failing Sonar workflow | S | Badges in README currently reflect a failed run |
 
@@ -173,7 +173,7 @@ Each package manager consumes the GitHub Release. Fixing the release once is che
 | F4 | MinVer 8.0.0 in `Directory.Build.props` (tag prefix `v`); "Parse Version" steps and `-p:Version*` flags removed; `fetch-depth: 0`; a guard target fails CI builds that fall back to `0.0.0-alpha.0` or whose version does not match the pushed tag. Also dropped the redundant `Microsoft.SourceLink.GitHub` 8.0.0 package (fixes NU1902) | G3, G4 | done; tag gives `1.2.0`, one commit later `1.2.1-alpha.0.1` |
 | F5 | `--version` prints one plain line: `hyperdu 1.2.0 (abc1234)` | G4 | done |
 | F6 | `release` job downloads every asset, attaches `SHA256SUMS` (`sha256sum` format), then undrafts. Every upload step refuses to touch an already-published release, so a re-run can never change published hashes | G7 | done (runs on first tag) |
-| F7 | Linux binaries are built inside `almalinux:8` (glibc 2.28, pinned multi-arch digest) via `docker run` on the normal runners; CI fails if the binary needs more than `GLIBC_2.28` or references libicu | G6 | done; output needs only `GLIBC_2.17` and ran on CentOS 7, Debian 11, AlmaLinux 8, Ubuntu 20.04, Debian 12-slim |
+| F7 | Linux binaries are built inside `almalinux:8` (glibc 2.28, pinned multi-arch digest) via `docker run` on the normal runners; CI fails if the binary needs more than `GLIBC_2.28` or references libicu | G6 | done; output needs only `GLIBC_2.17` and completed real scans on CentOS 7, Debian 11, AlmaLinux 8, Ubuntu 20.04, Debian 12-slim. The native reader needs `statx` (glibc 2.28); older glibc falls back to the .NET enumerator |
 | F8 | Cut `v1.2.0` and confirm NuGet, WinGet and all assets | Live-status lag | not done (outward-facing, needs the maintainer) |
 
 **WinGet transition (F1 side effect).** The 0.1.5 manifest pins `RelativeFilePath: hyperdu.Cli.exe` with alias `hyperdu`. `winget-releaser@v2` always installs the newest Komac, and Komac 2.17+ rebuilds `NestedInstallerFiles` from the zip and drops `PortableCommandAlias`. The `winget` job now downloads a pinned, checksum-verified Komac 2.17.2, generates the manifest with `--output --exit`, asserts `hyperdu.exe`, both `x64` and `x86`, and hashes matching `SHA256SUMS`, re-adds the alias, and only then submits. Prerelease tags are skipped because a WinGet version can never be reused. Do not resubmit v1.1.1: its Windows zips contain a nested zip.
