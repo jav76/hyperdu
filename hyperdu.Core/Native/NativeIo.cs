@@ -163,14 +163,17 @@ internal static unsafe class NativeIo
 
         try
         {
-            byte* root = stackalloc byte[] { (byte)'/', 0 };
+            ReadOnlySpan<byte> root = "/\0"u8;
             byte* buffer = stackalloc byte[StatBufferSize];
 
-            if (!TryStatAt(AtFdCwd, root, true, buffer, out NativeStat rootStat) ||
-                rootStat.Kind != NativeEntryKind.Directory)
-                return false;
+            fixed (byte* rootPath = root)
+            {
+                if (!TryStatAt(AtFdCwd, rootPath, true, buffer, out NativeStat rootStat) ||
+                    rootStat.Kind != NativeEntryKind.Directory)
+                    return false;
+            }
 
-            using NativeDirectory? directory = NativeDirectory.Open(new ReadOnlySpan<byte>(root, 2), out _);
+            using NativeDirectory? directory = NativeDirectory.Open(root, out _);
             if (directory == null) return false;
 
             while (directory.MoveNext())
