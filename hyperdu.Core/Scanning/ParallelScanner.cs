@@ -1,5 +1,8 @@
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Unicode;
 using hyperdu.Core.Models;
+using hyperdu.Core.Native;
 
 namespace hyperdu.Core.Scanning;
 
@@ -15,6 +18,7 @@ public class ParallelScanner
     private List<string> _normalizedExcludedPrefixes = new();
     private long _totalBytesFound;
     private long _pendingCount;
+    private bool _useNativeIo;
 
     public ParallelScanner(ScanOptions? options = null)
     {
@@ -52,6 +56,9 @@ public class ParallelScanner
     public long TotalBytesFound => Volatile.Read(ref _totalBytesFound);
     public string CurrentDirectory => Volatile.Read(ref _currentDirectory);
     public long ActiveWorkers => Volatile.Read(ref _activeWorkers);
+
+    /// <summary>Whether the current or last scan used the native libc reader.</summary>
+    internal bool UsesNativeIo => _useNativeIo;
 
     public static string NormalizePath(string path)
     {
@@ -94,7 +101,26 @@ public class ParallelScanner
         rootPath = NormalizePath(rootPath);
         if (IsVirtualOrSystemPath(rootPath))
             throw new ArgumentException($"Cannot scan virtual system path: {rootPath}");
-        DirectoryNode rootNode = new DirectoryNode(rootPath);
+        return await ScanCoreAsync(new DirectoryNode(rootPath), progress, cancellationToken);
+    }
+
+    /// <summary>
+    /// Scans the directory behind an existing node into a new, detached tree. Unlike the string overload,
+    /// this keeps exact native paths for names that are not valid UTF-8.
+    /// </summary>
+    public async Task<DirectoryNode> ScanAsync(DirectoryNode existing, IProgress<ScanProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        DirectoryNode rootNode = existing.HasNativeAncestry
+            ? new DirectoryNode(existing.Path, null, existing.NativeName, existing.GetNativePath(nullTerminated: false))
+            : new DirectoryNode(existing.Path);
+        return await ScanCoreAsync(rootNode, progress, cancellationToken);
+    }
+
+    private async Task<DirectoryNode> ScanCoreAsync(DirectoryNode rootNode, IProgress<ScanProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        string rootPath = rootNode.Path;
         RootNode = rootNode;
         IsScanning = true;
         IsPaused = false;
@@ -104,6 +130,7 @@ public class ParallelScanner
         {
             Queue.Clear();
 
+            _useNativeIo = _options.UseNativeIo && NativeIo.IsSupported;
             _directoriesScanned = 0;
             _filesScanned = 0;
             _totalBytesFound = 0;
@@ -256,23 +283,16 @@ public class ParallelScanner
 
         try
         {
-            using var enumerator = new LightweightFileSystemEnumerator(node.Path, enumerationOptions);
-            while (enumerator.MoveNext())
+            string? error = null;
+            if (_useNativeIo)
+                error = ReadDirectoryNative(node, ref localSelfSize, ref localFilesCount, ref subdirsToQueue, localUpdates, cancellationToken);
+            else
+                ReadDirectoryManaged(node, ref localSelfSize, ref localFilesCount, ref subdirsToQueue, localUpdates, enumerationOptions, cancellationToken);
+
+            if (error != null)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                _pauseEvent.Wait(cancellationToken);
-                LightweightEntry entry = enumerator.Current;
-
-                bool isSymlink = entry.Attributes.HasFlag(FileAttributes.ReparsePoint);
-
-                if (entry.IsDirectory)
-                {
-                    ProcessDirectoryEntry(entry, node, isSymlink, ref subdirsToQueue, localUpdates);
-                }
-                else
-                {
-                    ProcessFileEntry(entry, isSymlink, ref localSelfSize, ref localFilesCount);
-                }
+                MarkNodeFailed(node, error);
+                return;
             }
         }
         catch (UnauthorizedAccessException)
@@ -347,20 +367,144 @@ public class ParallelScanner
         }
     }
 
-    private void ProcessDirectoryEntry(LightweightEntry entry, DirectoryNode node, bool isSymlink, ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    private void ReadDirectoryManaged(DirectoryNode node, ref long localSelfSize, ref int localFilesCount,
+        ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates,
+        EnumerationOptions enumerationOptions, CancellationToken cancellationToken)
     {
-        string subPath = Path.Combine(node.Path, entry.Name);
-        if (IsVirtualOrSystemPath(subPath)) return;
-        if (IsExcludedPath(subPath)) return;
-        DirectoryNode childNode = new DirectoryNode(subPath, node);
+        using var enumerator = new LightweightFileSystemEnumerator(node.Path, enumerationOptions);
+        while (enumerator.MoveNext())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            _pauseEvent.Wait(cancellationToken);
+            LightweightEntry entry = enumerator.Current;
+
+            bool isSymlink = entry.Attributes.HasFlag(FileAttributes.ReparsePoint);
+
+            if (entry.IsDirectory)
+            {
+                ProcessDirectoryEntry(entry, node, isSymlink, ref subdirsToQueue, localUpdates);
+            }
+            else
+            {
+                ProcessFileEntry(entry, isSymlink, ref localSelfSize, ref localFilesCount);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reads one directory with libc: names stay raw bytes and every stat is relative to the open directory,
+    /// so the kernel never re-walks the full path per entry. Returns an error message when the directory cannot be read.
+    /// </summary>
+    private unsafe string? ReadDirectoryNative(DirectoryNode node, ref long localSelfSize, ref int localFilesCount,
+        ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates,
+        CancellationToken cancellationToken)
+    {
+        byte* statBuffer = stackalloc byte[NativeIo.StatBufferSize];
+        bool checkHiddenFlag = _options.SkipHidden && NativeIo.IsMacOS;
+
+        NativeDirectory? directory;
+        int openError;
+        fixed (byte* path = node.GetNativePath())
+        {
+            directory = NativeDirectory.Open(path, out openError);
+        }
+
+        if (directory == null) return NativeIo.DescribeError(openError);
+
+        using (directory)
+        {
+            while (directory.MoveNext())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                _pauseEvent.Wait(cancellationToken);
+
+                ReadOnlySpan<byte> name = directory.CurrentName;
+                if (_options.SkipHidden && name[0] == (byte)'.') continue;
+
+                NativeEntryKind kind = directory.CurrentKind;
+                NativeStat linkStat = default;
+                if (kind != NativeEntryKind.Directory || checkHiddenFlag)
+                {
+                    if (directory.TryStatCurrent(false, statBuffer, out linkStat))
+                    {
+                        if (checkHiddenFlag && linkStat.HasHiddenFlag) continue;
+                        if (kind == NativeEntryKind.Unknown) kind = linkStat.Kind;
+                    }
+                }
+
+                switch (kind)
+                {
+                    case NativeEntryKind.Directory:
+                        ProcessNativeDirectoryEntry(name, node, false, 0, ref subdirsToQueue, localUpdates);
+                        break;
+
+                    case NativeEntryKind.Symlink:
+                        bool hasTarget = directory.TryStatCurrent(true, statBuffer, out NativeStat target);
+                        if (hasTarget && target.Kind == NativeEntryKind.Directory)
+                        {
+                            ProcessNativeDirectoryEntry(name, node, true, linkStat.Size, ref subdirsToQueue, localUpdates);
+                        }
+                        else if (_options.FollowSymlinks)
+                        {
+                            localSelfSize += hasTarget ? target.Size : linkStat.Size;
+                            localFilesCount++;
+                        }
+
+                        break;
+
+                    default:
+                        localSelfSize += linkStat.Size;
+                        localFilesCount++;
+                        break;
+                }
+            }
+
+            return directory.Error == 0 ? null : NativeIo.DescribeError(directory.Error);
+        }
+    }
+
+    private void ProcessNativeDirectoryEntry(ReadOnlySpan<byte> nativeName, DirectoryNode node, bool isSymlink, long linkSize,
+        ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    {
+        byte[]? exactName = Utf8.IsValid(nativeName) ? null : nativeName.ToArray();
+        DirectoryNode? childNode = CreateChildNode(node, Encoding.UTF8.GetString(nativeName), exactName);
+        if (childNode == null) return;
 
         if (isSymlink && !_options.FollowSymlinks)
         {
-            string? linkTarget = ResolveLinkTargetSafely(subPath);
-            ProcessDirectorySymlink(node, childNode, linkTarget, localUpdates);
+            ProcessDirectorySymlink(node, childNode, linkSize, localUpdates);
             return;
         }
 
+        AddSubdirectory(node, childNode, ref subdirsToQueue, localUpdates);
+    }
+
+    private DirectoryNode? CreateChildNode(DirectoryNode node, string name, byte[]? nativeName)
+    {
+        string subPath = Path.Combine(node.Path, name);
+        if (IsVirtualOrSystemPath(subPath)) return null;
+        if (IsExcludedPath(subPath)) return null;
+        return new DirectoryNode(subPath, node, nativeName, null);
+    }
+
+    private void ProcessDirectoryEntry(LightweightEntry entry, DirectoryNode node, bool isSymlink, ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    {
+        DirectoryNode? childNode = CreateChildNode(node, entry.Name, null);
+        if (childNode == null) return;
+
+        if (isSymlink && !_options.FollowSymlinks)
+        {
+            string? linkTarget = ResolveLinkTargetSafely(childNode.Path);
+            ProcessDirectorySymlink(node, childNode, linkTarget?.Length ?? 0, localUpdates);
+            return;
+        }
+
+        AddSubdirectory(node, childNode, ref subdirsToQueue, localUpdates);
+    }
+
+    private static void AddSubdirectory(DirectoryNode node, DirectoryNode childNode, ref List<DirectoryNode>? subdirsToQueue,
+        Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    {
         subdirsToQueue ??= new List<DirectoryNode>(4);
         subdirsToQueue.Add(childNode);
         lock (node.Subdirectories)
@@ -379,9 +523,8 @@ public class ParallelScanner
         localFilesCount++;
     }
 
-    private void ProcessDirectorySymlink(DirectoryNode node, DirectoryNode childNode, string? linkTarget, Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    private void ProcessDirectorySymlink(DirectoryNode node, DirectoryNode childNode, long targetLength, Dictionary<DirectoryNode, NodeDelta> localUpdates)
     {
-        int targetLength = linkTarget?.Length ?? 0;
         childNode.SelfSize = targetLength;
         childNode.TotalSize = targetLength;
         childNode.IsScanned = true;

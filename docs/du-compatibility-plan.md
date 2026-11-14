@@ -79,6 +79,8 @@ Measured by a differential harness against the reference `du` and by the GNU cor
 
 **Recommendation: A**, with B only if profiling shows readdir overhead.
 
+**Decided: A** (2026-11-14). See [ADR 0001](adr/0001-native-filesystem-access.md).
+
 ### D5. Existing hyperdu flags
 
 | Option | Pros | Cons | Design Considerations |
