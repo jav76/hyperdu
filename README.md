@@ -1,8 +1,8 @@
-# ⚡ hyperdu
+# hyperdu
 
-`hyperdu` is a high-performance, cross-platform terminal-based directory space analyzer written in C# and built on **.NET 10**. 
+A terminal disk usage explorer for big directory trees and slow filesystems. Written in C# on .NET 10, runs on Linux, macOS and Windows.
 
-Designed for massive directory trees and high-latency filesystems, `hyperdu` scans your disk using a custom multi-threaded engine that **dynamically prioritizes scan queues** based on your interactive navigation. If you focus on a subdirectory in the UI, the background scanning workers immediately deprioritize other directories and shift their CPU/disk I/O resources to scan your current view first.
+You can browse while it scans. The folder you are looking at gets scanned first, so you don't have to wait for the whole disk before you can open a directory.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![NuGet Version](https://img.shields.io/nuget/v/hyperdu.svg)](https://www.nuget.org/packages/hyperdu/)
@@ -15,106 +15,35 @@ Designed for massive directory trees and high-latency filesystems, `hyperdu` sca
 [![Security Rating](https://sonarqube.jav26122.net/api/project_badges/measure?project=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f&metric=software_quality_security_rating&token=sqb_26e731c10e8956d411964d75c86646eb43df806e)](https://sonarqube.jav26122.net/dashboard?id=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f)
 [![Technical Debt](https://sonarqube.jav26122.net/api/project_badges/measure?project=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f&metric=software_quality_maintainability_remediation_effort&token=sqb_26e731c10e8956d411964d75c86646eb43df806e)](https://sonarqube.jav26122.net/dashboard?id=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f)
 [![Quality Gate Status](https://sonarqube.jav26122.net/api/project_badges/measure?project=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f&metric=alert_status&token=sqb_26e731c10e8956d411964d75c86646eb43df806e)](https://sonarqube.jav26122.net/dashboard?id=jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f)
----
 
-## User Interface Preview
-
-```text
-Target Directory: /
-Scanner Workers:  24
-Skip Hidden:      False
-Excluded Paths:   None
-Press Ctrl+C to cancel scan at any time.
-
-╭─Scan Progress───────────────────────────────────────────────────────────────╮ 
-│ Dirs: 933,711 Files: 2,567,182 Status: Scanning...                          │ 
-│ Size: 2.97 TB Threads: 24                                                   │ 
-│ Scanning Path: /media/                                                      │ 
-╰─────────────────────────────────────────────────────────────────────────────╯ 
-                           hyperdu Explorer - / ⚡ ⠏⠋                            
-╭─────┬───────────────────────────────┬───────────┬────────────┬──────────────╮ 
-│ Sel │ Name                          │ Size      │ Percentage │ Visual Usage │ 
-├─────┼───────────────────────────────┼───────────┼────────────┼──────────────┤ 
-│     │ 📁 mnt ⠏⠋                     │ 1.93 TB   │ 65.1%      │ ███████░░░   │ 
-│ >   │ 📁 media ⚡ ⠏⠋                 │ 0.92 TB   │ 31.1%      │ ███░░░░░░░   │ 
-│     │ 📁 var ⠏⠋                     │ 50.93 GB  │ 1.7%       │ ░░░░░░░░░░   │ 
-│     │ 📁 home ⠏⠋                    │ 48.41 GB  │ 1.6%       │ ░░░░░░░░░░   │ 
-│     │ 📁 usr ⠏⠋                     │ 11.16 GB  │ 0.4%       │ ░░░░░░░░░░   │ 
-│     │ 📁 opt                        │ 6.23 GB   │ 0.2%       │ ░░░░░░░░░░   │ 
-│     │ 📁 boot                       │ 233.67 MB │ 0.0%       │ ░░░░░░░░░░   │ 
-│     │ 📁 tmp                        │ 22.24 MB  │ 0.0%       │ ░░░░░░░░░░   │ 
-│     │ 📁 etc                        │ 6.17 MB   │ 0.0%       │ ░░░░░░░░░░   │ 
-│     │ 📁 lib64                      │ 9.00 B    │ 0.0%       │ ░░░░░░░░░░   │ 
-│     │ 📁 sbin                       │ 8.00 B    │ 0.0%       │ ░░░░░░░░░░   │ 
-│     │ 📁 bin                        │ 7.00 B    │ 0.0%       │ ░░░░░░░░░░   │ 
-│     │ 📁 lib                        │ 7.00 B    │ 0.0%       │ ░░░░░░░░░░   │ 
-│     │ 📁 srv                        │ 0.00 B    │ 0.0%       │ ░░░░░░░░░░   │ 
-│     │ 📁 lost+found (Access Denied) │ 0.00 B    │ 0.0%       │ ░░░░░░░░░░   │ 
-╰─────┴───────────────────────────────┴───────────┴────────────┴──────────────╯ 
-                   Showing 1-15 of 17 items. (Scroll active)                    
- Total Size: 2.96 TB +6.01 MB | Subdirectories: 998868+35 | Files: 2567013+128  
- ↑/↓ Navigate | Enter Open | Backspace/← Up | Space Pause/Resume | R Rescan |  
-                                  Q/Esc Exit
-```
-
----
+![hyperdu scanning / with the var folder highlighted and prioritized](https://raw.githubusercontent.com/jav76/hyperdu/main/docs/images/scanning.png)
 
 ## Features
 
-* **High-Performance Parallel Scanner**: Leverages a configurable pool of concurrent workers (`WorkerCount`) utilizing programmatically managed non-recursive directory traversal to avoid OS stack limitations.
-* **Dynamic Queue Prioritization**: Uses a custom **3-tier prioritized queue** (High, Medium, Low). As you navigate or hover over folders in the interactive terminal, the queue priorities are re-evaluated instantly to focus scanning threads on your active view.
-  * **Prioritization Indicator**: A yellow lightning bolt symbol (`⚡`) is displayed in the UI next to the folder currently selected and any actively prioritized directories. This visually indicates that scanning resources are actively focused on that path, yielding instantaneous response times.
-* **Pause & Resume Scanning**: Pause all active scanners dynamically with the Spacebar to temporarily free up disk/CPU resources, and resume them at any time.
-* **On-Demand Directory Rescanning**: Press `R` to force a rescan of the selected directory (or the current directory if nothing is highlighted) to update its size and contents without restarting the application.
-* **Latency-Aware & Device-Optimized Thread Scaling**: Automatically detects network mounts on Linux (e.g. NFS, CIFS, SMB, SSHFS) and scales up worker thread count (max(32, 2*Cores)) to hide remote latency. It also automatically detects rotational drives (HDDs) and scales the worker thread count down to `1` to prevent disk head thrashing and maximize performance.
-* **Visual Terminal Explorer**: Built with Spectre.Console, featuring:
-  * Colorful HSL-based progress/bar graphs representing disk usage percent.
-  * Real-time "+X size" / "+Y files" live animations for folders being actively scanned.
-  * Graceful directory-entry transition states (e.g. access denied, missing directories).
-* **Scan Time Tracking**: Recursively logs and computes the scan time of directories, highlighting bottle-necked folders.
-* **Lock Contention Optimization**: Workers batch up size delta updates (`NodeDelta`) and flush them periodically to reduce lock contention across shared directory tree structures.
-* **Intelligent Skipping**: Skips Linux pseudo-filesystems (`/proc`, `/sys`, `/dev`, `/run`) that do not consume physical disk space.
+- **Scans in parallel** across a pool of worker threads, using direct libc calls on Linux and macOS.
+- **Scans what you look at first.** The open folder and the highlighted folder jump ahead of the rest of the queue (marked with `⚡`).
+- **Tunes thread count to the disk**: more threads on network mounts (NFS, SMB, SSHFS and others; Linux only) to hide latency, one thread on spinning HDDs (Linux and Windows) to avoid seek thrashing.
+- **Shows live progress**: per-folder spinners, `+size` / `+files` deltas and a scan time when each folder finishes.
+- **Pause, resume and rescan** without restarting.
+- **Skips** Linux pseudo-filesystems (`/proc`, `/sys`, `/dev`, `/run`), and optionally hidden files or paths you exclude.
 
----
+![hyperdu after finishing a scan of /usr](https://raw.githubusercontent.com/jav76/hyperdu/main/docs/images/complete.png)
 
-## ⚡ Dynamic Scan Prioritization (How it Works)
+## Install
 
-Unlike traditional directory space analyzers that scan your disk in a rigid, predefined order, `hyperdu` shifts its parallel scanning threads in real time based on where you are navigating in the interactive terminal.
+**WinGet** (Windows):
 
-This behavior is tracked and represented visually by the **yellow lightning symbol (`⚡`)**:
+```powershell
+winget install JaretVarn.hyperdu
+```
 
-* **Entering a Directory (Medium Priority)**: 
-  When you press `Enter` to descend into a directory, `hyperdu` immediately promotes that directory's path and all of its nested subdirectories/files to **Priority 1 (Medium)**. The scanner thread pool deprioritizes other parts of the disk to populate your active view first.
-* **Selecting/Highlighting a Directory (High Priority)**: 
-  You can dynamically steer the scanner's focus simply by moving your selection cursor with the `↑` and `↓` arrow keys. The folder you currently highlight in the explorer list, along with all of its deep descendants, is elevated to **Priority 2 (High)**.
-* **Background Traversals (Low Priority)**: 
-  All other unvisited directories are scanned at **Priority 0 (Low)** using any remaining background thread pool capacity.
+**.NET tool** (any platform with the .NET 10 runtime):
 
-### Visual State Summary
-- **No Indicator**: The directory has finished scanning, or is not currently queued/running.
-- **Spinner only (`⠏⠋`)**: The directory is currently scanning in the background at standard priority.
-- **Lightning + Spinner (`⚡ ⠏⠋`)**: The directory is currently scanning and is **actively prioritized** (either because you are viewing it or because you have highlighted it with your selection cursor).
+```bash
+dotnet tool install -g hyperdu
+```
 
----
-
-## Interactive Keybindings
-
-When running `hyperdu`, you can navigate the disk structure instantly using the following controls:
-
-| Key | Action |
-|---|---|
-| `↑` / `↓` | Select/highlight subdirectories or files. |
-| `Enter` | Descend into the highlighted subdirectory (focuses scanner prioritization here). |
-| `Backspace` / `←` | Ascend to the parent directory. |
-| `Space` | Pause/Resume scanning. |
-| `R` | Rescan/refresh the selected directory (or the current directory if nothing is highlighted). |
-| `Q` / `Esc` | Quit the application gracefully. |
-
----
-
-## Installation & Building
-
-### Download a Release Binary
+### Release binaries
 
 Self-contained Native AOT binaries for Linux and macOS (x64, arm64) and Windows (x64, x86) are attached to each [GitHub Release](https://github.com/jav76/hyperdu/releases), along with a `SHA256SUMS` file. They need no .NET runtime and no ICU library.
 
@@ -126,78 +55,67 @@ tar -xzf hyperdu-linux-x64.tar.gz
 ./hyperdu --version
 ```
 
-### Install via WinGet (Windows)
-
-You can install `hyperdu` using the Windows Package Manager (WinGet):
-```powershell
-winget install JaretVarn.hyperdu
-```
-
-### Install via NuGet (.NET Tool)
-
-You can install `hyperdu` directly as a .NET global tool:
-```bash
-dotnet tool install -g hyperdu
-```
-
-Once installed, you can run the tool from anywhere:
-```bash
-hyperdu [target_path] [options]
-```
-
-### Clone & Build (Manual)
-Requires the [.NET 10.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0).
-```bash
-git clone https://github.com/jav76/hyperdu.git
-cd hyperdu
-dotnet build
-```
-
-### Run Locally
-To run `hyperdu` against a directory (defaulting to the current directory if unspecified):
-```bash
-dotnet run --project hyperdu.Cli/hyperdu.Cli.csproj -- [target_path] [options]
-```
-
-### Cross-Compilation & Publishing
-The project includes a `publish.sh` script to build self-contained, trimmed, single-file executables for multiple platforms:
-```bash
-./publish.sh
-```
-This generates binaries in the `publish/` directory for the following targets:
-- `linux-x64`
-- `linux-arm64`
-- `win-x64`
-- `win-x86`
-- `osx-x64`
-- `osx-arm64`
-
-### Versioning & Releases
-Versions come from git tags via [MinVer](https://github.com/adamralph/minver): a commit tagged `v1.2.0` builds as `1.2.0`, later commits as `1.2.1-alpha.0.N`. Do not set `Version` in project files: MinVer overrides `-p:Version` and `-p:InformationalVersion`. To build from a source tarball with no `.git` (distro or Nix packaging), pass `-p:MinVerVersionOverride=X.Y.Z` instead. Pushing a `vX.Y.Z` tag runs `.github/workflows/publish.yml`, which publishes the release assets, `SHA256SUMS`, the NuGet tool and (for stable tags) a WinGet update.
-
----
-
-## CLI Command Line Options
+## Usage
 
 ```bash
 hyperdu [path] [options]
 ```
 
-| Option | Alias | Description | Default |
-|---|---|---|---|
-| `--help` | `-h` | Prints help and usage instructions. | - |
-| `--version` | `-v` | Prints version information. | - |
-| `--threads <N>` | `-t <N>` | Explicitly sets the number of concurrent worker threads. | Logical core count (scales to max(32, 2*Cores) on network mounts, and down to 1 on rotational HDDs) |
-| `--exclude <path>` | `-e <path>` | Excludes specific paths/sub-paths from scanning (can specify multiple times). | None |
-| `--skip-hidden` | - | Skips hidden and system files/folders during traversal. | `false` |
+`path` defaults to the current directory.
 
-| Environment variable | Description |
+| Option | Description | Default |
+|---|---|---|
+| `-t, --threads <N>` | Number of scanner threads. | CPU cores; `max(32, 2 x cores)` on network mounts; 1 on HDDs |
+| `-e, --exclude <path>` | Skip a path. Repeat for more than one. | None |
+| `--skip-hidden` | Skip hidden and system files. | Off |
+| `-v, --version` | Print the version. | |
+| `-h, --help` | Print help. | |
+
+Set `HYPERDU_NATIVE_IO=0` to use the .NET file enumerator instead of direct libc calls on Linux and macOS. It is slower and cannot open names that are not valid UTF-8.
+
+### Keys
+
+| Key | Action |
 |---|---|
-| `HYPERDU_NATIVE_IO=0` | Disables the direct libc reader on Linux and macOS and uses the .NET enumerator instead (slower, and cannot open names that are not valid UTF-8). |
+| `↑` / `↓` | Move the selection |
+| `Enter` | Open the selected folder |
+| `Backspace` / `←` | Go up a level |
+| `Space` | Pause or resume scanning |
+| `R` | Rescan the selected folder (or the current one) |
+| `Q` / `Esc` | Quit |
 
----
+## How prioritization works
+
+The scan queue has three priority levels:
+
+| Priority | What gets it |
+|---|---|
+| High | The highlighted folder and everything under it |
+| Medium | The folder you opened and everything under it |
+| Low | Everything else |
+
+Priorities update as you move, so moving the cursor onto a large folder makes the scanner work on it next.
+
+In the list, a spinner (`⠏⠋`) means a folder is still scanning. `⚡` next to the spinner means it is prioritized. No marker means it is done.
+
+Below, `/var` was opened while `/` was still scanning. `/var` (medium) and the highlighted `lib` (high) are marked `⚡`, and the scanner is already working inside `/var/lib`:
+
+![hyperdu inside /var mid-scan, with lib highlighted and prioritized](https://raw.githubusercontent.com/jav76/hyperdu/main/docs/images/navigate.png)
+
+## Building from source
+
+Requires the [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0).
+
+```bash
+git clone https://github.com/jav76/hyperdu.git
+cd hyperdu
+dotnet run --project hyperdu.Cli -- [path] [options]
+```
+
+`./publish.sh` builds self-contained single-file binaries for `linux-x64`, `linux-arm64`, `win-x64`, `win-x86`, `osx-x64` and `osx-arm64` into `publish/`.
+
+Versions come from git tags via [MinVer](https://github.com/adamralph/minver). See [docs/publishing-guide.md](docs/publishing-guide.md) for the release process.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE) - see the file for details.
-Copyright (c) 2026 Jaret Varn.
+[MIT](LICENSE). Copyright (c) 2026 Jaret Varn.
