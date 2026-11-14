@@ -448,17 +448,17 @@ public class ParallelScanner
     }
 
     /// <summary>
-    /// Resolves the current entry's kind, lstat-ing it when d_type is not enough (non-directories, Unknown,
-    /// or the macOS UF_HIDDEN check). Returns false when the entry is hidden and must be skipped.
-    /// <paramref name="linkStat"/> stays default when no lstat was needed or it failed.
+    /// Directories skip the lstat unless the macOS UF_HIDDEN check needs it.
+    /// <paramref name="linkStat"/> stays default when no lstat ran or it failed.
     /// </summary>
     private bool TryClassifyNativeEntry(NativeDirectory directory, ReadOnlySpan<byte> name, bool checkHiddenFlag,
         Span<byte> statBuffer, out NativeEntryKind kind, out NativeStat linkStat)
     {
-        kind = directory.CurrentKind;
+        kind = default;
         linkStat = default;
         if (_options.SkipHidden && name[0] == (byte)'.') return false;
 
+        kind = directory.CurrentKind;
         bool needsLinkStat = kind != NativeEntryKind.Directory || checkHiddenFlag;
         if (!needsLinkStat || !directory.TryStatCurrent(false, statBuffer, out linkStat)) return true;
 
@@ -467,10 +467,7 @@ public class ParallelScanner
         return true;
     }
 
-    /// <summary>
-    /// Stats the current symlink's target. <paramref name="targetSize"/> is the target's size, or
-    /// <paramref name="linkSize"/> when the target cannot be stat-ed (a dangling link).
-    /// </summary>
+    /// <summary><paramref name="targetSize"/> falls back to <paramref name="linkSize"/> for a dangling link.</summary>
     private static bool IsSymlinkToDirectory(NativeDirectory directory, Span<byte> statBuffer, long linkSize,
         out long targetSize)
     {

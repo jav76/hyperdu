@@ -20,6 +20,16 @@ public sealed class LinuxFactAttribute : FactAttribute
     }
 }
 
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class MacFactAttribute : FactAttribute
+{
+    public MacFactAttribute(string reason)
+    {
+        if (!OperatingSystem.IsMacOS())
+            Skip = reason;
+    }
+}
+
 internal sealed class TempTree : IDisposable
 {
     public TempTree()
@@ -67,6 +77,17 @@ internal static partial class TestLibc
     {
         if (rename(NullTerminated(from), NullTerminated(to)) != 0)
             throw new IOException($"rename failed with errno {Marshal.GetLastPInvokeError()}");
+    }
+
+    private const uint UF_HIDDEN = 0x8000;
+
+    [LibraryImport("libc", SetLastError = true)]
+    private static partial int chflags(byte[] path, uint flags);
+
+    public static void SetHiddenFlag(string path)
+    {
+        if (chflags(NullTerminated(System.Text.Encoding.UTF8.GetBytes(path)), UF_HIDDEN) != 0)
+            throw new IOException($"chflags failed with errno {Marshal.GetLastPInvokeError()}");
     }
 
     private static byte[] NullTerminated(byte[] bytes) => [.. bytes, 0];

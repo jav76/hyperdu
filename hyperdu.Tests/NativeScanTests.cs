@@ -40,6 +40,23 @@ public class NativeScanTests
         Assert.Equal(1_000 + 2_000 + 3_000, nativeRoot.TotalSize);
     }
 
+    [MacFact("UF_HIDDEN is a macOS file flag.")]
+    public async Task SkipHidden_SkipsEntriesWithTheHiddenFlag()
+    {
+        using TempTree tree = new TempTree();
+        tree.File("visible", 100);
+        TestLibc.SetHiddenFlag(tree.File("flagged", 200));
+        tree.File("flaggeddir/payload", 400);
+        TestLibc.SetHiddenFlag(Path.Combine(tree.Root, "flaggeddir"));
+
+        (_, DirectoryNode shownRoot) = await ScanAsync(tree.Root, useNativeIo: true);
+        (_, DirectoryNode skippedRoot) = await ScanAsync(tree.Root, useNativeIo: true, skipHidden: true);
+
+        Assert.Equal(100 + 200 + 400, shownRoot.TotalSize);
+        Assert.Equal(100, skippedRoot.TotalSize);
+        Assert.Empty(skippedRoot.Subdirectories);
+    }
+
     [UnixFact]
     public async Task DirectorySymlink_IsListedButNotTraversed()
     {
