@@ -282,8 +282,7 @@ public class InteractiveNavigator
                 return true;
 
             default:
-                if ((keyInfo.Key == ConsoleKey.R || keyInfo.KeyChar == 'r' || keyInfo.KeyChar == 'R') &&
-                    _scanner != null && (_activeRescanScanner == null || !_activeRescanScanner.IsScanning))
+                if (IsRescanKey(keyInfo) && CanStartRescan)
                 {
                     StartRescan(items);
                     return true;
@@ -291,6 +290,12 @@ public class InteractiveNavigator
                 return false;
         }
     }
+
+    private static bool IsRescanKey(ConsoleKeyInfo keyInfo) =>
+        keyInfo.Key == ConsoleKey.R || keyInfo.KeyChar == 'r' || keyInfo.KeyChar == 'R';
+
+    private bool CanStartRescan =>
+        _scanner != null && (_activeRescanScanner == null || !_activeRescanScanner.IsScanning);
 
     private void TogglePause()
     {
