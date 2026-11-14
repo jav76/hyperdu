@@ -95,7 +95,7 @@ internal static unsafe class NativeIo
         if (dir != 0) return 0;
 
         int error = Marshal.GetLastPInvokeError();
-        Libc.close(fd);
+        _ = Libc.close(fd);
         fd = -1;
         return error;
     }
