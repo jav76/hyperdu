@@ -26,7 +26,13 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists; assets will be added to it."
+            # Re-running a published tag would rebuild archives with new hashes and
+            # break every package manifest that already recorded the old ones.
+            if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)" != "true" ]; then
+              echo "::error::$TAG is already published; refusing to replace its assets. Cut a new tag instead."
+              exit 1
+            fi
+            echo "Draft release $TAG already exists; assets will be added to it."
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --draft --generate-notes --title "$TAG"
@@ -38,12 +44,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
+    env:
+      # glibc 2.28 build image: Linux binaries then need only GLIBC_2.17. Multi-arch digest.
+      AOT_LINUX_IMAGE: almalinux:8@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b
 
     strategy:
       matrix:
         include:
           - platform: linux-x64
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - platform: linux-arm64
             os: ubuntu-24.04-arm
           - platform: win-x64
@@ -58,65 +67,91 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # MinVer derives the version from tags and history
 
       - name: Setup .NET SDK
+        if: runner.os != 'Linux'
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
 
-      - name: Install Native AOT Build Dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang zlib1g-dev
-
-      - name: Parse Version
-        id: versioning
-        shell: bash
-        run: |
-          BASE_VERSION="1.0.0"
-          if [ -f Directory.Build.props ]; then
-            PROP_VERSION=$(grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' Directory.Build.props | head -n 1)
-            if [ -n "$PROP_VERSION" ]; then
-              BASE_VERSION="$PROP_VERSION"
-            fi
-          fi
-          
-          if [[ "${{ github.ref }}" =~ ^refs/tags/v ]]; then
-            TAG_NAME="${{ github.ref_name }}"
-            SEM_VER="${TAG_NAME#v}"
-            echo "version_prefix=${SEM_VER}" >> $GITHUB_OUTPUT
-            echo "version_suffix=" >> $GITHUB_OUTPUT
-          else
-            echo "version_prefix=${BASE_VERSION}" >> $GITHUB_OUTPUT
-            echo "version_suffix=ci.${{ github.run_number }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Publish Profile (${{ matrix.platform }})
+      - name: Publish (${{ matrix.platform }})
+        if: runner.os != 'Linux'
         shell: bash
         run: |
           dotnet publish hyperdu.Cli/hyperdu.Cli.csproj \
             -c Release \
             -r ${{ matrix.platform }} \
             -p:PublishAot=true \
-            -p:VersionPrefix="${{ steps.versioning.outputs.version_prefix }}" \
-            -p:VersionSuffix="${{ steps.versioning.outputs.version_suffix }}" \
-            -p:FileVersion="${{ steps.versioning.outputs.version_prefix }}.${{ github.run_number }}" \
-            -p:InformationalVersion="${{ steps.versioning.outputs.version_prefix }}${{ steps.versioning.outputs.version_suffix != '' && format('-{0}', steps.versioning.outputs.version_suffix) || '' }}+sha.${{ github.sha }}" \
             -o publish/${{ matrix.platform }}
 
-      - name: Compress Executables (Windows)
+      - name: Publish (${{ matrix.platform }}, glibc 2.28 container)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            -e CI -e GITHUB_REF_TYPE -e GITHUB_REF_NAME \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
+            "$AOT_LINUX_IMAGE" \
+            bash .github/scripts/publish-linux-aot.sh ${{ matrix.platform }} publish/${{ matrix.platform }}
+
+      - name: Check Linux Binary (glibc floor, no ICU)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="publish/${{ matrix.platform }}/hyperdu"
+          max=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n1)
+          echo "Max glibc symbol: $max"
+          if [ "$(printf '%s\n' "$max" GLIBC_2.28 | sort -V | tail -n1)" != "GLIBC_2.28" ]; then
+            echo "::error::$bin requires $max (newer than GLIBC_2.28)"; exit 1
+          fi
+          if grep -qa libicu "$bin"; then
+            echo "::error::$bin references libicu (is InvariantGlobalization off?)"; exit 1
+          fi
+
+      - name: Smoke Test
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          ext=""
+          if [[ "$PLATFORM" == win-* ]]; then ext=".exe"; fi
+          "publish/$PLATFORM/hyperdu$ext" --version
+
+      # Archives hold only what users run; debug symbols go to a separate CI artifact.
+      - name: Package Archive (Windows)
         if: ${{ startsWith(matrix.platform, 'win-') }}
         shell: pwsh
         run: |
-          Compress-Archive -Path publish/${{ matrix.platform }}/* -DestinationPath hyperdu-${{ matrix.platform }}.zip
+          $ErrorActionPreference = 'Stop'
+          $stage = "stage/hyperdu-${{ matrix.platform }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Path "publish/${{ matrix.platform }}/hyperdu.exe", LICENSE, README.md -Destination $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath hyperdu-${{ matrix.platform }}.zip
 
-      - name: Compress Executables (Non-Windows)
+      - name: Package Archive (Non-Windows)
         if: ${{ !startsWith(matrix.platform, 'win-') }}
         shell: bash
         run: |
-          cd publish/${{ matrix.platform }}
-          tar -czf ../../hyperdu-${{ matrix.platform }}.tar.gz *
+          set -euo pipefail
+          stage="stage/hyperdu-${{ matrix.platform }}"
+          mkdir -p "$stage"
+          cp "publish/${{ matrix.platform }}/hyperdu" LICENSE README.md "$stage/"
+          tar -czf "hyperdu-${{ matrix.platform }}.tar.gz" -C "$stage" hyperdu LICENSE README.md
+
+      - name: Upload Debug Symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyperdu-symbols-${{ matrix.platform }}
+          path: |
+            publish/${{ matrix.platform }}/*.dbg
+            publish/${{ matrix.platform }}/*.pdb
+            publish/${{ matrix.platform }}/*.dSYM
+          retention-days: 30
+          if-no-files-found: warn
 
       - name: Upload Release Assets (tag builds)
         if: startsWith(github.ref, 'refs/tags/v')
@@ -126,6 +161,9 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)" != "true" ]; then
+            echo "::error::$TAG is already published; refusing to replace its assets."; exit 1
+          fi
           found=()
           for f in "hyperdu-${{ matrix.platform }}.zip" "hyperdu-${{ matrix.platform }}.tar.gz"; do
             [ -f "$f" ] && found+=("$f")
@@ -154,43 +192,16 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # MinVer derives the version from tags and history
 
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
 
-      - name: Parse Version
-        id: versioning
-        shell: bash
-        run: |
-          BASE_VERSION="1.0.0"
-          if [ -f Directory.Build.props ]; then
-            PROP_VERSION=$(grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' Directory.Build.props | head -n 1)
-            if [ -n "$PROP_VERSION" ]; then
-              BASE_VERSION="$PROP_VERSION"
-            fi
-          fi
-          
-          if [[ "${{ github.ref }}" =~ ^refs/tags/v ]]; then
-            TAG_NAME="${{ github.ref_name }}"
-            SEM_VER="${TAG_NAME#v}"
-            echo "version_prefix=${SEM_VER}" >> $GITHUB_OUTPUT
-            echo "version_suffix=" >> $GITHUB_OUTPUT
-          else
-            echo "version_prefix=${BASE_VERSION}" >> $GITHUB_OUTPUT
-            echo "version_suffix=ci.${{ github.run_number }}" >> $GITHUB_OUTPUT
-          fi
-
       - name: Pack Tool
-        run: |
-          dotnet pack hyperdu.Cli/hyperdu.Cli.csproj \
-            -c Release \
-            -p:VersionPrefix="${{ steps.versioning.outputs.version_prefix }}" \
-            -p:VersionSuffix="${{ steps.versioning.outputs.version_suffix }}" \
-            -p:FileVersion="${{ steps.versioning.outputs.version_prefix }}.${{ github.run_number }}" \
-            -p:InformationalVersion="${{ steps.versioning.outputs.version_prefix }}${{ steps.versioning.outputs.version_suffix != '' && format('-{0}', steps.versioning.outputs.version_suffix) || '' }}+sha.${{ github.sha }}" \
-            -o publish/tool
+        run: dotnet pack hyperdu.Cli/hyperdu.Cli.csproj -c Release -o publish/tool
 
       - name: Upload Tool Artifact
         uses: actions/upload-artifact@v4
@@ -251,13 +262,40 @@ jobs:
             --api-key "${{ secrets.GITHUB_TOKEN }}" \
             --skip-duplicate
 
-      - name: Attach Tool Package and Publish Release
+      - name: Attach Tool Package
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)" != "true" ]; then
+            echo "::error::$TAG is already published; refusing to replace its assets."; exit 1
+          fi
           gh release upload "$TAG" artifacts/*.nupkg --repo "$GITHUB_REPOSITORY" --clobber
+
+      # Package managers (Homebrew, Scoop, AUR, Nix) read hashes from this file.
+      - name: Generate and Attach SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)" != "true" ]; then
+            echo "::error::$TAG is already published; refusing to replace its assets."; exit 1
+          fi
+          rm -rf release-assets && mkdir release-assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets
+          rm -f release-assets/SHA256SUMS
+          (cd release-assets && sha256sum -- * > ../SHA256SUMS)
+          cat SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
           {
             echo "### Published $TAG"
@@ -268,17 +306,96 @@ jobs:
   # Package-manager submission is a nice-to-have. In its own non-blocking job,
   # a broken or renamed action can no longer stop the release assets from being
   # published - which is exactly how v1.1.1 shipped with zero assets.
+  #
+  # Calls a pinned Komac directly instead of winget-releaser@v2, which installs
+  # whatever Komac is latest. Komac >= 2.17 rebuilds NestedInstallerFiles from the
+  # zip and drops PortableCommandAlias, so the manifest is checked and the alias
+  # re-applied before submitting. Prerelease tags are skipped: a WinGet version
+  # string can never be reused.
   winget:
     name: Update WinGet Package
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # yq is preinstalled
     needs: [release]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     continue-on-error: true
+    env:
+      KOMAC_VERSION: '2.17.2'
+      KOMAC_SHA256: b03b020eec98acfb0b53e284a6e21815b884be33de6785b97e7a120f0e748966
+      PACKAGE_ID: JaretVarn.hyperdu
+      KOMAC_FORK_OWNER: ${{ github.repository_owner }}
     steps:
-      - name: Update WinGet Package
-        uses: vedantmgoyal9/winget-releaser@v2
-        with:
-          identifier: JaretVarn.hyperdu
-          release-tag: ${{ github.ref_name }}
-          installers-regex: 'hyperdu-win-(x64|x86)\.zip$'
-          token: ${{ secrets.WINGET_TOKEN }}
+      - name: Install Komac
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="komac-${KOMAC_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          gh release download "v${KOMAC_VERSION}" --repo russellbanks/Komac \
+            --pattern "$asset" --dir "$RUNNER_TEMP"
+          echo "${KOMAC_SHA256}  ${RUNNER_TEMP}/${asset}" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/komac"
+          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/komac"
+          bin="$(find "$RUNNER_TEMP/komac" -type f -name komac -print -quit)"
+          test -n "$bin"
+          chmod +x "$bin"
+          dirname "$bin" >> "$GITHUB_PATH"
+
+      - name: Generate and Check Manifests
+        env:
+          GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          komac --version
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          # Komac's own existing-PR check also matches closed/merged PRs, which would block
+          # resubmitting a rejected version forever. Only an open PR should stop us.
+          open_prs="$(gh pr list --repo microsoft/winget-pkgs --state open \
+            --search "$PACKAGE_ID $VERSION in:title" --json number --jq length)"
+          if [ "$open_prs" != 0 ]; then
+            echo "::error::An open microsoft/winget-pkgs PR for $PACKAGE_ID $VERSION already exists."
+            exit 1
+          fi
+
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          urls=("$base/hyperdu-win-x64.zip" "$base/hyperdu-win-x86.zip")
+          for u in "${urls[@]}"; do curl -fsSIL -o /dev/null "$u"; done
+
+          out="$RUNNER_TEMP/winget"
+          komac update "$PACKAGE_ID" --version "$VERSION" --urls "${urls[@]}" --output "$out" --exit --skip-pr-check
+          f="$(find "$out" -type f -name "$PACKAGE_ID.installer.yaml" -print -quit)"
+          if [ -z "$f" ]; then
+            echo "::error::Komac wrote no installer manifest for $VERSION"
+            exit 1
+          fi
+          cat "$f"
+
+          # A root RelativeFilePath of hyperdu.exe proves Komac detected the exe in BOTH zips;
+          # on a detection miss the stale hyperdu.Cli.exe from 0.1.5 would survive at the root.
+          test "$(yq '.NestedInstallerType' "$f")" = portable
+          test "$(yq '.NestedInstallerFiles | length' "$f")" = 1
+          test "$(yq '.NestedInstallerFiles[0].RelativeFilePath' "$f")" = hyperdu.exe
+          test "$(yq '[.Installers[].Architecture] | sort | join(",")' "$f")" = x64,x86
+          if grep -q 'hyperdu.Cli' "$f"; then echo "::error::stale hyperdu.Cli reference"; exit 1; fi
+
+          curl -fsSL "$base/SHA256SUMS" -o "$RUNNER_TEMP/SHA256SUMS"
+          for a in x64 x86; do
+            want="$(grep " hyperdu-win-$a.zip\$" "$RUNNER_TEMP/SHA256SUMS" | cut -d' ' -f1 | tr a-f A-F)"
+            got="$(yq ".Installers[] | select(.Architecture == \"$a\") | .InstallerSha256" "$f")"
+            test -n "$want"
+            test "$want" = "$got"
+          done
+
+          yq -i '.NestedInstallerFiles[0].PortableCommandAlias = "hyperdu"' "$f"
+          cat "$f"
+          echo "MANIFEST_DIR=$(dirname "$f")" >> "$GITHUB_ENV"
+
+      - name: Submit to microsoft/winget-pkgs
+        env:
+          GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          set -euo pipefail
+          komac sync-fork
+          komac submit "$MANIFEST_DIR" --yes
+          komac cleanup --only-merged || true

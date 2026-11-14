@@ -126,10 +126,7 @@ public static class Program
         }
 
         AnsiConsole.Write(new FigletText("hyperdu").Color(Color.DeepSkyBlue4));
-        var version = System.Reflection.Assembly.GetEntryAssembly()?
-            .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?
-            .InformationalVersion ?? "1.0.0-local";
-        AnsiConsole.Write(new Markup($"[bold teal]High-Performance Directory Space Analyzer v{version}[/]\n\n"));
+        AnsiConsole.Write(new Markup($"[bold teal]High-Performance Directory Space Analyzer v{Markup.Escape(GetDisplayVersion())}[/]\n\n"));
 
         string targetPath = parsed.TargetPath;
 
@@ -219,12 +216,29 @@ public static class Program
         AnsiConsole.MarkupLine("  [cyan]--skip-hidden[/]       Skip hidden and system files/folders");
     }
 
+    // Plain Console output so package-manager smoke tests and scripts get one unwrapped line.
     private static void PrintVersion()
     {
-        var version = System.Reflection.Assembly.GetEntryAssembly()?
-            .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?
-            .InformationalVersion ?? "1.0.0-local";
-        AnsiConsole.MarkupLine($"hyperdu version [green]{version}[/]");
+        Console.WriteLine($"hyperdu {GetDisplayVersion()}");
+    }
+
+    /// <summary>
+    /// Formats "1.2.0+&lt;full sha&gt;" (SourceLink appends the commit) as "1.2.0 (abc1234)".
+    /// </summary>
+    private static string GetDisplayVersion()
+    {
+        string informational = Assembly.GetEntryAssembly()?
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+            .InformationalVersion ?? "0.0.0-local";
+
+        int plus = informational.IndexOf('+');
+        if (plus < 0) return informational;
+
+        string version = informational[..plus];
+        string metadata = informational[(plus + 1)..];
+        return metadata.Length >= 7 && metadata.All(Uri.IsHexDigit)
+            ? $"{version} ({metadata[..7]})"
+            : version;
     }
 
     private static bool IsNetworkMount(string path)
