@@ -36,31 +36,22 @@ public class NativeDirectoryTests
     }
 
     [UnixFact]
-    public unsafe void Open_ReportsErrnoForMissingDirectory()
+    public void Open_ReportsErrnoForMissingDirectory()
     {
         byte[] path = Encoding.UTF8.GetBytes("/nonexistent-hyperdu-test-path\0");
-        NativeDirectory? directory;
-        int error;
-        fixed (byte* p = path)
-        {
-            directory = NativeDirectory.Open(p, out error);
-        }
+        NativeDirectory? directory = NativeDirectory.Open(path, out int error);
 
         Assert.Null(directory);
         Assert.Equal("Directory Not Found", NativeIo.DescribeError(error));
     }
 
-    private static unsafe Dictionary<string, (NativeEntryKind Kind, long Size)> ReadAll(string dir)
+    private static Dictionary<string, (NativeEntryKind Kind, long Size)> ReadAll(string dir)
     {
         Dictionary<string, (NativeEntryKind Kind, long Size)> result = new();
-        byte* buffer = stackalloc byte[NativeIo.StatBufferSize];
+        Span<byte> buffer = stackalloc byte[NativeIo.StatBufferSize];
         byte[] path = Encoding.UTF8.GetBytes(dir + "\0");
 
-        NativeDirectory? directory;
-        fixed (byte* p = path)
-        {
-            directory = NativeDirectory.Open(p, out _);
-        }
+        NativeDirectory? directory = NativeDirectory.Open(path, out _);
 
         Assert.NotNull(directory);
         using (directory)

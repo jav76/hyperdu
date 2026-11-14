@@ -395,20 +395,14 @@ public class ParallelScanner
     /// Reads one directory with libc: names stay raw bytes and every stat is relative to the open directory,
     /// so the kernel never re-walks the full path per entry. Returns an error message when the directory cannot be read.
     /// </summary>
-    private unsafe string? ReadDirectoryNative(DirectoryNode node, ref long localSelfSize, ref int localFilesCount,
+    private string? ReadDirectoryNative(DirectoryNode node, ref long localSelfSize, ref int localFilesCount,
         ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates,
         CancellationToken cancellationToken)
     {
-        byte* statBuffer = stackalloc byte[NativeIo.StatBufferSize];
+        Span<byte> statBuffer = stackalloc byte[NativeIo.StatBufferSize];
         bool checkHiddenFlag = _options.SkipHidden && NativeIo.IsMacOS;
 
-        NativeDirectory? directory;
-        int openError;
-        fixed (byte* path = node.GetNativePath())
-        {
-            directory = NativeDirectory.Open(path, out openError);
-        }
-
+        NativeDirectory? directory = NativeDirectory.Open(node.GetNativePath(), out int openError);
         if (directory == null) return NativeIo.DescribeError(openError);
 
         using (directory)

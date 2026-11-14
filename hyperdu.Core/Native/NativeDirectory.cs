@@ -25,16 +25,25 @@ internal sealed unsafe class NativeDirectory : IDisposable
     public int Error { get; private set; }
 
     /// <summary>Null-terminated name of the current entry.</summary>
-    public byte* CurrentNamePointer => _entry + NativeIo.DirentNameOffset;
+    private byte* CurrentNamePointer => _entry + NativeIo.DirentNameOffset;
 
     public ReadOnlySpan<byte> CurrentName => new(CurrentNamePointer, _nameLength);
 
     public NativeEntryKind CurrentKind => NativeIo.KindFromDirentType(_entry[NativeIo.DirentTypeOffset]);
 
     /// <summary>Opens <paramref name="path"/> (null-terminated). Returns null and sets <paramref name="error"/> on failure.</summary>
-    public static NativeDirectory? Open(byte* path, out int error)
+    public static NativeDirectory? Open(ReadOnlySpan<byte> path, out int error)
     {
-        error = NativeIo.OpenDirectory(path, out nint dir, out int fd);
+        if (path.IsEmpty || path[^1] != 0)
+            throw new ArgumentException("Path must be null-terminated.", nameof(path));
+
+        nint dir;
+        int fd;
+        fixed (byte* p = path)
+        {
+            error = NativeIo.OpenDirectory(p, out dir, out fd);
+        }
+
         return error == 0 ? new NativeDirectory(dir, fd) : null;
     }
 
@@ -62,8 +71,17 @@ internal sealed unsafe class NativeDirectory : IDisposable
         }
     }
 
-    public bool TryStatCurrent(bool followSymlinks, byte* buffer, out NativeStat stat) =>
-        NativeIo.TryStatAt(Fd, CurrentNamePointer, followSymlinks, buffer, out stat);
+    /// <summary>Stats the current entry. <paramref name="buffer"/> must hold at least <see cref="NativeIo.StatBufferSize"/> bytes.</summary>
+    public bool TryStatCurrent(bool followSymlinks, Span<byte> buffer, out NativeStat stat)
+    {
+        if (buffer.Length < NativeIo.StatBufferSize)
+            throw new ArgumentException("Buffer is smaller than NativeIo.StatBufferSize.", nameof(buffer));
+
+        fixed (byte* p = buffer)
+        {
+            return NativeIo.TryStatAt(Fd, CurrentNamePointer, followSymlinks, p, out stat);
+        }
+    }
 
     /// <summary>Layout sanity check used by the startup probe.</summary>
     internal bool IsCurrentEntryWellFormed()

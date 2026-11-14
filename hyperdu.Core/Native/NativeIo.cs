@@ -170,7 +170,7 @@ internal static unsafe class NativeIo
                 rootStat.Kind != NativeEntryKind.Directory)
                 return false;
 
-            using NativeDirectory? directory = NativeDirectory.Open(root, out _);
+            using NativeDirectory? directory = NativeDirectory.Open(new ReadOnlySpan<byte>(root, 2), out _);
             if (directory == null) return false;
 
             while (directory.MoveNext())

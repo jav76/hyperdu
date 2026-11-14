@@ -37,18 +37,12 @@ public static class DirectoryListing
         return files;
     }
 
-    private static unsafe List<(string Name, long Size)> ListFilesNative(DirectoryNode directory)
+    private static List<(string Name, long Size)> ListFilesNative(DirectoryNode directory)
     {
         List<(string Name, long Size)> files = new List<(string Name, long Size)>();
-        byte* statBuffer = stackalloc byte[NativeIo.StatBufferSize];
+        Span<byte> statBuffer = stackalloc byte[NativeIo.StatBufferSize];
 
-        NativeDirectory? handle;
-        int openError;
-        fixed (byte* path = directory.GetNativePath())
-        {
-            handle = NativeDirectory.Open(path, out openError);
-        }
-
+        NativeDirectory? handle = NativeDirectory.Open(directory.GetNativePath(), out int openError);
         if (handle == null) throw new IOException(NativeIo.DescribeError(openError));
 
         using (handle)
