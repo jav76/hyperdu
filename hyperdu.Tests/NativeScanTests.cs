@@ -40,6 +40,23 @@ public class NativeScanTests
         Assert.Equal(1_000 + 2_000 + 3_000, nativeRoot.TotalSize);
     }
 
+    [MacFact("UF_HIDDEN is a macOS file flag.")]
+    public async Task SkipHidden_SkipsEntriesWithTheHiddenFlag()
+    {
+        using TempTree tree = new TempTree();
+        tree.File("visible", 100);
+        TestLibc.SetHiddenFlag(tree.File("flagged", 200));
+        tree.File("flaggeddir/payload", 400);
+        TestLibc.SetHiddenFlag(Path.Combine(tree.Root, "flaggeddir"));
+
+        (_, DirectoryNode shownRoot) = await ScanAsync(tree.Root, useNativeIo: true);
+        (_, DirectoryNode skippedRoot) = await ScanAsync(tree.Root, useNativeIo: true, skipHidden: true);
+
+        Assert.Equal(100 + 200 + 400, shownRoot.TotalSize);
+        Assert.Equal(100, skippedRoot.TotalSize);
+        Assert.Empty(skippedRoot.Subdirectories);
+    }
+
     [UnixFact]
     public async Task DirectorySymlink_IsListedButNotTraversed()
     {
@@ -54,6 +71,40 @@ public class NativeScanTests
         Assert.Empty(link.Subdirectories);
         Assert.Equal("real".Length, link.TotalSize);
         Assert.Equal(500 + "real".Length, root.TotalSize);
+    }
+
+    [UnixFact]
+    public async Task DirectorySymlink_IsTraversedWhenFollowing()
+    {
+        using TempTree tree = new TempTree();
+        tree.File("real/payload", 500);
+        File.CreateSymbolicLink(Path.Combine(tree.Root, "link"), "real");
+
+        (_, DirectoryNode root) = await ScanAsync(tree.Root, useNativeIo: true, followSymlinks: true);
+
+        DirectoryNode link = root.Subdirectories.Single(d => d.Name == "link");
+        Assert.Equal(500, link.TotalSize);
+        Assert.Equal(1, link.FileCount);
+        Assert.Equal(1_000, root.TotalSize);
+    }
+
+    [UnixFact]
+    public async Task FileSymlinks_AreCountedOnlyWhenFollowing()
+    {
+        using TempTree tree = new TempTree();
+        tree.File("data", 300);
+        File.CreateSymbolicLink(Path.Combine(tree.Root, "filelink"), "data");
+        File.CreateSymbolicLink(Path.Combine(tree.Root, "dangling"), "missing-target");
+
+        (ParallelScanner plain, DirectoryNode plainRoot) = await ScanAsync(tree.Root, useNativeIo: true);
+        (ParallelScanner following, DirectoryNode followingRoot) =
+            await ScanAsync(tree.Root, useNativeIo: true, followSymlinks: true);
+
+        Assert.Equal(300, plainRoot.TotalSize);
+        Assert.Equal(1, plain.FilesScanned);
+        // A followed link counts its target's size; a dangling one falls back to the link's own size.
+        Assert.Equal(300 + 300 + "missing-target".Length, followingRoot.TotalSize);
+        Assert.Equal(3, following.FilesScanned);
     }
 
     [LinuxFact(NeedsByteNames)]
@@ -174,13 +225,14 @@ public class NativeScanTests
     }
 
     private static async Task<(ParallelScanner Scanner, DirectoryNode Root)> ScanAsync(string path, bool useNativeIo,
-        bool skipHidden = false)
+        bool skipHidden = false, bool followSymlinks = false)
     {
         ParallelScanner scanner = new ParallelScanner(new ScanOptions
         {
             WorkerCount = 4,
             UseNativeIo = useNativeIo,
-            SkipHidden = skipHidden
+            SkipHidden = skipHidden,
+            FollowSymlinks = followSymlinks
         });
         DirectoryNode root = await scanner.ScanAsync(path);
         return (scanner, root);

@@ -413,18 +413,9 @@ public class ParallelScanner
                 _pauseEvent.Wait(cancellationToken);
 
                 ReadOnlySpan<byte> name = directory.CurrentName;
-                if (_options.SkipHidden && name[0] == (byte)'.') continue;
-
-                NativeEntryKind kind = directory.CurrentKind;
-                NativeStat linkStat = default;
-                if (kind != NativeEntryKind.Directory || checkHiddenFlag)
-                {
-                    if (directory.TryStatCurrent(false, statBuffer, out linkStat))
-                    {
-                        if (checkHiddenFlag && linkStat.HasHiddenFlag) continue;
-                        if (kind == NativeEntryKind.Unknown) kind = linkStat.Kind;
-                    }
-                }
+                if (!TryClassifyNativeEntry(directory, name, checkHiddenFlag, statBuffer, out NativeEntryKind kind,
+                        out NativeStat linkStat))
+                    continue;
 
                 switch (kind)
                 {
@@ -433,14 +424,13 @@ public class ParallelScanner
                         break;
 
                     case NativeEntryKind.Symlink:
-                        bool hasTarget = directory.TryStatCurrent(true, statBuffer, out NativeStat target);
-                        if (hasTarget && target.Kind == NativeEntryKind.Directory)
+                        if (IsSymlinkToDirectory(directory, statBuffer, linkStat.Size, out long targetSize))
                         {
                             ProcessNativeDirectoryEntry(name, node, true, linkStat.Size, ref subdirsToQueue, localUpdates);
                         }
                         else if (_options.FollowSymlinks)
                         {
-                            localSelfSize += hasTarget ? target.Size : linkStat.Size;
+                            localSelfSize += targetSize;
                             localFilesCount++;
                         }
 
@@ -455,6 +445,35 @@ public class ParallelScanner
 
             return directory.Error == 0 ? null : NativeIo.DescribeError(directory.Error);
         }
+    }
+
+    /// <summary>
+    /// Directories skip the lstat unless the macOS UF_HIDDEN check needs it.
+    /// <paramref name="linkStat"/> stays default when no lstat ran or it failed.
+    /// </summary>
+    private bool TryClassifyNativeEntry(NativeDirectory directory, ReadOnlySpan<byte> name, bool checkHiddenFlag,
+        Span<byte> statBuffer, out NativeEntryKind kind, out NativeStat linkStat)
+    {
+        kind = default;
+        linkStat = default;
+        if (_options.SkipHidden && name[0] == (byte)'.') return false;
+
+        kind = directory.CurrentKind;
+        bool needsLinkStat = kind != NativeEntryKind.Directory || checkHiddenFlag;
+        if (!needsLinkStat || !directory.TryStatCurrent(false, statBuffer, out linkStat)) return true;
+
+        if (checkHiddenFlag && linkStat.HasHiddenFlag) return false;
+        if (kind == NativeEntryKind.Unknown) kind = linkStat.Kind;
+        return true;
+    }
+
+    /// <summary><paramref name="targetSize"/> falls back to <paramref name="linkSize"/> for a dangling link.</summary>
+    private static bool IsSymlinkToDirectory(NativeDirectory directory, Span<byte> statBuffer, long linkSize,
+        out long targetSize)
+    {
+        bool hasTarget = directory.TryStatCurrent(true, statBuffer, out NativeStat target);
+        targetSize = hasTarget ? target.Size : linkSize;
+        return hasTarget && target.Kind == NativeEntryKind.Directory;
     }
 
     private void ProcessNativeDirectoryEntry(ReadOnlySpan<byte> nativeName, DirectoryNode node, bool isSymlink, long linkSize,
