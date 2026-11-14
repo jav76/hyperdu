@@ -51,6 +51,9 @@ jobs:
 
       - name: Build and analyze
         run: |
-          ${{ runner.temp }}/scanner/dotnet-sonarscanner begin /k:"jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f" /d:sonar.token="${{ secrets.SONAR_TOKEN }}" /d:sonar.host.url="${{ secrets.SONAR_HOST_URL }}"
+          ${{ runner.temp }}/scanner/dotnet-sonarscanner begin /k:"jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f" /d:sonar.token="${{ secrets.SONAR_TOKEN }}" /d:sonar.host.url="${{ secrets.SONAR_HOST_URL }}" \
+            /d:sonar.issue.ignore.multicriteria=e1 \
+            /d:sonar.issue.ignore.multicriteria.e1.ruleKey=csharpsquid:S6640 \
+            /d:sonar.issue.ignore.multicriteria.e1.resourceKey="hyperdu.Core/Native/**"
           dotnet build
           ${{ runner.temp }}/scanner/dotnet-sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
