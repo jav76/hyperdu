@@ -68,5 +68,9 @@ nunit-*.xml
 *.sln.DotSettings.user
 
 
-# Architecture decision records stay local (public repo)
+# Internal-only architecture decision, planning, and guide docs stay local (public repo)
 docs/adr/
+docs/du-compatibility-plan.md
+docs/publishing-guide.md
+docs/*-plan.md
+docs/*-guide.md

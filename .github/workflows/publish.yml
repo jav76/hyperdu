@@ -137,10 +137,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          stage="stage/hyperdu-${{ matrix.platform }}"
-          mkdir -p "$stage"
-          cp "publish/${{ matrix.platform }}/hyperdu" LICENSE README.md "$stage/"
-          tar -czf "hyperdu-${{ matrix.platform }}.tar.gz" -C "$stage" hyperdu LICENSE README.md
+          bash .github/scripts/package-unix-archive.sh \
+            "publish/${{ matrix.platform }}/hyperdu" \
+            "hyperdu-${{ matrix.platform }}.tar.gz" \
+            LICENSE \
+            README.md
+
+      - name: Verify Unix Release Archive
+        if: ${{ !startsWith(matrix.platform, 'win-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp_verify="$(mktemp -d "${TMPDIR:-/tmp}/hyperdu-verify.XXXXXX")"
+          trap 'rm -rf "$tmp_verify"' EXIT
+          bash .github/scripts/verify-unix-archive.sh \
+            "hyperdu-${{ matrix.platform }}.tar.gz" \
+            --extract-dir "$tmp_verify/bin"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            python3 .github/scripts/check-aot-startup.py \
+              --binary "$tmp_verify/bin/du" \
+              --target README.md \
+              --max-median-ms 5.0
+            bash tests/compat/diff-run.sh \
+              --candidate-du "$tmp_verify/bin/du" \
+              --min-score 100
+          fi
 
       - name: Upload Debug Symbols
         uses: actions/upload-artifact@v4

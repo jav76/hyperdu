@@ -10,6 +10,7 @@ on:
       - "hyperdu.Core/**"
       - "hyperdu.Cli/**"
       - "tests/compat/**"
+      - ".github/scripts/**"
       - ".github/workflows/compat.yml"
 
 permissions:
@@ -44,12 +45,26 @@ jobs:
           echo "Reference du: $ACTUAL_VER (pinned: $PINNED_GNU_DU_VERSION)"
           echo "$ACTUAL_VER" | grep -q "GNU coreutils) $PINNED_GNU_DU_VERSION"
 
-      - name: Publish Native AOT hyperdu and create du symlink
+      - name: Publish Native AOT hyperdu, package archive, and extract du symlink
         run: |
-          mkdir -p artifacts/compat-bin
-          dotnet publish hyperdu.Cli/hyperdu.Cli.csproj -c Release -r linux-x64 -p:PublishAot=true -o artifacts/compat-bin --nologo -v quiet
-          ln -sf hyperdu artifacts/compat-bin/du
-          ln -sf hyperdu artifacts/compat-bin/gdu
+          mkdir -p artifacts/publish-bin artifacts/compat-archive artifacts/compat-bin
+          dotnet publish hyperdu.Cli/hyperdu.Cli.csproj -c Release -r linux-x64 -p:PublishAot=true -o artifacts/publish-bin --nologo -v quiet
+          bash .github/scripts/package-unix-archive.sh \
+            artifacts/publish-bin/hyperdu \
+            artifacts/compat-archive/hyperdu-linux-x64.tar.gz \
+            LICENSE \
+            README.md
+          bash .github/scripts/verify-unix-archive.sh \
+            artifacts/compat-archive/hyperdu-linux-x64.tar.gz \
+            --extract-dir artifacts/compat-bin
+
+      - name: Check AOT du FILE startup latency (< 5 ms)
+        run: |
+          python3 .github/scripts/check-aot-startup.py \
+            --binary artifacts/compat-bin/du \
+            --target README.md \
+            --max-median-ms 5.0 \
+            --markdown artifacts/compat/startup-report.md
 
       - name: Run differential compatibility harness (100% gate across all phases and thread modes)
         run: |
@@ -78,7 +93,7 @@ jobs:
       - name: Publish compatibility summary
         if: always()
         run: |
-          for f in artifacts/compat/diff-report.md artifacts/compat/gnu-suite-report.md; do
+          for f in artifacts/compat/startup-report.md artifacts/compat/diff-report.md artifacts/compat/gnu-suite-report.md; do
             if [ -f "$f" ]; then
               cat "$f" >> "$GITHUB_STEP_SUMMARY"
               echo "" >> "$GITHUB_STEP_SUMMARY"
