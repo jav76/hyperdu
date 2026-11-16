@@ -51,6 +51,10 @@ internal static unsafe partial class Libc
 
     internal const uint UF_HIDDEN = 0x8000;
 
+    internal const ulong TMPFS_MAGIC = 0x01021994;
+    internal const ulong RAMFS_MAGIC = 0x858458F6;
+    internal const ulong NFS_SUPER_MAGIC = 0x6969;
+
     // open(2) and openat(2) are variadic; declaring only the fixed arguments is ABI-safe because O_CREAT is never passed.
     [LibraryImport(Lib, SetLastError = true)]
     internal static partial int open(byte* path, int flags);
@@ -60,6 +64,9 @@ internal static unsafe partial class Libc
 
     [LibraryImport(Lib)]
     internal static partial int close(int fd);
+
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int fstatfs(int fd, byte* buf);
 
     [LibraryImport(Lib)]
     internal static partial nint signal(int signum, nint handler);

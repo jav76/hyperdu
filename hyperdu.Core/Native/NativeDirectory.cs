@@ -29,6 +29,8 @@ internal sealed unsafe class NativeDirectory : IDisposable
 
     public ReadOnlySpan<byte> CurrentName => new(CurrentNamePointer, _nameLength);
 
+    public ulong CurrentInode => *(ulong*)_entry;
+
     public NativeEntryKind CurrentKind => NativeIo.KindFromDirentType(_entry[NativeIo.DirentTypeOffset]);
 
     /// <summary>Opens <paramref name="path"/> (null-terminated). Returns null and sets <paramref name="error"/> on failure.</summary>
@@ -108,6 +110,21 @@ internal sealed unsafe class NativeDirectory : IDisposable
         fixed (byte* p = buffer)
         {
             return NativeIo.TryStatAt(Fd, CurrentNamePointer, followSymlinks, p, out stat, out errno);
+        }
+    }
+
+    /// <summary>Stats <paramref name="nullTerminatedName"/> relative to this directory and outputs errno on failure.</summary>
+    public bool TryStatRelative(ReadOnlySpan<byte> nullTerminatedName, bool followSymlinks, Span<byte> buffer, out NativeStat stat, out int errno)
+    {
+        if (nullTerminatedName.IsEmpty || nullTerminatedName[^1] != 0)
+            throw new ArgumentException("Name must be null-terminated.", nameof(nullTerminatedName));
+        if (buffer.Length < NativeIo.StatBufferSize)
+            throw new ArgumentException("Buffer is smaller than NativeIo.StatBufferSize.", nameof(buffer));
+
+        fixed (byte* pName = nullTerminatedName)
+        fixed (byte* pBuf = buffer)
+        {
+            return NativeIo.TryStatAt(Fd, pName, followSymlinks, pBuf, out stat, out errno);
         }
     }
 

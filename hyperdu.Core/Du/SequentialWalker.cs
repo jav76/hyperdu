@@ -11,8 +11,10 @@ namespace hyperdu.Core.Du;
 public sealed class SequentialWalker
 {
     private readonly record struct FileIdentity(ulong Device, ulong Inode);
+    private readonly record struct DirEntry(ulong Inode, int Order, byte[] NullTermName);
 
     private const int OutputBufferSize = 65536;
+    private const int InodeSortThreshold = 10000;
     private static readonly int OpenFdSafetyCap = OperatingSystem.IsMacOS() ? 200 : 850;
 
     private readonly DuOptions _options;
@@ -123,17 +125,27 @@ public sealed class SequentialWalker
 
         // Keep open FDs bounded so deeply nested trees cannot hit RLIMIT_NOFILE.
         _openDirCount++;
-        List<(byte[] Name, byte[] ChildPath, NativeStat Stat)>? deferredSubdirs =
+        List<(byte[] ChildPath, NativeStat Stat)>? deferredSubdirs =
             _openDirCount >= OpenFdSafetyCap ? [] : null;
 
         try
         {
-            while (dir.MoveNext())
+            List<DirEntry> entries = ReadDirectoryEntries(dir, displayPath);
+            if (entries.Count > InodeSortThreshold && NativeIo.ShouldSortDirectoryByInode(dir.Fd))
             {
-                ReadOnlySpan<byte> entryName = dir.CurrentName;
+                entries.Sort(static (a, b) =>
+                {
+                    int cmp = a.Inode.CompareTo(b.Inode);
+                    return cmp != 0 ? cmp : a.Order.CompareTo(b.Order);
+                });
+            }
+
+            foreach (DirEntry entry in entries)
+            {
+                ReadOnlySpan<byte> entryName = entry.NullTermName.AsSpan(0, entry.NullTermName.Length - 1);
                 byte[] childPath = JoinPath(displayPath, entryName);
 
-                if (!dir.TryStatCurrent(followSymlinks: false, _statBuffer, out NativeStat childStat, out int statErrno))
+                if (!dir.TryStatRelative(entry.NullTermName, followSymlinks: false, _statBuffer, out NativeStat childStat, out int statErrno))
                 {
                     FlushOutput();
                     Messages.WritePosixError(_stderr, _programName, "cannot access", childPath, statErrno);
@@ -151,12 +163,11 @@ public sealed class SequentialWalker
                 {
                     if (deferredSubdirs != null)
                     {
-                        byte[] nameNullTerm = NullTerminate(entryName);
-                        deferredSubdirs.Add((nameNullTerm, childPath, childStat));
+                        deferredSubdirs.Add((childPath, childStat));
                     }
                     else
                     {
-                        using NativeDirectory? subDir = dir.OpenCurrentDirectory(out int subOpenErrno);
+                        using NativeDirectory? subDir = NativeDirectory.OpenRelative(dir.Fd, entry.NullTermName, out int subOpenErrno);
                         (ulong subReported, ulong subFull) = WalkDirectory(
                             subDir,
                             subOpenErrno,
@@ -175,13 +186,6 @@ public sealed class SequentialWalker
                         EmitLine(entryBytes, childPath);
                 }
             }
-
-            if (dir.Error != 0)
-            {
-                FlushOutput();
-                Messages.WritePosixError(_stderr, _programName, "cannot read directory", displayPath, dir.Error);
-                _hasError = true;
-            }
         }
         finally
         {
@@ -191,7 +195,7 @@ public sealed class SequentialWalker
 
         if (deferredSubdirs != null)
         {
-            foreach ((byte[] _, byte[] childPath, NativeStat childStat) in deferredSubdirs)
+            foreach ((byte[] childPath, NativeStat childStat) in deferredSubdirs)
             {
                 byte[] pathNullTerm = NullTerminate(childPath);
                 using NativeDirectory? subDir = NativeDirectory.Open(pathNullTerm, out int subOpenErrno);
@@ -214,6 +218,25 @@ public sealed class SequentialWalker
             EmitLine(reportedTotal, displayPath);
 
         return (_options.SeparateDirs ? 0UL : reportedTotal, fullTotal);
+    }
+
+    private List<DirEntry> ReadDirectoryEntries(NativeDirectory dir, byte[] displayPath)
+    {
+        List<DirEntry> entries = [];
+        int order = 0;
+        while (dir.MoveNext())
+        {
+            entries.Add(new DirEntry(dir.CurrentInode, order++, NullTerminate(dir.CurrentName)));
+        }
+
+        if (dir.Error != 0)
+        {
+            FlushOutput();
+            Messages.WritePosixError(_stderr, _programName, "cannot read directory", displayPath, dir.Error);
+            _hasError = true;
+        }
+
+        return entries;
     }
 
     private ulong ComputeEntryBytes(in NativeStat stat)

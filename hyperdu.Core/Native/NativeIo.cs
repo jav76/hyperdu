@@ -247,6 +247,24 @@ internal static unsafe class NativeIo
     }
 
     /// <summary>
+    /// Matches gnulib fts_build inode-sort filesystem check: on Linux local block filesystems
+    /// (everything except tmpfs, ramfs, and NFS), sorting large directories by d_ino avoids random disk seeks
+    /// and matches GNU du output ordering on ext4.
+    /// </summary>
+    internal static bool ShouldSortDirectoryByInode(int dirFd)
+    {
+        if (s_platform != Platform.Linux)
+            return false;
+
+        byte* buf = stackalloc byte[128];
+        if (Libc.fstatfs(dirFd, buf) != 0)
+            return false;
+
+        ulong fsType = *(ulong*)buf;
+        return fsType is not (Libc.TMPFS_MAGIC or Libc.RAMFS_MAGIC or Libc.NFS_SUPER_MAGIC);
+    }
+
+    /// <summary>
     /// Binds every entry point once and checks the struct layouts against "/", so a platform
     /// with unexpected symbols or layouts falls back to the managed scanner instead of misreading data.
     /// </summary>
