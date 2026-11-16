@@ -121,34 +121,23 @@ public static partial class DiskDeviceHelper
 
     private static bool IsRotationalDriveLinux(string path)
     {
+        if (!MountHeuristics.TryGetLinuxMountInfo(path, out string bestMatchDevice, out _) ||
+            string.IsNullOrEmpty(bestMatchDevice))
+        {
+            return false;
+        }
+
+        return IsRotationalBlockDevice(bestMatchDevice);
+    }
+
+    internal static bool IsRotationalBlockDevice(string devicePath)
+    {
         try
         {
-            string fullPath = Path.GetFullPath(path);
-            if (!File.Exists("/proc/mounts")) return false;
-
-            string[] lines = File.ReadAllLines("/proc/mounts");
-            string bestMatchMount = "";
-            string bestMatchDevice = "";
-
-            foreach (string line in lines)
-            {
-                string[] parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length < 3) continue;
-
-                string device = parts[0];
-                string mountPoint = parts[1];
-
-                if (fullPath.StartsWith(mountPoint, StringComparison.Ordinal) && mountPoint.Length > bestMatchMount.Length)
-                {
-                    bestMatchMount = mountPoint;
-                    bestMatchDevice = device;
-                }
-            }
-
-            if (string.IsNullOrEmpty(bestMatchDevice))
+            if (string.IsNullOrEmpty(devicePath))
                 return false;
 
-            string baseDevice = GetBaseBlockDevice(bestMatchDevice);
+            string baseDevice = GetBaseBlockDevice(devicePath);
             if (string.IsNullOrEmpty(baseDevice))
                 return false;
 

@@ -1,4 +1,5 @@
 using hyperdu.Core.Du;
+using hyperdu.Core.Native;
 
 namespace hyperdu.Cli;
 
@@ -11,11 +12,11 @@ internal static class DuCommand
     public static int Run(string[] args, string programName, string version, bool restoreSigpipe = true)
     {
         if (restoreSigpipe)
-            SequentialWalker.RestoreDefaultSigpipe();
+            ParallelDuWalker.RestoreDefaultSigpipe();
 
-        using Stream stdin = Console.OpenStandardInput();
-        using Stream stdout = Console.OpenStandardOutput();
-        using Stream stderr = Console.OpenStandardError();
+        using Stream stdin = OpenStandardFd(0, FileAccess.Read) ?? Console.OpenStandardInput();
+        using Stream stdout = OpenStandardFd(1, FileAccess.Write) ?? Console.OpenStandardOutput();
+        using Stream stderr = OpenStandardFd(2, FileAccess.Write) ?? Console.OpenStandardError();
 
         try
         {
@@ -28,18 +29,26 @@ internal static class DuCommand
                 stderr,
                 out DuOptions? options);
 
-            return outcome switch
-            {
-                DuParseOutcome.ExitSuccess => 0,
-                DuParseOutcome.ExitFailure => 1,
-                DuParseOutcome.Run when options != null => new SequentialWalker(options, programName, stdin, stdout, stderr).Run(),
-                _ => 1
-            };
+            if (outcome == DuParseOutcome.ExitSuccess)
+                return 0;
+
+            if (outcome != DuParseOutcome.Run || options == null)
+                return 1;
+
+            return new ParallelDuWalker(options, programName, stdin, stdout, stderr).Run();
         }
         catch (IOException ex) when (IsBrokenPipe(ex))
         {
             return 141;
         }
+    }
+
+    private static Stream? OpenStandardFd(int fd, FileAccess access)
+    {
+        if (OperatingSystem.IsWindows())
+            return null;
+
+        return new RawUnixFdStream(fd, writable: access == FileAccess.Write);
     }
 
     private static bool IsBrokenPipe(IOException ex) =>

@@ -240,7 +240,7 @@ internal static unsafe class NativeIo
             _ = Libc.close(fd);
     }
 
-    private static int WrapOpenDirectoryFd(int fd, out nint dir)
+    internal static int WrapOpenDirectoryFd(int fd, out nint dir)
     {
         dir = 0;
         if (fd < 0) return GetLastErrno();

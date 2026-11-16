@@ -36,6 +36,7 @@ parser.add_argument("--markdown", dest="md_out", help="Write Markdown report to 
 parser.add_argument("--category", action="append", help="Filter vectors by category (repeatable)")
 parser.add_argument("--baseline", action="store_true", help="Exit 0 regardless of score (Phase 0 baseline mode)")
 parser.add_argument("--min-score", type=float, default=100.0, help="Minimum passing percentage (ignored with --baseline)")
+parser.add_argument("--threads-matrix", help="Comma-separated HYPERDU_THREADS modes to verify (e.g. 1,4,auto)")
 args = parser.parse_args(argv)
 
 def find_ref_du(override: str | None) -> str:
@@ -236,38 +237,63 @@ try:
     def evaluate_vector(item):
         vec_id, category, env_ov, vec_args, stdin_data = item
         ref_rc, ref_out, ref_err, ref_to = run_one(ref_du, env_ov, vec_args, stdin_data)
-        cand_rc, cand_out, cand_err, cand_to = run_one(cand_du, env_ov, vec_args, stdin_data)
 
-        stdout_match = (cand_out == ref_out)
-        stderr_match = (cand_err == ref_err)
-        exit_match = (cand_rc == ref_rc) and (not cand_to) and (not ref_to)
-        passed = stdout_match and stderr_match and exit_match
+        thread_modes = [m.strip() for m in args.threads_matrix.split(",") if m.strip()] if args.threads_matrix else [None]
+        mode_failures = []
+        last_rc = ref_rc
+        last_to = False
+        stdout_match = True
+        stderr_match = True
+        exit_match = True
 
-        reasons = []
-        if cand_to:
-            reasons.append("candidate-timeout")
+        for mode in thread_modes:
+            cand_env = dict(env_ov)
+            if mode == "auto":
+                cand_env.pop("HYPERDU_THREADS", None)
+            elif mode is not None:
+                cand_env["HYPERDU_THREADS"] = mode
+
+            cand_rc, cand_out, cand_err, cand_to = run_one(cand_du, cand_env, vec_args, stdin_data)
+            last_rc = cand_rc
+            if cand_to:
+                last_to = True
+
+            s_ok = (cand_out == ref_out)
+            e_ok = (cand_err == ref_err)
+            x_ok = (cand_rc == ref_rc) and (not cand_to) and (not ref_to)
+            stdout_match = stdout_match and s_ok
+            stderr_match = stderr_match and e_ok
+            exit_match = exit_match and x_ok
+
+            prefix = f"[threads={mode}] " if mode is not None else ""
+            if cand_to:
+                mode_failures.append(f"{prefix}candidate-timeout")
+            if not x_ok and not cand_to and not ref_to:
+                mode_failures.append(f"{prefix}exit({cand_rc}!={ref_rc})")
+            if not s_ok:
+                mode_failures.append(f"{prefix}stdout-diff({len(cand_out)}B!={len(ref_out)}B)")
+            if not e_ok:
+                mode_failures.append(f"{prefix}stderr-diff({len(cand_err)}B!={len(ref_err)}B)")
+
         if ref_to:
-            reasons.append("reference-timeout")
-        if not exit_match and not cand_to and not ref_to:
-            reasons.append(f"exit({cand_rc}!={ref_rc})")
-        if not stdout_match:
-            reasons.append(f"stdout-diff({len(cand_out)}B!={len(ref_out)}B)")
-        if not stderr_match:
-            reasons.append(f"stderr-diff({len(cand_err)}B!={len(ref_err)}B)")
+            mode_failures.insert(0, "reference-timeout")
+
+        passed = stdout_match and stderr_match and exit_match
 
         return {
             "id": vec_id,
             "category": category,
             "args": vec_args,
             "env": env_ov,
+            "threads_matrix": thread_modes if args.threads_matrix else None,
             "passed": passed,
             "stdout_match": stdout_match,
             "stderr_match": stderr_match,
             "exit_match": exit_match,
-            "timed_out": cand_to,
+            "timed_out": last_to,
             "ref_exit": ref_rc,
-            "cand_exit": cand_rc,
-            "reasons": reasons,
+            "cand_exit": last_rc,
+            "reasons": mode_failures,
         }
 
     if args.category:

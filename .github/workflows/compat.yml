@@ -51,7 +51,7 @@ jobs:
           ln -sf hyperdu artifacts/compat-bin/du
           ln -sf hyperdu artifacts/compat-bin/gdu
 
-      - name: Run differential compatibility harness (100% gate across all phases)
+      - name: Run differential compatibility harness (100% gate across all phases and thread modes)
         run: |
           FIXTURES_DIR="$(mktemp -d -t hyperdu-ci-fixtures-XXXXXX)"
           trap 'bash tests/compat/cleanup-fixtures.sh "$FIXTURES_DIR"' EXIT
@@ -59,6 +59,7 @@ jobs:
           bash tests/compat/diff-run.sh \
             --fixtures "$FIXTURES_DIR" \
             --candidate-du artifacts/compat-bin/du \
+            --threads-matrix 1,4,auto \
             --min-score 100 \
             --timeout 2 \
             --jobs 4 \

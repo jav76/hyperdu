@@ -72,6 +72,12 @@ internal sealed unsafe class NativeDirectory : IDisposable
         return error == 0 ? new NativeDirectory(dir, fd, dir == 0) : null;
     }
 
+    internal static NativeDirectory? WrapFd(int fd, out int error)
+    {
+        error = NativeIo.WrapOpenDirectoryFd(fd, out nint dir);
+        return error == 0 ? new NativeDirectory(dir, fd, dir == 0) : null;
+    }
+
     /// <summary>Opens <paramref name="name"/> (null-terminated) relative to <paramref name="parentFd"/>.</summary>
     public static NativeDirectory? OpenRelative(int parentFd, ReadOnlySpan<byte> name, out int error)
     {
