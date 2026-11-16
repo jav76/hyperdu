@@ -227,9 +227,10 @@ public sealed partial class DuPhase1Tests
             {
                 using MemoryStream outF = new();
                 using MemoryStream errF = new();
-                DuParseOutcome res = DuOptions.Parse([flag, "."], "du", "1.0.0", outF, errF, out _);
-                Assert.Equal(DuParseOutcome.ExitFailure, res);
-                Assert.Contains("not yet implemented", Encoding.UTF8.GetString(errF.ToArray()));
+                DuParseOutcome res = DuOptions.Parse([flag, "."], "du", "1.0.0", outF, errF, out DuOptions? parsedF);
+                Assert.Equal(DuParseOutcome.Run, res);
+                Assert.NotNull(parsedF);
+                Assert.Empty(Encoding.UTF8.GetString(errF.ToArray()));
             }
         });
     }

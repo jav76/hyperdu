@@ -4,15 +4,27 @@ using hyperdu.Core.Native;
 
 namespace hyperdu.Core.Du;
 
+internal readonly record struct NumericLocaleFormat(byte[] DecimalPoint, byte[] ThousandsSep, byte[] Grouping)
+{
+    internal static readonly NumericLocaleFormat Invariant = new([(byte)'.'], [], []);
+    internal static readonly NumericLocaleFormat FallbackGrouped = new([(byte)'.'], [(byte)','], [3]);
+
+    internal bool HasGrouping => ThousandsSep.Length > 0 && Grouping.Length > 0 && Grouping[0] > 0 && Grouping[0] != 127;
+}
+
 /// <summary>
 /// Formats GNU-compatible diagnostic messages, locale-aware quotes, and POSIX errno descriptions.
 /// </summary>
 public static class Messages
 {
+    private sealed record CachedNumericLocale(string Key, NumericLocaleFormat Format);
+
     private static readonly byte[] CQuoteOpen = [(byte)'\''];
     private static readonly byte[] CQuoteClose = [(byte)'\''];
     private static readonly byte[] Utf8QuoteOpen = [0xE2, 0x80, 0x98]; // U+2018
     private static readonly byte[] Utf8QuoteClose = [0xE2, 0x80, 0x99]; // U+2019
+
+    private static volatile CachedNumericLocale? s_cachedNumericLocale;
 
     internal static bool IsUtf8Locale()
     {
@@ -28,22 +40,44 @@ public static class Messages
                locale.Contains("utf8", StringComparison.OrdinalIgnoreCase);
     }
 
-    internal static bool ShouldGroupThousands()
+    internal static bool ShouldGroupThousands() => GetNumericLocaleFormat().HasGrouping;
+
+    internal static NumericLocaleFormat GetNumericLocaleFormat()
     {
         string? locale = GetEffectiveCategoryLocale("LC_NUMERIC");
-        if (string.IsNullOrEmpty(locale))
-            return false;
+        if (IsCPosixLocale(locale))
+            return NumericLocaleFormat.Invariant;
 
-        if (string.Equals(locale, "C", StringComparison.Ordinal) ||
-            string.Equals(locale, "POSIX", StringComparison.Ordinal) ||
-            locale.StartsWith("C.", StringComparison.Ordinal) ||
-            locale.StartsWith("POSIX.", StringComparison.Ordinal))
-            return false;
+        CachedNumericLocale? cached = s_cachedNumericLocale;
+        if (cached != null && string.Equals(cached.Key, locale, StringComparison.Ordinal))
+            return cached.Format;
 
-        return true;
+        NumericLocaleFormat resolved;
+        if (!NativeIo.IsSupported)
+        {
+            resolved = NumericLocaleFormat.FallbackGrouped;
+        }
+        else if (NativeIo.TryGetNumericLocaleStrings(locale!, out byte[] decimalPoint, out byte[] thousandsSep, out byte[] grouping))
+        {
+            resolved = new NumericLocaleFormat(decimalPoint, thousandsSep, grouping);
+        }
+        else
+        {
+            resolved = NumericLocaleFormat.Invariant;
+        }
+
+        s_cachedNumericLocale = new CachedNumericLocale(locale!, resolved);
+        return resolved;
     }
 
-    private static string? GetEffectiveCategoryLocale(string category)
+    internal static bool IsCPosixLocale(string? locale) =>
+        string.IsNullOrEmpty(locale) ||
+        string.Equals(locale, "C", StringComparison.Ordinal) ||
+        string.Equals(locale, "POSIX", StringComparison.Ordinal) ||
+        locale.StartsWith("C.", StringComparison.Ordinal) ||
+        locale.StartsWith("POSIX.", StringComparison.Ordinal);
+
+    internal static string? GetEffectiveCategoryLocale(string category)
     {
         string? value = Environment.GetEnvironmentVariable("LC_ALL");
         if (!string.IsNullOrEmpty(value)) return value;

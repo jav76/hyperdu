@@ -15,7 +15,7 @@ internal enum NativeEntryKind : byte
 internal readonly struct NativeStat
 {
     public NativeStat(int mode, long size, long blocks, uint flags)
-        : this(mode, size, blocks, flags, device: 0, inode: 0, hardLinks: 0, mtimeSec: 0, mtimeNsec: 0)
+        : this(mode, size, blocks, flags, device: 0, inode: 0, hardLinks: 0, mtimeSec: 0, mtimeNsec: 0, atimeSec: 0, atimeNsec: 0, ctimeSec: 0, ctimeNsec: 0)
     {
     }
 
@@ -29,6 +29,24 @@ internal readonly struct NativeStat
         uint hardLinks,
         long mtimeSec,
         uint mtimeNsec)
+        : this(mode, size, blocks, flags, device, inode, hardLinks, mtimeSec, mtimeNsec, atimeSec: 0, atimeNsec: 0, ctimeSec: 0, ctimeNsec: 0)
+    {
+    }
+
+    public NativeStat(
+        int mode,
+        long size,
+        long blocks,
+        uint flags,
+        ulong device,
+        ulong inode,
+        uint hardLinks,
+        long mtimeSec,
+        uint mtimeNsec,
+        long atimeSec,
+        uint atimeNsec,
+        long ctimeSec,
+        uint ctimeNsec)
     {
         Mode = mode;
         Size = size;
@@ -39,6 +57,10 @@ internal readonly struct NativeStat
         HardLinks = hardLinks;
         MtimeSec = mtimeSec;
         MtimeNsec = mtimeNsec;
+        AtimeSec = atimeSec;
+        AtimeNsec = atimeNsec;
+        CtimeSec = ctimeSec;
+        CtimeNsec = ctimeNsec;
     }
 
     public int Mode { get; }
@@ -53,6 +75,10 @@ internal readonly struct NativeStat
     public uint HardLinks { get; }
     public long MtimeSec { get; }
     public uint MtimeNsec { get; }
+    public long AtimeSec { get; }
+    public uint AtimeNsec { get; }
+    public long CtimeSec { get; }
+    public uint CtimeNsec { get; }
 
     public NativeEntryKind Kind => (Mode & Libc.S_IFMT) switch
     {
@@ -256,7 +282,8 @@ internal static unsafe class NativeIo
         {
             int flags = followSymlinks ? 0 : Libc.AT_SYMLINK_NOFOLLOW_LINUX;
             uint mask = Libc.STATX_TYPE | Libc.STATX_MODE | Libc.STATX_NLINK |
-                        Libc.STATX_INO | Libc.STATX_SIZE | Libc.STATX_BLOCKS | Libc.STATX_MTIME;
+                        Libc.STATX_INO | Libc.STATX_SIZE | Libc.STATX_BLOCKS |
+                        Libc.STATX_ATIME | Libc.STATX_CTIME | Libc.STATX_MTIME;
             if (Libc.statx(dirFd, path, flags, mask, buffer) != 0)
             {
                 errno = GetLastErrno();
@@ -264,8 +291,8 @@ internal static unsafe class NativeIo
                 return false;
             }
 
-            // struct statx: nlink u32 @16, mode u16 @28, ino u64 @32, size u64 @40,
-            // blocks u64 @48, mtime.tv_sec i64 @112, mtime.tv_nsec u32 @120, dev_major u32 @136, dev_minor u32 @140.
+            // struct statx: nlink u32 @16, mode u16 @28, ino u64 @32, size u64 @40, blocks u64 @48,
+            // atime i64/u32 @64/72, ctime i64/u32 @96/104, mtime i64/u32 @112/120, dev_major/minor u32 @136/140.
             ulong device = ((ulong)*(uint*)(buffer + 136) << 32) | *(uint*)(buffer + 140);
             stat = new NativeStat(
                 mode: *(ushort*)(buffer + 28),
@@ -276,7 +303,11 @@ internal static unsafe class NativeIo
                 inode: *(ulong*)(buffer + 32),
                 hardLinks: *(uint*)(buffer + 16),
                 mtimeSec: *(long*)(buffer + 112),
-                mtimeNsec: *(uint*)(buffer + 120));
+                mtimeNsec: *(uint*)(buffer + 120),
+                atimeSec: *(long*)(buffer + 64),
+                atimeNsec: *(uint*)(buffer + 72),
+                ctimeSec: *(long*)(buffer + 96),
+                ctimeNsec: *(uint*)(buffer + 104));
             errno = 0;
             return true;
         }
@@ -293,7 +324,7 @@ internal static unsafe class NativeIo
         }
 
         // 64-bit inode struct stat: dev u32 @0, mode u16 @4, nlink u16 @6, ino u64 @8,
-        // mtime.tv_sec i64 @48, mtime.tv_nsec i64 @56, size i64 @96, blocks i64 @104, flags u32 @116.
+        // atime i64/i64 @32/40, mtime i64/i64 @48/56, ctime i64/i64 @64/72, size i64 @96, blocks i64 @104, flags u32 @116.
         stat = new NativeStat(
             mode: *(ushort*)(buffer + 4),
             size: *(long*)(buffer + 96),
@@ -303,7 +334,11 @@ internal static unsafe class NativeIo
             inode: *(ulong*)(buffer + 8),
             hardLinks: *(ushort*)(buffer + 6),
             mtimeSec: *(long*)(buffer + 48),
-            mtimeNsec: (uint)*(long*)(buffer + 56));
+            mtimeNsec: (uint)*(long*)(buffer + 56),
+            atimeSec: *(long*)(buffer + 32),
+            atimeNsec: (uint)*(long*)(buffer + 40),
+            ctimeSec: *(long*)(buffer + 64),
+            ctimeNsec: (uint)*(long*)(buffer + 72));
         errno = 0;
         return true;
     }
@@ -339,6 +374,185 @@ internal static unsafe class NativeIo
     {
         if (s_platform != Platform.Unsupported)
             _ = Libc.signal(Libc.SIGPIPE, 0);
+    }
+
+    internal static bool TryGetNumericLocaleStrings(
+        string localeName,
+        out byte[] decimalPoint,
+        out byte[] thousandsSep,
+        out byte[] grouping)
+    {
+        decimalPoint = [];
+        thousandsSep = [];
+        grouping = [];
+
+        if (!IsSupported || string.IsNullOrEmpty(localeName))
+            return false;
+
+        int mask = IsMacOS ? Libc.LC_ALL_MASK_MACOS : Libc.LC_NUMERIC_MASK_LINUX;
+        nint loc = CreatePosixLocaleHandle(mask, localeName);
+        if (loc == 0)
+            return false;
+
+        nint prev = Libc.uselocale(loc);
+        try
+        {
+            byte** lconv = Libc.localeconv();
+            if (lconv == null)
+                return false;
+
+            byte* decPtr = lconv[0];
+            byte* sepPtr = lconv[1];
+            byte* grpPtr = lconv[2];
+
+            decimalPoint = decPtr != null
+                ? MemoryMarshal.CreateReadOnlySpanFromNullTerminated(decPtr).ToArray()
+                : [(byte)'.'];
+            if (decimalPoint.Length == 0)
+                decimalPoint = [(byte)'.'];
+
+            thousandsSep = sepPtr != null
+                ? MemoryMarshal.CreateReadOnlySpanFromNullTerminated(sepPtr).ToArray()
+                : [];
+
+            grouping = grpPtr != null
+                ? MemoryMarshal.CreateReadOnlySpanFromNullTerminated(grpPtr).ToArray()
+                : [];
+
+            return true;
+        }
+        finally
+        {
+            if (prev != 0)
+                _ = Libc.uselocale(prev);
+            Libc.freelocale(loc);
+        }
+    }
+
+    internal static nint CreateTimeLocaleHandle(string? localeName)
+    {
+        if (!IsSupported || string.IsNullOrEmpty(localeName))
+            return 0;
+
+        int mask = IsMacOS ? Libc.LC_ALL_MASK_MACOS : Libc.LC_TIME_MASK_LINUX;
+        return CreatePosixLocaleHandle(mask, localeName);
+    }
+
+    internal static void FreeLocaleHandle(nint loc)
+    {
+        if (IsSupported && loc != 0)
+            Libc.freelocale(loc);
+    }
+
+    internal static void SyncTimezone(string? tzValue)
+    {
+        if (!IsSupported)
+            return;
+
+        ReadOnlySpan<byte> tzName = "TZ\0"u8;
+        fixed (byte* pName = tzName)
+        {
+            byte* existingPtr = Libc.getenv(pName);
+            if (tzValue == null)
+            {
+                if (existingPtr != null)
+                    _ = Libc.unsetenv(pName);
+            }
+            else
+            {
+                int maxBytes = System.Text.Encoding.UTF8.GetMaxByteCount(tzValue.Length) + 1;
+                byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(maxBytes);
+                try
+                {
+                    int len = System.Text.Encoding.UTF8.GetBytes(tzValue, rented);
+                    rented[len] = 0;
+                    ReadOnlySpan<byte> newSpan = rented.AsSpan(0, len);
+                    bool same = existingPtr != null &&
+                                MemoryMarshal.CreateReadOnlySpanFromNullTerminated(existingPtr).SequenceEqual(newSpan);
+                    if (!same)
+                    {
+                        fixed (byte* pVal = rented)
+                        {
+                            _ = Libc.setenv(pName, pVal, 1);
+                        }
+                    }
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+                }
+            }
+        }
+
+        Libc.tzset();
+    }
+
+    internal static bool TryFormatLocalTime(
+        long seconds,
+        ReadOnlySpan<byte> sentinelNullTermFormat,
+        Span<byte> destination,
+        nint timeLocale,
+        out int bytesWritten,
+        out bool outOfRange)
+    {
+        bytesWritten = 0;
+        outOfRange = false;
+
+        if (!IsSupported || destination.IsEmpty)
+            return false;
+
+        byte* tmBuf = stackalloc byte[128];
+        long sec = seconds;
+        if (Libc.localtime_r(&sec, tmBuf) == null)
+        {
+            outOfRange = true;
+            return false;
+        }
+
+        nint prev = timeLocale != 0 ? Libc.uselocale(timeLocale) : 0;
+        try
+        {
+            nuint len;
+            fixed (byte* pDst = destination)
+            fixed (byte* pFmt = sentinelNullTermFormat)
+            {
+                len = Libc.strftime(pDst, (nuint)destination.Length, pFmt, tmBuf);
+            }
+
+            if (len == 0)
+                return false;
+
+            int contentLen = (int)len - 1;
+            if (contentLen > 0)
+                destination.Slice(1, contentLen).CopyTo(destination);
+
+            bytesWritten = contentLen;
+            return true;
+        }
+        finally
+        {
+            if (prev != 0)
+                _ = Libc.uselocale(prev);
+        }
+    }
+
+    private static nint CreatePosixLocaleHandle(int mask, string localeName)
+    {
+        int maxBytes = System.Text.Encoding.UTF8.GetMaxByteCount(localeName.Length) + 1;
+        byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(maxBytes);
+        try
+        {
+            int len = System.Text.Encoding.UTF8.GetBytes(localeName, rented);
+            rented[len] = 0;
+            fixed (byte* pLocale = rented)
+            {
+                return Libc.newlocale(mask, pLocale, 0);
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     /// <summary>

@@ -17,8 +17,7 @@ public enum SymlinkPolicy
 }
 
 /// <summary>
-/// Full GNU du option table parser for Phase 1 and Phase 2 flags, recognizing Phase 3 options
-/// with explicit not-yet-implemented errors.
+/// Full GNU du option table parser across Phases 1 through 3.
 /// </summary>
 public sealed class DuOptions
 {
@@ -73,6 +72,10 @@ public sealed class DuOptions
     public bool OneFileSystem { get; private set; }
     public bool CountLinks { get; private set; }
     public bool Inodes { get; private set; }
+    public TimeKind TimeKind { get; private set; } = TimeKind.None;
+    public TimeStyleKind TimeStyleKind { get; private set; } = TimeStyleKind.LongIso;
+    public string? CustomTimeFormat { get; private set; }
+    public bool ShowTime => TimeKind != TimeKind.None;
     public SymlinkPolicy SymlinkPolicy { get; private set; } = SymlinkPolicy.NoDereference;
     public ThresholdSpec? Threshold { get; private set; }
     public string? Files0From { get; private set; }
@@ -111,6 +114,7 @@ public sealed class DuOptions
         bool hasExplicitBlockSize = false;
         BlockSizeSpec explicitBlockSize = BlockSizeSpec.Default1024;
         bool? humanOverride = null;
+        string? cliTimeStyle = null;
 
         foreach (ParsedOption opt in opts)
         {
@@ -261,13 +265,33 @@ public sealed class DuOptions
                     break;
 
                 case OptTime:
+                    if (opt.Argument == null)
+                    {
+                        result.TimeKind = TimeKind.Mtime;
+                    }
+                    else if (TimeFormat.TryParseTimeKind(opt.Argument, programName, stderr, out TimeKind parsedTimeKind))
+                    {
+                        result.TimeKind = parsedTimeKind;
+                    }
+                    else
+                    {
+                        return DuParseOutcome.ExitFailure;
+                    }
+                    break;
+
                 case OptTimeStyle:
-                {
-                    string flagName = opt.LongName != null ? $"--{opt.LongName}" : $"-{(char)opt.Value}";
-                    Messages.WriteError(stderr, programName, $"option '{flagName}' is not yet implemented");
-                    return DuParseOutcome.ExitFailure;
-                }
+                    cliTimeStyle = opt.Argument ?? string.Empty;
+                    break;
             }
+        }
+
+        if (result.TimeKind != TimeKind.None)
+        {
+            if (!TimeFormat.TryResolveTimeStyle(cliTimeStyle, programName, stderr, out TimeStyleKind resolvedStyle, out string? customFmt))
+                return DuParseOutcome.ExitFailure;
+
+            result.TimeStyleKind = resolvedStyle;
+            result.CustomTimeFormat = customFmt;
         }
 
         if (result.Summarize && result.All)
@@ -357,6 +381,13 @@ public sealed class DuOptions
           -s, --summarize       display only a total for each argument
           -t, --threshold=SIZE  exclude entries smaller than SIZE if positive,
                                   or entries greater than SIZE if negative
+              --time            show time of the last modification of any file in the
+                                  directory, or any of its subdirectories
+              --time=WORD       show time as WORD instead of modification time:
+                                  atime, access, use, ctime or status
+              --time-style=STYLE  show times using STYLE, which can be:
+                                    full-iso, long-iso, iso, or +FORMAT;
+                                    FORMAT is interpreted like in 'date'
           -X, --exclude-from=FILE  exclude files that match any pattern in FILE
               --exclude=PATTERN    exclude files that match PATTERN
           -x, --one-file-system    skip directories on different file systems
