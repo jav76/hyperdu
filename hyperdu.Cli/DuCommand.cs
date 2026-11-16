@@ -9,24 +9,36 @@ namespace hyperdu.Cli;
 /// </summary>
 internal static class DuCommand
 {
+    internal readonly record struct StdStreams(Stream Stdin, Stream Stdout, Stream Stderr);
+
     public static int Run(string[] args, string programName, string version, bool restoreSigpipe = true)
     {
         if (restoreSigpipe)
-            ParallelDuWalker.RestoreDefaultSigpipe();
+            NativeIo.RestoreDefaultSigpipe();
 
         using Stream stdin = OpenStandardFd(0, FileAccess.Read) ?? Console.OpenStandardInput();
         using Stream stdout = OpenStandardFd(1, FileAccess.Write) ?? Console.OpenStandardOutput();
         using Stream stderr = OpenStandardFd(2, FileAccess.Write) ?? Console.OpenStandardError();
 
+        return Run(args, programName, version, new StdStreams(stdin, stdout, stderr), restoreSigpipe);
+    }
+
+    internal static int Run(
+        string[] args,
+        string programName,
+        string version,
+        StdStreams streams,
+        bool restoreSigpipe = false)
+    {
         try
         {
             DuParseOutcome outcome = DuOptions.Parse(
                 args,
                 programName,
                 version,
-                stdin,
-                stdout,
-                stderr,
+                streams.Stdin,
+                streams.Stdout,
+                streams.Stderr,
                 out DuOptions? options);
 
             if (outcome == DuParseOutcome.ExitSuccess)
@@ -35,10 +47,12 @@ internal static class DuCommand
             if (outcome != DuParseOutcome.Run || options == null)
                 return 1;
 
-            return new ParallelDuWalker(options, programName, stdin, stdout, stderr).Run();
+            return new ParallelDuWalker(options, programName, streams.Stdin, streams.Stdout, streams.Stderr).Run();
         }
         catch (IOException ex) when (IsBrokenPipe(ex))
         {
+            if (restoreSigpipe)
+                NativeIo.RestoreDefaultSigpipeAndReraise();
             return 141;
         }
     }

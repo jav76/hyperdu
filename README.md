@@ -37,7 +37,7 @@ You can browse while it scans. The folder you are looking at gets scanned first,
 winget install JaretVarn.hyperdu
 ```
 
-**.NET tool** (any platform with the .NET 10 runtime):
+**.NET tool** (any platform with the .NET 10 runtime; for `hyperdu` TUI and `hyperdu du`, not a `du` drop-in):
 
 ```bash
 dotnet tool install -g hyperdu
@@ -45,7 +45,7 @@ dotnet tool install -g hyperdu
 
 ### Release binaries
 
-Self-contained Native AOT binaries for Linux and macOS (x64, arm64) and Windows (x64, x86) are attached to each [GitHub Release](https://github.com/jav76/hyperdu/releases), along with a `SHA256SUMS` file. They need no .NET runtime and no ICU library.
+Self-contained Native AOT binaries for Linux and macOS (x64, arm64) and Windows (x64, x86) are attached to each [GitHub Release](https://github.com/jav76/hyperdu/releases), along with a `SHA256SUMS` file. They need no .NET runtime and no ICU library. Linux and macOS `.tar.gz` archives include `du` and `gdu` symlinks next to `hyperdu`.
 
 * Linux binaries need glibc 2.28 or newer (RHEL/Alma/Rocky 8, Debian 10, Ubuntu 20.04 and later).
 * macOS binaries are not notarized. If Gatekeeper blocks a browser download, run `xattr -d com.apple.quarantine hyperdu`.
@@ -54,6 +54,54 @@ Self-contained Native AOT binaries for Linux and macOS (x64, arm64) and Windows 
 tar -xzf hyperdu-linux-x64.tar.gz
 ./hyperdu --version
 ```
+
+## Use as `du`
+
+When invoked as `du` or `gdu` (via symlink on a Native AOT binary), or via `hyperdu du [OPTIONS] [FILE]...`, `hyperdu` runs in GNU-compatible `du` mode with identical output format and no TUI banner (`du --version` prints `du (hyperdu) <version>` rather than claiming to be GNU coreutils). Running `hyperdu` without the `du` subcommand still launches the interactive explorer.
+
+### Option A: System-wide install (`/usr/local/bin`, works with `sudo` and scripts)
+
+```bash
+sudo mkdir -p /usr/local/bin
+sudo tar -xzf hyperdu-linux-x64.tar.gz -C /usr/local/bin hyperdu du gdu
+command -v du   # /usr/local/bin/du
+du --version
+```
+
+On macOS, substitute `hyperdu-osx-arm64.tar.gz` (Apple Silicon) or `hyperdu-osx-x64.tar.gz` (Intel). Passing `hyperdu du gdu` extracts only the binary and symlinks cleanly into `/usr/local/bin` without writing `LICENSE` or `README.md` there (inspect those inside the archive if needed).
+
+### Option B: Current user only (`~/.local/bin`, no root)
+
+```bash
+mkdir -p ~/.local/bin
+tar -xzf hyperdu-linux-x64.tar.gz -C ~/.local/bin hyperdu du gdu
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup file (`~/.profile` or `~/.bash_profile` for login shells, `~/.bashrc` for interactive bash, `~/.zshrc` for zsh) so `~/.local/bin` appears ahead of `/usr/bin`. Verify precedence with `command -v du`. Note that `cron`, `make`, and standalone `#!/bin/sh` scripts typically use a minimal `PATH` (such as `/usr/bin:/bin`) and ignore interactive shell startup files, so use Option A (`/usr/local/bin`) if non-interactive system jobs should pick up `du`.
+
+### Placement rules and caveats
+
+* **Never overwrite `/usr/bin/du`.** `/usr/bin` is owned by your OS package manager (`apt`, `dnf`, `pacman`) or macOS SIP; OS updates will overwrite it or fail integrity checks. Putting `hyperdu`, `du`, and `gdu` in `/usr/local/bin` or `~/.local/bin` ahead of `/usr/bin` overrides `du` cleanly and is easy to remove (`rm -f /usr/local/bin/du /usr/local/bin/gdu /usr/local/bin/hyperdu`).
+* **`sudo` uses `secure_path`.** `sudo` resets `PATH` (typically omitting `~/.local/bin`). If `sudo du` or root/cron scripts must resolve to `hyperdu`, install into `/usr/local/bin`.
+* **Shell aliases do not affect scripts.** `alias du='hyperdu du'` only applies in interactive shells; scripts, `cron`, `make`, `xargs`, and `find -exec` bypass aliases. Use symlinks on `PATH` instead.
+* **Thread control (`HYPERDU_THREADS`).** `du` mode accepts only GNU `du` flags, so override worker count with `HYPERDU_THREADS=<N>` when needed (by default it keeps tiny scans inline, limits rotational Linux HDDs to 1 worker, and scales up on SSDs and network mounts).
+
+### `.NET tool` limitations and wrapper script
+
+`dotnet tool install -g hyperdu` installs a framework-dependent **JIT** shim, so it is **not** a drop-in replacement for `du`:
+
+1. **JIT startup latency:** cold startup takes tens of milliseconds on each invocation, whereas the Native AOT binary starts in ~2-3 ms.
+2. **No `argv[0]` dispatch:** the .NET tool host invokes `hyperdu.dll` rather than passing the symlink name, so symlinking `~/.dotnet/tools/hyperdu` to `du` does not activate `du` mode.
+
+For occasional convenience when only the .NET tool is installed, use `hyperdu du ...` directly or save a small wrapper script on `PATH` (note that JIT startup overhead still applies):
+
+```sh
+#!/bin/sh
+exec hyperdu du "$@"
+```
+
+Save that as `~/.local/bin/du` and run `chmod +x ~/.local/bin/du`. Use the Native AOT release archive when replacing `du` in scripts or pipelines.
 
 ## Usage
 

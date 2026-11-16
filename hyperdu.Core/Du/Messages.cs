@@ -36,8 +36,12 @@ public static class Messages
             string.Equals(locale, "POSIX", StringComparison.Ordinal))
             return false;
 
-        return locale.Contains("UTF-8", StringComparison.OrdinalIgnoreCase) ||
-               locale.Contains("utf8", StringComparison.OrdinalIgnoreCase);
+        bool looksUtf8 = locale.Contains("UTF-8", StringComparison.OrdinalIgnoreCase) ||
+                         locale.Contains("utf8", StringComparison.OrdinalIgnoreCase);
+        if (!looksUtf8)
+            return false;
+
+        return !NativeIo.IsSupported || NativeIo.IsPosixCtypeLocaleAvailable(locale);
     }
 
     internal static bool ShouldGroupThousands() => GetNumericLocaleFormat().HasGrouping;

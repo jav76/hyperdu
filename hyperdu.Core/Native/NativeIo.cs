@@ -376,6 +376,16 @@ internal static unsafe class NativeIo
             _ = Libc.signal(Libc.SIGPIPE, 0);
     }
 
+    /// <summary>Restores default SIGPIPE and raises SIGPIPE on EPIPE so POSIX callers (including pipefail) observe signal 13 (141).</summary>
+    internal static void RestoreDefaultSigpipeAndReraise()
+    {
+        if (s_platform == Platform.Unsupported)
+            return;
+
+        RestoreDefaultSigpipe();
+        _ = Libc.raise(Libc.SIGPIPE);
+    }
+
     internal static bool TryGetNumericLocaleStrings(
         string localeName,
         out byte[] decimalPoint,
@@ -427,6 +437,20 @@ internal static unsafe class NativeIo
                 _ = Libc.uselocale(prev);
             Libc.freelocale(loc);
         }
+    }
+
+    internal static bool IsPosixCtypeLocaleAvailable(string? localeName)
+    {
+        if (!IsSupported || string.IsNullOrEmpty(localeName))
+            return false;
+
+        int mask = IsMacOS ? Libc.LC_CTYPE_MASK_MACOS : Libc.LC_CTYPE_MASK_LINUX;
+        nint loc = CreatePosixLocaleHandle(mask, localeName);
+        if (loc == 0)
+            return false;
+
+        Libc.freelocale(loc);
+        return true;
     }
 
     internal static nint CreateTimeLocaleHandle(string? localeName)

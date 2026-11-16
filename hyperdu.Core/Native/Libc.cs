@@ -56,8 +56,10 @@ internal static unsafe partial class Libc
     internal const ulong RAMFS_MAGIC = 0x858458F6;
     internal const ulong NFS_SUPER_MAGIC = 0x6969;
 
+    internal const int LC_CTYPE_MASK_LINUX = 1 << 0;
     internal const int LC_NUMERIC_MASK_LINUX = 1 << 1;
     internal const int LC_TIME_MASK_LINUX = 1 << 2;
+    internal const int LC_CTYPE_MASK_MACOS = 1 << 1;
     internal const int LC_ALL_MASK_MACOS = 0x3F;
 
     // open(2) and openat(2) are variadic; declaring only the fixed arguments is ABI-safe because O_CREAT is never passed.
@@ -84,6 +86,9 @@ internal static unsafe partial class Libc
 
     [LibraryImport(Lib)]
     internal static partial nint signal(int signum, nint handler);
+
+    [LibraryImport(Lib)]
+    internal static partial int raise(int signum);
 
     [LibraryImport(Lib)]
     internal static partial int closedir(nint dir);

@@ -46,6 +46,14 @@ for platform in "${platforms[@]}"; do
             -p:PublishTrimmed=true \
             -o "$DIR/publish/$platform"
     fi
+
+    if [[ "$platform" == "$HOST_RID" ]] && [[ "$platform" != win-* ]]; then
+        (
+            cd "$DIR/publish/$platform"
+            ln -sf hyperdu du
+            ln -sf hyperdu gdu
+        )
+    fi
 done
 
 echo "All targets published successfully in the './publish/' folder!"

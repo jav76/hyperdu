@@ -8,6 +8,7 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <InternalsVisibleTo Include="hyperdu"/>
         <InternalsVisibleTo Include="hyperdu.Tests"/>
         <InternalsVisibleTo Include="hyperdu.Benchmarks"/>
     </ItemGroup>
