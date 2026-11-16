@@ -1,0 +1,92 @@
+name: du Compatibility Harness
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - "hyperdu.Core/**"
+      - "hyperdu.Cli/**"
+      - "tests/compat/**"
+      - ".github/workflows/compat.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  compat:
+    name: Compat (ubuntu-24.04, GNU du 9.4)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Install Native AOT prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends clang zlib1g-dev
+
+      - name: Verify pinned GNU du version
+        run: |
+          source tests/compat/PINNED_VERSION
+          ACTUAL_VER="$(du --version | head -n 1)"
+          echo "Reference du: $ACTUAL_VER (pinned: $PINNED_GNU_DU_VERSION)"
+          echo "$ACTUAL_VER" | grep -q "GNU coreutils) $PINNED_GNU_DU_VERSION"
+
+      - name: Publish Native AOT hyperdu and create du symlink
+        run: |
+          mkdir -p artifacts/compat-bin
+          dotnet publish hyperdu.Cli/hyperdu.Cli.csproj -c Release -r linux-x64 -p:PublishAot=true -o artifacts/compat-bin --nologo -v quiet
+          ln -sf hyperdu artifacts/compat-bin/du
+          ln -sf hyperdu artifacts/compat-bin/gdu
+
+      - name: Run differential compatibility harness (baseline)
+        run: |
+          FIXTURES_DIR="$(mktemp -d -t hyperdu-ci-fixtures-XXXXXX)"
+          trap 'bash tests/compat/cleanup-fixtures.sh "$FIXTURES_DIR"' EXIT
+          bash tests/compat/make-fixtures.sh "$FIXTURES_DIR" --with-mounts
+          bash tests/compat/diff-run.sh \
+            --fixtures "$FIXTURES_DIR" \
+            --candidate-du artifacts/compat-bin/du \
+            --baseline \
+            --timeout 2 \
+            --jobs 4 \
+            --json artifacts/compat/diff-results.json \
+            --markdown artifacts/compat/diff-report.md
+
+      - name: Run GNU coreutils tests/du/ suite (baseline)
+        run: |
+          bash tests/compat/run-gnu-suite.sh \
+            --candidate-du artifacts/compat-bin/du \
+            --baseline \
+            --timeout 3 \
+            --json artifacts/compat/gnu-suite-results.json \
+            --markdown artifacts/compat/gnu-suite-report.md
+
+      - name: Publish compatibility summary
+        if: always()
+        run: |
+          for f in artifacts/compat/diff-report.md artifacts/compat/gnu-suite-report.md; do
+            if [ -f "$f" ]; then
+              cat "$f" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: Upload compatibility artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-results
+          path: artifacts/compat/
+          if-no-files-found: warn
