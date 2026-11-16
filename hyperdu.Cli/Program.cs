@@ -108,41 +108,12 @@ public static class Program
         AnsiConsole.MarkupLine("Press [yellow]Ctrl+C[/] to cancel scan at any time.\n");
     }
 
-    public static async Task Main(string[] args)
+    private static (ScanOptions Options, bool IsNetwork, bool IsRotational) BuildScanContext(
+        CommandLineOptions parsed,
+        string targetPath)
     {
-        Console.OutputEncoding = Encoding.UTF8;
-        CommandLineOptions parsed = ParseArguments(args);
-
-        if (parsed.ShowVersion)
-        {
-            PrintVersion();
-            return;
-        }
-
-        if (parsed.ShowHelp)
-        {
-            PrintHelp();
-            return;
-        }
-
-        AnsiConsole.Write(new FigletText("hyperdu").Color(Color.DeepSkyBlue4));
-        AnsiConsole.Write(new Markup($"[bold teal]High-Performance Directory Space Analyzer v{Markup.Escape(GetDisplayVersion())}[/]\n\n"));
-
-        string targetPath = parsed.TargetPath;
-
-        if (!Directory.Exists(targetPath))
-        {
-            AnsiConsole.MarkupLine(
-                $"[red]Error: Target directory does not exist:[/] [white]{Markup.Escape(targetPath)}[/]");
-            return;
-        }
-
-        targetPath = Path.GetFullPath(targetPath);
-        AnsiConsole.MarkupLine($"Target Directory: [cyan]{Markup.Escape(targetPath)}[/]");
-
         bool isNetwork = IsNetworkMount(targetPath);
         bool isRotational = !isNetwork && DiskDeviceHelper.IsRotationalDrive(targetPath);
-
         int finalWorkers = DetermineWorkerCount(parsed, isNetwork, isRotational);
 
         ScanOptions options = new ScanOptions
@@ -157,12 +128,78 @@ public static class Program
             options.ExcludedPaths = parsed.CustomExcludes;
         }
 
-        PrintScannerConfig(options, isNetwork, isRotational, parsed.CustomThreads.HasValue);
+        return (options, isNetwork, isRotational);
+    }
 
+    private static void ConfigureThreadPool(int workerCount)
+    {
         // Since scanner workers perform synchronous blocking I/O (stat/network latency),
         // adjust ThreadPool minimum threads to avoid slow ramp-up (ThreadPool starvation).
         ThreadPool.GetMinThreads(out int _, out int minCompletionPortThreads);
-        ThreadPool.SetMinThreads(Math.Max(options.WorkerCount, Environment.ProcessorCount), minCompletionPortThreads);
+        ThreadPool.SetMinThreads(Math.Max(workerCount, Environment.ProcessorCount), minCompletionPortThreads);
+    }
+
+    private static async Task<int> RunHeadlessScanAsync(CommandLineOptions parsed)
+    {
+        string targetPath = parsed.TargetPath;
+        if (!Directory.Exists(targetPath))
+        {
+            Console.Error.WriteLine($"Error: Target directory does not exist: {targetPath}");
+            return 1;
+        }
+
+        targetPath = Path.GetFullPath(targetPath);
+        (ScanOptions options, _, _) = BuildScanContext(parsed, targetPath);
+        ConfigureThreadPool(options.WorkerCount);
+
+        ParallelScanner scanner = new ParallelScanner(options);
+        var rootNode = await scanner.ScanAsync(targetPath, null, CancellationToken.None);
+        Console.WriteLine($"{rootNode.TotalSize}\t{targetPath}");
+        return 0;
+    }
+
+    public static async Task<int> Main(string[] args)
+    {
+        Console.OutputEncoding = Encoding.UTF8;
+        CommandLineOptions parsed = ParseArguments(args);
+
+        if (parsed.ShowVersion)
+        {
+            PrintVersion();
+            return 0;
+        }
+
+        if (parsed.ShowHelp)
+        {
+            PrintHelp();
+            return 0;
+        }
+
+        if (Environment.GetEnvironmentVariable("HYPERDU_NO_UI") == "1")
+        {
+            return await RunHeadlessScanAsync(parsed);
+        }
+
+        AnsiConsole.Write(new FigletText("hyperdu").Color(Color.DeepSkyBlue4));
+        AnsiConsole.Write(new Markup($"[bold teal]High-Performance Directory Space Analyzer v{Markup.Escape(GetDisplayVersion())}[/]\n\n"));
+
+        string targetPath = parsed.TargetPath;
+
+        if (!Directory.Exists(targetPath))
+        {
+            AnsiConsole.MarkupLine(
+                $"[red]Error: Target directory does not exist:[/] [white]{Markup.Escape(targetPath)}[/]");
+            return 0;
+        }
+
+        targetPath = Path.GetFullPath(targetPath);
+        AnsiConsole.MarkupLine($"Target Directory: [cyan]{Markup.Escape(targetPath)}[/]");
+
+        (ScanOptions options, bool isNetwork, bool isRotational) = BuildScanContext(parsed, targetPath);
+
+        PrintScannerConfig(options, isNetwork, isRotational, parsed.CustomThreads.HasValue);
+
+        ConfigureThreadPool(options.WorkerCount);
 
         ParallelScanner scanner = new ParallelScanner(options);
 
@@ -200,6 +237,8 @@ public static class Program
         {
             // Ignore exceptions from task cancellation on cleanup.
         }
+
+        return 0;
     }
 
     private static void PrintHelp()
