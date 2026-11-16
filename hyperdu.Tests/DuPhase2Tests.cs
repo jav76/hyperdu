@@ -145,7 +145,10 @@ public sealed partial class DuPhase2Tests
         Assert.Equal(new ThresholdSpec(true, 2048), tNeg);
 
         Assert.False(BlockSize.TryParseThreshold("-0", out _, out BlockSizeParseStatus sNeg0));
-        Assert.Equal(BlockSizeParseStatus.InvalidArgument, sNeg0);
+        Assert.Equal(BlockSizeParseStatus.NegativeZeroThreshold, sNeg0);
+
+        Assert.False(BlockSize.TryParseThreshold("-0K", out _, out BlockSizeParseStatus sNeg0K));
+        Assert.Equal(BlockSizeParseStatus.NegativeZeroThreshold, sNeg0K);
 
         Assert.False(BlockSize.TryParseThreshold("1Y", out _, out BlockSizeParseStatus sOver));
         Assert.Equal(BlockSizeParseStatus.Overflow, sOver);
@@ -154,7 +157,11 @@ public sealed partial class DuPhase2Tests
         {
             (int rcErr, _, string errText) = RunWalker(["-t", "-0", "."]);
             Assert.Equal(1, rcErr);
-            Assert.Equal("du: invalid -t argument '-0'\n", errText);
+            Assert.Equal("du: invalid --threshold argument '-0'\n", errText);
+
+            (int rcSize, _, string errSize) = RunWalker(["-t", "SIZE", "."]);
+            Assert.Equal(1, rcSize);
+            Assert.Equal("du: invalid -t argument 'SIZE'\n", errSize);
 
             (int rcOver, _, string errOver) = RunWalker(["--threshold=1Y", "."]);
             Assert.Equal(1, rcOver);

@@ -47,7 +47,8 @@ internal enum BlockSizeParseStatus
     Ok,
     InvalidArgument,
     InvalidSuffix,
-    Overflow
+    Overflow,
+    NegativeZeroThreshold
 }
 
 /// <summary>
@@ -171,8 +172,14 @@ public static class BlockSize
             return false;
         }
 
-        if (!TryParseScaledValue(span, allowZero: !isNegative, out ulong magnitude, out _, out _, out errorStatus))
+        if (!TryParseScaledValue(span, allowZero: true, out ulong magnitude, out _, out _, out errorStatus))
             return false;
+
+        if (isNegative && magnitude == 0)
+        {
+            errorStatus = BlockSizeParseStatus.NegativeZeroThreshold;
+            return false;
+        }
 
         ulong maxSignedMagnitude = isNegative ? 9223372036854775808UL : (ulong)long.MaxValue;
         if (magnitude > maxSignedMagnitude)
@@ -187,6 +194,9 @@ public static class BlockSize
 
     internal static string FormatErrorMessage(string optionName, string rawArg, BlockSizeParseStatus status)
     {
+        if (status == BlockSizeParseStatus.NegativeZeroThreshold)
+            return "invalid --threshold argument '-0'";
+
         string quoted = Messages.QuoteAscii(rawArg);
         return status switch
         {
