@@ -101,11 +101,22 @@ try:
 finally:
     os.close(cur_fd)
 
-# 7. Mount point target & helper metadata files
+# 7. Mount point target, fixed DST timestamps, & helper metadata files
 write_bytes(os.path.join(root, "mnt", "outside.bin"), b"O" * 4096)
 os.makedirs(os.path.join(root, "mnt", "submount"), exist_ok=True)
 write_bytes(os.path.join(root, "exclude_patterns.txt"), b"*.tmp\n")
 write_bytes(os.path.join(root, "files0.list"), b"d/a\x00d/c\x00sparse\x00")
+
+times_dir = os.path.join(root, "times_dst")
+times_sub = os.path.join(times_dir, "sub")
+summer = os.path.join(times_dir, "summer.bin")
+winter = os.path.join(times_sub, "winter.bin")
+write_bytes(summer, b"S" * 4096)
+write_bytes(winter, b"W" * 4096)
+os.utime(summer, ns=(1751373296_987654321, 1751373296_987654321)) # 2025-07-01 12:34:56.987654321 UTC (EDT -0400)
+os.utime(winter, ns=(1764592496_123456789, 1764592496_123456789)) # 2025-12-01 12:34:56.123456789 UTC (EST -0500)
+os.utime(times_sub, ns=(1735689600_000000000, 1735689600_000000000))
+os.utime(times_dir, ns=(1735689600_000000000, 1735689600_000000000))
 PY
 
 if [[ "$WITH_MOUNTS" -eq 1 ]] && [[ "$(uname -s)" == "Linux" ]]; then

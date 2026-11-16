@@ -26,6 +26,12 @@ public sealed unsafe class SequentialWalker
         }
     }
 
+    private readonly record struct DirWalkResult(
+        ulong ReportedToParent,
+        ulong FullBytes,
+        FileTimestamp ReportedTime,
+        FileTimestamp FullTime);
+
     private const int OutputBufferSize = 65536;
     private const int DirentReadBufferSize = 65536;
     private const int InodeSortThreshold = 10000;
@@ -44,6 +50,9 @@ public sealed unsafe class SequentialWalker
     private readonly ulong _maxDepth;
     private readonly byte _lineTerminator;
     private readonly bool _hasExcludes;
+    private readonly bool _showTime;
+    private readonly TimeKind _timeKind;
+    private readonly NumericLocaleFormat _numericLocale;
 
     private byte[] _nameArena = new byte[65536];
     private int _nameArenaPos;
@@ -52,10 +61,12 @@ public sealed unsafe class SequentialWalker
     private byte[] _pathStack = new byte[8192];
     private int _pathLen;
 
+    private TimeFormat.Formatter? _timeFormatter;
     private int _outPos;
     private int _openDirCount;
     private ulong _rootDevice;
     private ulong _grandTotal;
+    private FileTimestamp _grandMaxTime = new(0, 0);
     private bool _hasError;
 
     public SequentialWalker(DuOptions options, string programName, Stream stdout, Stream stderr)
@@ -73,52 +84,62 @@ public sealed unsafe class SequentialWalker
         _maxDepth = options.Summarize ? 0UL : (options.MaxDepth ?? ulong.MaxValue);
         _lineTerminator = options.NullTerminator ? (byte)'\0' : (byte)'\n';
         _hasExcludes = !options.Excludes.IsEmpty;
+        _showTime = options.ShowTime;
+        _timeKind = options.TimeKind;
+        _numericLocale = Messages.GetNumericLocaleFormat();
     }
 
     public static void RestoreDefaultSigpipe() => NativeIo.RestoreDefaultSigpipe();
 
-    public int Run()
+    public int Run() => RunWithTimeContext(() =>
     {
         if (_options.Files0From != null)
         {
             if (!Files0Reader.ReadAll(_options.Files0From, _stdin, _programName, _stderr, ProcessOperand))
                 _hasError = true;
+            return;
         }
-        else
+
+        Span<byte> operandStackBuf = stackalloc byte[512];
+        foreach (string operand in _options.Operands)
         {
-            Span<byte> operandStackBuf = stackalloc byte[512];
-            foreach (string operand in _options.Operands)
+            int maxBytes = Encoding.UTF8.GetMaxByteCount(operand.Length);
+            if (maxBytes <= operandStackBuf.Length)
             {
-                int maxBytes = Encoding.UTF8.GetMaxByteCount(operand.Length);
-                if (maxBytes <= operandStackBuf.Length)
-                {
-                    int len = Encoding.UTF8.GetBytes(operand, operandStackBuf);
-                    ProcessOperand(operandStackBuf[..len]);
-                }
-                else
-                {
-                    ProcessOperand(Encoding.UTF8.GetBytes(operand));
-                }
+                int len = Encoding.UTF8.GetBytes(operand, operandStackBuf);
+                ProcessOperand(operandStackBuf[..len]);
+            }
+            else
+            {
+                ProcessOperand(Encoding.UTF8.GetBytes(operand));
             }
         }
+    });
 
-        if (_options.Total)
-            EmitLine(_grandTotal, "total"u8);
-
-        FlushOutput();
-        return _hasError ? 1 : 0;
-    }
-
-    internal int Run(IReadOnlyList<byte[]> rawOperands)
+    internal int Run(IReadOnlyList<byte[]> rawOperands) => RunWithTimeContext(() =>
     {
         foreach (byte[] rawBytes in rawOperands)
             ProcessOperand(rawBytes);
+    });
 
-        if (_options.Total)
-            EmitLine(_grandTotal, "total"u8);
+    private int RunWithTimeContext(Action scanAction)
+    {
+        _timeFormatter = _showTime ? TimeFormat.CreateFormatter(_options, _programName, _stderr, FlushOutput) : null;
+        try
+        {
+            scanAction();
 
-        FlushOutput();
-        return _hasError ? 1 : 0;
+            if (_options.Total)
+                EmitLine(_grandTotal, _grandMaxTime, "total"u8);
+
+            FlushOutput();
+            return _hasError ? 1 : 0;
+        }
+        finally
+        {
+            _timeFormatter?.Dispose();
+            _timeFormatter = null;
+        }
     }
 
     private void ProcessOperand(ReadOnlySpan<byte> rawOperand)
@@ -158,15 +179,20 @@ public sealed unsafe class SequentialWalker
             if (stat.Kind != NativeEntryKind.Directory)
             {
                 ulong count = ComputeEntryValue(in stat);
+                FileTimestamp entryTime = ExtractTimestamp(in stat);
                 _grandTotal += count;
+                if (_showTime)
+                    _grandMaxTime = FileTimestamp.Max(_grandMaxTime, entryTime);
                 if (ShouldEmitForThreshold(count))
-                    EmitLine(count, CurrentPathSpan);
+                    EmitLine(count, entryTime, CurrentPathSpan);
                 return;
             }
 
             OpenRootDirectory(nullTermPath, out int dirFd, out NativeDirectory? fallbackDir, out int openErrno);
-            (ulong _, ulong fullBytes) = WalkDirectory(dirFd, fallbackDir, openErrno, in stat, depth: 0);
-            _grandTotal += fullBytes;
+            DirWalkResult walked = WalkDirectory(dirFd, fallbackDir, openErrno, in stat, depth: 0);
+            _grandTotal += walked.FullBytes;
+            if (_showTime)
+                _grandMaxTime = FileTimestamp.Max(_grandMaxTime, walked.FullTime);
         }
         finally
         {
@@ -175,7 +201,7 @@ public sealed unsafe class SequentialWalker
         }
     }
 
-    private (ulong ReportedToParent, ulong FullBytes) WalkDirectory(
+    private DirWalkResult WalkDirectory(
         int dirFd,
         NativeDirectory? fallbackDir,
         int openErrno,
@@ -183,9 +209,14 @@ public sealed unsafe class SequentialWalker
         ulong depth)
     {
         ulong ownBytes = ComputeEntryValue(in dirStat);
+        FileTimestamp directMaxTime = ExtractTimestamp(in dirStat);
         ulong directNonDirBytes = 0;
         ulong directSubdirReportedBytes = 0;
         ulong subdirFullBytes = 0;
+        bool hasSubdirReportedTime = false;
+        FileTimestamp subdirReportedMaxTime = default;
+        bool hasSubdirFullTime = false;
+        FileTimestamp subdirFullMaxTime = default;
         ulong childDepth = depth + 1;
 
         if (openErrno != 0)
@@ -194,8 +225,8 @@ public sealed unsafe class SequentialWalker
             Messages.WritePosixError(_stderr, _programName, "cannot read directory", CurrentPathSpan, openErrno);
             _hasError = true;
             if (depth <= _maxDepth && ShouldEmitForThreshold(ownBytes))
-                EmitLine(ownBytes, CurrentPathSpan);
-            return (ownBytes, ownBytes);
+                EmitLine(ownBytes, directMaxTime, CurrentPathSpan);
+            return new DirWalkResult(ownBytes, ownBytes, directMaxTime, directMaxTime);
         }
 
         FileIdentity dirId = new(dirStat.Device, dirStat.Inode);
@@ -232,7 +263,12 @@ public sealed unsafe class SequentialWalker
                     deferredSubdirs,
                     ref directNonDirBytes,
                     ref directSubdirReportedBytes,
-                    ref subdirFullBytes);
+                    ref subdirFullBytes,
+                    ref directMaxTime,
+                    ref hasSubdirReportedTime,
+                    ref subdirReportedMaxTime,
+                    ref hasSubdirFullTime,
+                    ref subdirFullMaxTime);
                 _pathLen = savedPath;
             }
         }
@@ -266,14 +302,20 @@ public sealed unsafe class SequentialWalker
                     childPath.CopyTo(buf);
                     buf[childPath.Length] = 0;
                     OpenRootDirectory(buf[..(childPath.Length + 1)], out int subFd, out NativeDirectory? subFallback, out int subOpenErrno);
-                    (ulong subReported, ulong subFull) = WalkDirectory(
+                    DirWalkResult sub = WalkDirectory(
                         subFd,
                         subFallback,
                         subOpenErrno,
                         in childStat,
                         childDepth);
-                    directSubdirReportedBytes += subReported;
-                    subdirFullBytes += subFull;
+                    directSubdirReportedBytes += sub.ReportedToParent;
+                    subdirFullBytes += sub.FullBytes;
+                    AccumulateSubdirTime(
+                        in sub,
+                        ref hasSubdirReportedTime,
+                        ref subdirReportedMaxTime,
+                        ref hasSubdirFullTime,
+                        ref subdirFullMaxTime);
                 }
                 finally
                 {
@@ -289,10 +331,21 @@ public sealed unsafe class SequentialWalker
         ulong reportedTotal = _options.SeparateDirs ? ownAndFiles : ownAndFiles + directSubdirReportedBytes;
         ulong fullTotal = ownAndFiles + subdirFullBytes;
 
-        if (depth <= _maxDepth && ShouldEmitForThreshold(reportedTotal))
-            EmitLine(reportedTotal, CurrentPathSpan);
+        FileTimestamp reportedTime = (!_options.SeparateDirs && hasSubdirReportedTime)
+            ? FileTimestamp.Max(directMaxTime, subdirReportedMaxTime)
+            : directMaxTime;
+        FileTimestamp fullTime = hasSubdirFullTime
+            ? FileTimestamp.Max(directMaxTime, subdirFullMaxTime)
+            : directMaxTime;
 
-        return (_options.SeparateDirs ? 0UL : reportedTotal, fullTotal);
+        if (depth <= _maxDepth && ShouldEmitForThreshold(reportedTotal))
+            EmitLine(reportedTotal, reportedTime, CurrentPathSpan);
+
+        return new DirWalkResult(
+            _options.SeparateDirs ? 0UL : reportedTotal,
+            fullTotal,
+            reportedTime,
+            fullTime);
     }
 
     private void ProcessChildEntry(
@@ -304,7 +357,12 @@ public sealed unsafe class SequentialWalker
         List<(byte[] ChildPath, NativeStat Stat)>? deferredSubdirs,
         ref ulong directNonDirBytes,
         ref ulong directSubdirReportedBytes,
-        ref ulong subdirFullBytes)
+        ref ulong subdirFullBytes,
+        ref FileTimestamp directMaxTime,
+        ref bool hasSubdirReportedTime,
+        ref FileTimestamp subdirReportedMaxTime,
+        ref bool hasSubdirFullTime,
+        ref FileTimestamp subdirFullMaxTime)
     {
         bool pathPushed = false;
         if (_hasExcludes)
@@ -383,25 +441,71 @@ public sealed unsafe class SequentialWalker
             else
                 OpenChildDirectory(dirFd, fallbackDir, entry.NameOffset, entry.NameLength, out childFd, out childFallback, out subOpenErrno);
 
-            (ulong subReported, ulong subFull) = WalkDirectory(
+            DirWalkResult sub = WalkDirectory(
                 childFd,
                 childFallback,
                 subOpenErrno,
                 in childStat,
                 childDepth);
-            directSubdirReportedBytes += subReported;
-            subdirFullBytes += subFull;
+            directSubdirReportedBytes += sub.ReportedToParent;
+            subdirFullBytes += sub.FullBytes;
+            AccumulateSubdirTime(
+                in sub,
+                ref hasSubdirReportedTime,
+                ref subdirReportedMaxTime,
+                ref hasSubdirFullTime,
+                ref subdirFullMaxTime);
             return;
         }
 
         ulong entryValue = ComputeEntryValue(in childStat);
         directNonDirBytes += entryValue;
+        FileTimestamp entryTime = ExtractTimestamp(in childStat);
+        if (_showTime)
+            directMaxTime = FileTimestamp.Max(directMaxTime, entryTime);
         if (_options.All && childDepth <= _maxDepth && ShouldEmitForThreshold(entryValue))
         {
             if (!pathPushed)
                 PushPathSegment(entry.NameOffset, entry.NameLength);
-            EmitLine(entryValue, CurrentPathSpan);
+            EmitLine(entryValue, entryTime, CurrentPathSpan);
         }
+    }
+
+    private void AccumulateSubdirTime(
+        in DirWalkResult sub,
+        ref bool hasSubdirReportedTime,
+        ref FileTimestamp subdirReportedMaxTime,
+        ref bool hasSubdirFullTime,
+        ref FileTimestamp subdirFullMaxTime)
+    {
+        if (!_showTime)
+            return;
+
+        if (!_options.SeparateDirs)
+        {
+            subdirReportedMaxTime = hasSubdirReportedTime
+                ? FileTimestamp.Max(subdirReportedMaxTime, sub.ReportedTime)
+                : sub.ReportedTime;
+            hasSubdirReportedTime = true;
+        }
+
+        subdirFullMaxTime = hasSubdirFullTime
+            ? FileTimestamp.Max(subdirFullMaxTime, sub.FullTime)
+            : sub.FullTime;
+        hasSubdirFullTime = true;
+    }
+
+    private FileTimestamp ExtractTimestamp(in NativeStat stat)
+    {
+        if (!_showTime)
+            return default;
+
+        return _timeKind switch
+        {
+            TimeKind.Atime => new FileTimestamp(stat.AtimeSec, stat.AtimeNsec),
+            TimeKind.Ctime => new FileTimestamp(stat.CtimeSec, stat.CtimeNsec),
+            _ => new FileTimestamp(stat.MtimeSec, stat.MtimeNsec)
+        };
     }
 
     private int NormalizeDanglingSymlinkErrno(ReadOnlySpan<byte> nullTermPath, int statErrno)
@@ -640,20 +744,22 @@ public sealed unsafe class SequentialWalker
         return t.IsNegative ? value <= t.Value : value >= t.Value;
     }
 
-    private void EmitLine(ulong bytes, ReadOnlySpan<byte> pathBytes)
+    private void EmitLine(ulong bytes, in FileTimestamp time, ReadOnlySpan<byte> pathBytes)
     {
-        Span<byte> sizeBuf = stackalloc byte[64];
-        if (!HumanFormat.TryFormatBytes(bytes, _options.BlockSizeSpec, sizeBuf, out int sizeLen))
+        Span<byte> sizeBuf = stackalloc byte[128];
+        if (!HumanFormat.TryFormatBytes(bytes, _options.BlockSizeSpec, in _numericLocale, sizeBuf, out int sizeLen))
             return;
 
-        int totalLen = sizeLen + 1 + pathBytes.Length + 1;
+        ReadOnlySpan<byte> timeBytes = _timeFormatter != null ? _timeFormatter.Format(in time) : [];
+        bool includeTime = _timeFormatter != null;
+        int totalLen = sizeLen + 1 + (includeTime ? timeBytes.Length + 1 : 0) + pathBytes.Length + 1;
         if (totalLen > _outBuffer.Length)
         {
             FlushOutput();
             byte[] rented = ArrayPool<byte>.Shared.Rent(totalLen);
             try
             {
-                int pos = WriteFormattedLine(rented, sizeBuf[..sizeLen], pathBytes);
+                int pos = WriteFormattedLine(rented, sizeBuf[..sizeLen], includeTime, timeBytes, pathBytes);
                 _stdout.Write(rented, 0, pos);
             }
             finally
@@ -667,14 +773,26 @@ public sealed unsafe class SequentialWalker
         if (_outPos + totalLen > _outBuffer.Length)
             FlushOutput();
 
-        _outPos += WriteFormattedLine(_outBuffer.AsSpan(_outPos), sizeBuf[..sizeLen], pathBytes);
+        _outPos += WriteFormattedLine(_outBuffer.AsSpan(_outPos), sizeBuf[..sizeLen], includeTime, timeBytes, pathBytes);
     }
 
-    private int WriteFormattedLine(Span<byte> dest, ReadOnlySpan<byte> sizeBytes, ReadOnlySpan<byte> pathBytes)
+    private int WriteFormattedLine(
+        Span<byte> dest,
+        ReadOnlySpan<byte> sizeBytes,
+        bool includeTime,
+        ReadOnlySpan<byte> timeBytes,
+        ReadOnlySpan<byte> pathBytes)
     {
         sizeBytes.CopyTo(dest);
         int pos = sizeBytes.Length;
         dest[pos++] = (byte)'\t';
+        if (includeTime)
+        {
+            timeBytes.CopyTo(dest[pos..]);
+            pos += timeBytes.Length;
+            dest[pos++] = (byte)'\t';
+        }
+
         pathBytes.CopyTo(dest[pos..]);
         pos += pathBytes.Length;
         dest[pos++] = _lineTerminator;

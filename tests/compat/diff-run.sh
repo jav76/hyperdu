@@ -169,6 +169,15 @@ try:
         ("p3-time-atime-iso", "phase3", {"TZ": "America/New_York"}, ["--time=atime", "--time-style=iso", "-s", "d"], None),
         ("p3-time-ctime-long", "phase3", {"TZ": "UTC"}, ["--time=ctime", "--time-style=long-iso", "-s", "d"], None),
         ("p3-time-custom-fmt", "phase3", {"TZ": "UTC"}, ["--time", "--time-style=+%Y-%m-%d %H:%M:%S.%N", "-s", "d"], None),
+        ("p3-time-dst-full-iso-utc", "phase3", {"TZ": "UTC", "LC_ALL": "C"}, ["--time", "--time-style=full-iso", "-a", "times_dst"], None),
+        ("p3-time-dst-full-iso-ny", "phase3", {"TZ": "America/New_York", "LC_ALL": "en_US.UTF-8"}, ["--time", "--time-style=full-iso", "-a", "times_dst"], None),
+        ("p3-time-env-posix-c", "phase3", {"TZ": "America/New_York", "LC_ALL": "C", "TIME_STYLE": "posix-full-iso"}, ["--time", "-s", "times_dst"], None),
+        ("p3-time-env-posix-en", "phase3", {"TZ": "America/New_York", "LC_ALL": "en_US.UTF-8", "TIME_STYLE": "posix-iso"}, ["--time", "-s", "times_dst"], None),
+        ("p3-time-separate-total", "phase3", {"TZ": "UTC", "LC_ALL": "C"}, ["--time", "--time-style=full-iso", "-S", "-c", "times_dst"], None),
+        ("p3-time-invalid-word-en", "phase3", {"LC_ALL": "en_US.UTF-8"}, ["--time=bogus", "d"], None),
+        ("p3-time-invalid-style-c", "phase3", {"LC_ALL": "C"}, ["--time", "--time-style=bogus", "d"], None),
+        ("p3-locale-grouping-c", "phase3", {"LC_ALL": "C"}, ["-B", "'1", "-s", "d"], None),
+        ("p3-locale-grouping-lcnum", "phase3", {"LC_ALL": "", "LC_NUMERIC": "en_US.UTF-8", "LANG": "C"}, ["-B", "'1", "-s", "d"], None),
     ]
 
     # Seeded deterministic random combinations from Section 6

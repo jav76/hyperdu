@@ -55,6 +55,10 @@ internal static unsafe partial class Libc
     internal const ulong RAMFS_MAGIC = 0x858458F6;
     internal const ulong NFS_SUPER_MAGIC = 0x6969;
 
+    internal const int LC_NUMERIC_MASK_LINUX = 1 << 1;
+    internal const int LC_TIME_MASK_LINUX = 1 << 2;
+    internal const int LC_ALL_MASK_MACOS = 0x3F;
+
     // open(2) and openat(2) are variadic; declaring only the fixed arguments is ABI-safe because O_CREAT is never passed.
     [LibraryImport(Lib)]
     internal static partial int open(byte* path, int flags);
@@ -109,4 +113,34 @@ internal static unsafe partial class Libc
 
     [LibraryImport(Lib, EntryPoint = "fstatat$INODE64")]
     internal static partial int fstatat_inode64(int dirFd, byte* path, byte* statBuffer, int flags);
+
+    [LibraryImport(Lib)]
+    internal static partial void tzset();
+
+    [LibraryImport(Lib)]
+    internal static partial byte* localtime_r(long* timer, byte* result);
+
+    [LibraryImport(Lib)]
+    internal static partial nuint strftime(byte* s, nuint max, byte* format, byte* tm);
+
+    [LibraryImport(Lib)]
+    internal static partial byte* getenv(byte* name);
+
+    [LibraryImport(Lib)]
+    internal static partial int setenv(byte* name, byte* value, int overwrite);
+
+    [LibraryImport(Lib)]
+    internal static partial int unsetenv(byte* name);
+
+    [LibraryImport(Lib)]
+    internal static partial nint newlocale(int categoryMask, byte* locale, nint baseLocale);
+
+    [LibraryImport(Lib)]
+    internal static partial nint uselocale(nint newLoc);
+
+    [LibraryImport(Lib)]
+    internal static partial void freelocale(nint loc);
+
+    [LibraryImport(Lib)]
+    internal static partial byte** localeconv();
 }
