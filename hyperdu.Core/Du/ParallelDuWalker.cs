@@ -114,6 +114,7 @@ public sealed unsafe class ParallelDuWalker
     {
         public readonly DirNode Node;
         public readonly int DirFd;
+        public readonly NativeDirectory? FallbackDir;
         public readonly ulong RootDevice;
         public readonly RawDirEntry[] RawEntries;
         public readonly int RawCount;
@@ -125,6 +126,7 @@ public sealed unsafe class ParallelDuWalker
         public LargeDirBatch(
             DirNode node,
             int dirFd,
+            NativeDirectory? fallbackDir,
             ulong rootDevice,
             RawDirEntry[] rawEntries,
             int rawCount,
@@ -134,6 +136,7 @@ public sealed unsafe class ParallelDuWalker
         {
             Node = node;
             DirFd = dirFd;
+            FallbackDir = fallbackDir;
             RootDevice = rootDevice;
             RawEntries = rawEntries;
             RawCount = rawCount;
@@ -794,17 +797,19 @@ public sealed unsafe class ParallelDuWalker
                 Array.Sort(scratch.TempEntries, 0, rawCount, RawDirEntryInodeComparer.Instance);
 
             if (rawCount >= LargeDirChunkThreshold &&
-                fallbackDir == null &&
                 TryEnableWorkersForLargeDir(node, rawCount))
             {
                 if (node.FollowChildSymlinks)
                 {
-                    _ = Libc.close(dirFd);
-                    DispatchLargeDirChunks(node, dirFd: -1, rawCount, scratch, readErrno);
+                    if (fallbackDir != null)
+                        fallbackDir.Dispose();
+                    else if (dirFd >= 0)
+                        _ = Libc.close(dirFd);
+                    DispatchLargeDirChunks(node, dirFd: -1, fallbackDir: null, rawCount, scratch, readErrno);
                 }
                 else
                 {
-                    DispatchLargeDirChunks(node, dirFd, rawCount, scratch, readErrno);
+                    DispatchLargeDirChunks(node, dirFd, fallbackDir, rawCount, scratch, readErrno);
                 }
 
                 spawnedChunks = true;
@@ -1080,6 +1085,7 @@ public sealed unsafe class ParallelDuWalker
     private void DispatchLargeDirChunks(
         DirNode node,
         int dirFd,
+        NativeDirectory? fallbackDir,
         int rawCount,
         WorkerScratch scratch,
         int finalReadErrno)
@@ -1106,6 +1112,7 @@ public sealed unsafe class ParallelDuWalker
         LargeDirBatch batch = new(
             node,
             dirFd,
+            fallbackDir,
             node.RootDevice,
             rawEntries,
             rawCount,
@@ -1269,7 +1276,9 @@ public sealed unsafe class ParallelDuWalker
 
     private void FinalizeLargeDirBatch(LargeDirBatch batch)
     {
-        if (batch.DirFd >= 0)
+        if (batch.FallbackDir != null)
+            batch.FallbackDir.Dispose();
+        else if (batch.DirFd >= 0)
             _ = Libc.close(batch.DirFd);
         ArrayPool<RawDirEntry>.Shared.Return(batch.RawEntries);
         ArrayPool<byte>.Shared.Return(batch.RawNameArena);
