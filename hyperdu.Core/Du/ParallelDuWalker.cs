@@ -758,10 +758,10 @@ public sealed unsafe class ParallelDuWalker
         NativeDirectory? fallbackDir;
         int openErrno;
 
-        if (node.PreOpenedFd >= 0)
+        int preOpenedFd = Interlocked.Exchange(ref node.PreOpenedFd, -1);
+        if (preOpenedFd >= 0)
         {
-            dirFd = node.PreOpenedFd;
-            node.PreOpenedFd = -1;
+            dirFd = preOpenedFd;
             fallbackDir = null;
             openErrno = 0;
         }
@@ -1009,13 +1009,14 @@ public sealed unsafe class ParallelDuWalker
             }
         }
 
-        MarkNodeCompleted(node);
-
         if (isWorkerThread)
         {
             EnqueueRemainingSubdirs(node, startIndex: inlineContinuation != null ? 1 : 0);
+            MarkNodeCompleted(node);
             return inlineContinuation;
         }
+
+        MarkNodeCompleted(node);
 
         if (node.SubdirCount > 0)
         {
@@ -1367,22 +1368,31 @@ public sealed unsafe class ParallelDuWalker
         node.UnprintedWeight = entryPos + 1;
         AddUnprintedEntries(node.UnprintedWeight);
 
-        MarkNodeCompleted(node);
         EnqueueRemainingSubdirs(node, startIndex: 0);
+        MarkNodeCompleted(node);
     }
 
     private void EnqueueRemainingSubdirs(DirNode parent, int startIndex)
     {
-        if (parent.SubdirCount <= startIndex || parent.Subdirs == null || _queue == null)
+        if (_stoppedEarly || _cancellationToken.IsCancellationRequested)
+            return;
+
+        DirNode?[]? subdirs = parent.Subdirs;
+        int subdirCount = parent.SubdirCount;
+        if (subdirs == null || subdirCount <= startIndex || _queue == null)
             return;
 
         DirNode? frontier = Volatile.Read(ref _frontierTarget);
         bool onFrontier = frontier != null && IsFrontierOrNear(parent, frontier);
         ulong frontierDepth = frontier?.Depth ?? parent.Depth;
 
-        for (int i = parent.SubdirCount - 1; i >= startIndex; i--)
+        int limit = Math.Min(subdirCount, subdirs.Length);
+        for (int i = limit - 1; i >= startIndex; i--)
         {
-            DirNode? child = parent.Subdirs[i];
+            if (_stoppedEarly || _cancellationToken.IsCancellationRequested)
+                return;
+
+            DirNode? child = subdirs[i];
             if (child == null || Volatile.Read(ref child.State) != StatePending)
                 continue;
 
