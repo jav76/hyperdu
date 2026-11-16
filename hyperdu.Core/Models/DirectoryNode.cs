@@ -1,4 +1,5 @@
 using System.Text;
+using hyperdu.Core.Du;
 
 namespace hyperdu.Core.Models;
 
@@ -46,6 +47,7 @@ public class DirectoryNode
     internal bool HasNativeAncestry { get; }
 
     private readonly byte[]? _nativeRootPath;
+    internal FileIdentity Identity { get; set; }
     public DirectoryNode? Parent { get; set; }
     public long SelfSize { get; set; }
 

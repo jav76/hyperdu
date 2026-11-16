@@ -17,8 +17,8 @@ public class NativeScanTests
     {
         using TempTree tree = BuildTree();
 
-        (ParallelScanner native, DirectoryNode nativeRoot) = await ScanAsync(tree.Root, useNativeIo: true);
-        (ParallelScanner managed, DirectoryNode managedRoot) = await ScanAsync(tree.Root, useNativeIo: false);
+        (ParallelScanner native, DirectoryNode nativeRoot) = await ScanAsync(tree.Root, useNativeIo: true, apparentSize: true);
+        (ParallelScanner managed, DirectoryNode managedRoot) = await ScanAsync(tree.Root, useNativeIo: false, apparentSize: true);
 
         Assert.True(native.UsesNativeIo);
         Assert.False(managed.UsesNativeIo);
@@ -33,8 +33,8 @@ public class NativeScanTests
     {
         using TempTree tree = BuildTree();
 
-        (_, DirectoryNode nativeRoot) = await ScanAsync(tree.Root, useNativeIo: true, skipHidden: true);
-        (_, DirectoryNode managedRoot) = await ScanAsync(tree.Root, useNativeIo: false, skipHidden: true);
+        (_, DirectoryNode nativeRoot) = await ScanAsync(tree.Root, useNativeIo: true, skipHidden: true, apparentSize: true);
+        (_, DirectoryNode managedRoot) = await ScanAsync(tree.Root, useNativeIo: false, skipHidden: true, apparentSize: true);
 
         Assert.Equal(Flatten(managedRoot), Flatten(nativeRoot));
         Assert.Equal(1_000 + 2_000 + 3_000, nativeRoot.TotalSize);
@@ -49,8 +49,8 @@ public class NativeScanTests
         tree.File("flaggeddir/payload", 400);
         TestLibc.SetHiddenFlag(Path.Combine(tree.Root, "flaggeddir"));
 
-        (_, DirectoryNode shownRoot) = await ScanAsync(tree.Root, useNativeIo: true);
-        (_, DirectoryNode skippedRoot) = await ScanAsync(tree.Root, useNativeIo: true, skipHidden: true);
+        (_, DirectoryNode shownRoot) = await ScanAsync(tree.Root, useNativeIo: true, apparentSize: true);
+        (_, DirectoryNode skippedRoot) = await ScanAsync(tree.Root, useNativeIo: true, skipHidden: true, apparentSize: true);
 
         Assert.Equal(100 + 200 + 400, shownRoot.TotalSize);
         Assert.Equal(100, skippedRoot.TotalSize);
@@ -64,7 +64,7 @@ public class NativeScanTests
         tree.File("real/payload", 500);
         File.CreateSymbolicLink(Path.Combine(tree.Root, "link"), "real");
 
-        (_, DirectoryNode root) = await ScanAsync(tree.Root, useNativeIo: true);
+        (_, DirectoryNode root) = await ScanAsync(tree.Root, useNativeIo: true, apparentSize: true);
 
         DirectoryNode link = root.Subdirectories.Single(d => d.Name == "link");
         Assert.True(link.IsScanned);
@@ -80,12 +80,15 @@ public class NativeScanTests
         tree.File("real/payload", 500);
         File.CreateSymbolicLink(Path.Combine(tree.Root, "link"), "real");
 
-        (_, DirectoryNode root) = await ScanAsync(tree.Root, useNativeIo: true, followSymlinks: true);
+        (_, DirectoryNode dedupedRoot) = await ScanAsync(tree.Root, useNativeIo: true, followSymlinks: true, apparentSize: true, countLinks: false);
+        Assert.Equal(500, dedupedRoot.TotalSize);
+        Assert.Single(dedupedRoot.Subdirectories);
 
-        DirectoryNode link = root.Subdirectories.Single(d => d.Name == "link");
+        (_, DirectoryNode countedRoot) = await ScanAsync(tree.Root, useNativeIo: true, followSymlinks: true, apparentSize: true, countLinks: true);
+        DirectoryNode link = countedRoot.Subdirectories.Single(d => d.Name == "link");
         Assert.Equal(500, link.TotalSize);
         Assert.Equal(1, link.FileCount);
-        Assert.Equal(1_000, root.TotalSize);
+        Assert.Equal(1_000, countedRoot.TotalSize);
     }
 
     [UnixFact]
@@ -96,13 +99,17 @@ public class NativeScanTests
         File.CreateSymbolicLink(Path.Combine(tree.Root, "filelink"), "data");
         File.CreateSymbolicLink(Path.Combine(tree.Root, "dangling"), "missing-target");
 
-        (ParallelScanner plain, DirectoryNode plainRoot) = await ScanAsync(tree.Root, useNativeIo: true);
+        (ParallelScanner plain, DirectoryNode plainRoot) = await ScanAsync(tree.Root, useNativeIo: true, apparentSize: true);
+        (ParallelScanner dedupedFollowing, DirectoryNode dedupedRoot) =
+            await ScanAsync(tree.Root, useNativeIo: true, followSymlinks: true, apparentSize: true, countLinks: false);
         (ParallelScanner following, DirectoryNode followingRoot) =
-            await ScanAsync(tree.Root, useNativeIo: true, followSymlinks: true);
+            await ScanAsync(tree.Root, useNativeIo: true, followSymlinks: true, apparentSize: true, countLinks: true);
 
         Assert.Equal(300, plainRoot.TotalSize);
         Assert.Equal(1, plain.FilesScanned);
-        // A followed link counts its target's size; a dangling one falls back to the link's own size.
+        Assert.Equal(300 + "missing-target".Length, dedupedRoot.TotalSize);
+        Assert.Equal(2, dedupedFollowing.FilesScanned);
+        // With CountLinks enabled, a followed link counts its target's size and a dangling one falls back to link size.
         Assert.Equal(300 + 300 + "missing-target".Length, followingRoot.TotalSize);
         Assert.Equal(3, following.FilesScanned);
     }
@@ -115,7 +122,7 @@ public class NativeScanTests
 
         try
         {
-            (_, DirectoryNode root) = await ScanAsync(tree.Root, useNativeIo: true);
+            (_, DirectoryNode root) = await ScanAsync(tree.Root, useNativeIo: true, apparentSize: true);
 
             DirectoryNode invalid = root.Subdirectories.Single();
             Assert.Null(invalid.ErrorMessage);
@@ -138,10 +145,10 @@ public class NativeScanTests
 
         try
         {
-            (_, DirectoryNode root) = await ScanAsync(tree.Root, useNativeIo: true);
+            (_, DirectoryNode root) = await ScanAsync(tree.Root, useNativeIo: true, apparentSize: true);
             DirectoryNode invalid = root.Subdirectories.Single();
 
-            ParallelScanner rescanner = new ParallelScanner(new ScanOptions { WorkerCount = 2 });
+            ParallelScanner rescanner = new ParallelScanner(new ScanOptions { WorkerCount = 2, ApparentSize = true });
             DirectoryNode rescanned = await rescanner.ScanAsync(invalid);
 
             Assert.Null(rescanned.ErrorMessage);
@@ -162,9 +169,9 @@ public class NativeScanTests
 
         try
         {
-            (_, DirectoryNode root) = await ScanAsync(tree.Root, useNativeIo: true);
+            (_, DirectoryNode root) = await ScanAsync(tree.Root, useNativeIo: true, apparentSize: true);
 
-            List<(string Name, long Size)> files = DirectoryListing.ListFiles(root.Subdirectories.Single());
+            List<(string Name, long Size)> files = DirectoryListing.ListFiles(root.Subdirectories.Single(), apparentSize: true);
 
             Assert.Equal(new List<(string Name, long Size)> { ("payload.txt", 100L) }, files);
         }
@@ -225,14 +232,16 @@ public class NativeScanTests
     }
 
     private static async Task<(ParallelScanner Scanner, DirectoryNode Root)> ScanAsync(string path, bool useNativeIo,
-        bool skipHidden = false, bool followSymlinks = false)
+        bool skipHidden = false, bool followSymlinks = false, bool apparentSize = false, bool countLinks = false)
     {
         ParallelScanner scanner = new ParallelScanner(new ScanOptions
         {
             WorkerCount = 4,
             UseNativeIo = useNativeIo,
             SkipHidden = skipHidden,
-            FollowSymlinks = followSymlinks
+            FollowSymlinks = followSymlinks,
+            ApparentSize = apparentSize,
+            CountLinks = countLinks
         });
         DirectoryNode root = await scanner.ScanAsync(path);
         return (scanner, root);

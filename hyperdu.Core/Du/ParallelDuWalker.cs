@@ -769,7 +769,6 @@ public sealed unsafe class ParallelDuWalker
         {
             DuAccounting.OpenDirectoryPathSafe(
                 node.NullTermPath,
-                node.FollowChildSymlinks,
                 out dirFd,
                 out fallbackDir,
                 out openErrno);

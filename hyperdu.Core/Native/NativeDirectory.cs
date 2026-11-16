@@ -72,6 +72,18 @@ internal sealed unsafe class NativeDirectory : IDisposable
         return error == 0 ? new NativeDirectory(dir, fd, dir == 0) : null;
     }
 
+    internal static NativeDirectory? OpenPathSafe(ReadOnlySpan<byte> path, out int error)
+    {
+        if (path.IsEmpty || path[^1] != 0)
+            throw new ArgumentException("Path must be null-terminated.", nameof(path));
+
+        if (!NativeIo.TryOpenDirectoryFdPathSafe(path, out int fd, out error))
+            return null;
+
+        // WrapFd calls WrapOpenDirectoryFd, which closes fd on failure.
+        return WrapFd(fd, out error);
+    }
+
     internal static NativeDirectory? WrapFd(int fd, out int error)
     {
         error = NativeIo.WrapOpenDirectoryFd(fd, out nint dir);

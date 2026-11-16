@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using hyperdu.Core.Native;
 
 namespace hyperdu.Core.Scanning;
 
@@ -21,10 +22,8 @@ public static class MountHeuristics
 
     public static bool IsNetworkMount(string path)
     {
-        if (!OperatingSystem.IsLinux())
-            return false;
-
-        return TryGetLinuxMountInfo(path, out _, out string fsType) && IsNetworkFsType(fsType);
+        DetectMountCharacteristicsCore(path, checkRotational: false, out bool isNetwork, out _);
+        return isNetwork;
     }
 
     public static int ResolveWorkerBudget(
@@ -51,14 +50,21 @@ public static class MountHeuristics
         return Math.Max(1, Environment.ProcessorCount);
     }
 
-    public static void DetectMountCharacteristics(string path, out bool isNetwork, out bool isRotational)
+    public static void DetectMountCharacteristics(string path, out bool isNetwork, out bool isRotational) =>
+        DetectMountCharacteristicsCore(path, checkRotational: true, out isNetwork, out isRotational);
+
+    private static void DetectMountCharacteristicsCore(
+        string path,
+        bool checkRotational,
+        out bool isNetwork,
+        out bool isRotational)
     {
         if (OperatingSystem.IsLinux())
         {
             if (TryGetLinuxMountInfo(path, out string device, out string fsType))
             {
                 isNetwork = IsNetworkFsType(fsType);
-                isRotational = !isNetwork && DiskDeviceHelper.IsRotationalBlockDevice(device);
+                isRotational = checkRotational && !isNetwork && DiskDeviceHelper.IsRotationalBlockDevice(device);
                 return;
             }
 
@@ -67,8 +73,29 @@ public static class MountHeuristics
             return;
         }
 
+        if (OperatingSystem.IsMacOS())
+        {
+            if (NativeIo.TryGetMacOsMountInfo(path, out string fsType, out string mountFromName))
+            {
+                isNetwork = IsNetworkFsType(fsType);
+                isRotational = checkRotational && !isNetwork && DiskDeviceHelper.IsRotationalMacOsMount(mountFromName);
+                return;
+            }
+
+            isNetwork = false;
+            isRotational = false;
+            return;
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            isNetwork = DiskDeviceHelper.IsNetworkDriveWindows(path);
+            isRotational = checkRotational && !isNetwork && DiskDeviceHelper.IsRotationalDrive(path);
+            return;
+        }
+
         isNetwork = false;
-        isRotational = DiskDeviceHelper.IsRotationalDrive(path);
+        isRotational = checkRotational && DiskDeviceHelper.IsRotationalDrive(path);
     }
 
     internal static bool IsNetworkFsType(string? fsType)
@@ -80,10 +107,13 @@ public static class MountHeuristics
         return fsLower.Contains("nfs", StringComparison.Ordinal) ||
                fsLower.Contains("cifs", StringComparison.Ordinal) ||
                fsLower.Contains("smb", StringComparison.Ordinal) ||
+               fsLower.Contains("afp", StringComparison.Ordinal) ||
+               fsLower.Contains("webdav", StringComparison.Ordinal) ||
                fsLower.Contains("sshfs", StringComparison.Ordinal) ||
                fsLower.Contains("davfs", StringComparison.Ordinal) ||
                fsLower.Contains("glusterfs", StringComparison.Ordinal) ||
-               fsLower.Contains("ceph", StringComparison.Ordinal);
+               fsLower.Contains("ceph", StringComparison.Ordinal) ||
+               fsLower == "ftp";
     }
 
     internal static bool TryGetLinuxMountInfo(string path, out string device, out string fsType)

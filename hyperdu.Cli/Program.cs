@@ -12,6 +12,10 @@ public static class Program
         string TargetPath,
         int? CustomThreads,
         bool SkipHidden,
+        bool ApparentSize,
+        bool CountLinks,
+        bool OneFileSystem,
+        bool FollowSymlinks,
         List<string> CustomExcludes,
         bool ShowHelp,
         bool ShowVersion
@@ -22,6 +26,10 @@ public static class Program
         string targetPath = Directory.GetCurrentDirectory();
         int? customThreads = null;
         bool skipHidden = false;
+        bool apparentSize = false;
+        bool countLinks = false;
+        bool oneFileSystem = false;
+        bool followSymlinks = false;
         List<string> customExcludes = new();
         bool showHelp = false;
         bool showVersion = false;
@@ -58,6 +66,26 @@ public static class Program
                 skipHidden = true;
                 i++;
             }
+            else if (arg == "--apparent-size")
+            {
+                apparentSize = true;
+                i++;
+            }
+            else if (arg == "-l" || arg == "--count-links")
+            {
+                countLinks = true;
+                i++;
+            }
+            else if (arg == "-x" || arg == "--one-file-system")
+            {
+                oneFileSystem = true;
+                i++;
+            }
+            else if (arg == "-L" || arg == "--dereference")
+            {
+                followSymlinks = true;
+                i++;
+            }
             else
             {
                 targetPath = arg;
@@ -65,7 +93,17 @@ public static class Program
             }
         }
 
-        return new CommandLineOptions(targetPath, customThreads, skipHidden, customExcludes, showHelp, showVersion);
+        return new CommandLineOptions(
+            targetPath,
+            customThreads,
+            skipHidden,
+            apparentSize,
+            countLinks,
+            oneFileSystem,
+            followSymlinks,
+            customExcludes,
+            showHelp,
+            showVersion);
     }
 
     private static void PrintScannerConfig(ScanOptions options, bool isNetwork, bool isRotational, bool isCustomThreads)
@@ -105,7 +143,10 @@ public static class Program
         {
             WorkerCount = finalWorkers,
             SkipHidden = parsed.SkipHidden,
-            FollowSymlinks = false,
+            ApparentSize = parsed.ApparentSize,
+            CountLinks = parsed.CountLinks,
+            OneFileSystem = parsed.OneFileSystem,
+            FollowSymlinks = parsed.FollowSymlinks,
             UseNativeIo = Environment.GetEnvironmentVariable("HYPERDU_NATIVE_IO") != "0"
         };
         if (parsed.CustomExcludes.Count > 0)
@@ -127,7 +168,7 @@ public static class Program
     private static async Task<int> RunHeadlessScanAsync(CommandLineOptions parsed)
     {
         string targetPath = parsed.TargetPath;
-        if (!Directory.Exists(targetPath))
+        if (!ParallelScanner.DirectoryExistsPathSafe(targetPath))
         {
             Console.Error.WriteLine($"Error: Target directory does not exist: {targetPath}");
             return 1;
@@ -227,7 +268,7 @@ public static class Program
 
         string targetPath = parsed.TargetPath;
 
-        if (!Directory.Exists(targetPath))
+        if (!ParallelScanner.DirectoryExistsPathSafe(targetPath))
         {
             AnsiConsole.MarkupLine(
                 $"[red]Error: Target directory does not exist:[/] [white]{Markup.Escape(targetPath)}[/]");
@@ -295,6 +336,10 @@ public static class Program
         AnsiConsole.MarkupLine(
             "  [cyan]-e, --exclude <path>[/] Add a path to the exclusion list (can be specified multiple times. default: None)");
         AnsiConsole.MarkupLine("  [cyan]--skip-hidden[/]       Skip hidden and system files/folders");
+        AnsiConsole.MarkupLine("  [cyan]--apparent-size[/]     Count apparent byte sizes rather than allocated disk blocks");
+        AnsiConsole.MarkupLine("  [cyan]-l, --count-links[/]   Count hard-linked files multiple times");
+        AnsiConsole.MarkupLine("  [cyan]-x, --one-file-system[/] Skip directories on different filesystems");
+        AnsiConsole.MarkupLine("  [cyan]-L, --dereference[/]   Follow symbolic links");
     }
 
     // Plain Console output so package-manager smoke tests and scripts get one unwrapped line.
