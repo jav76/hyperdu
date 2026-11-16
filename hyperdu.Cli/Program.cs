@@ -68,23 +68,6 @@ public static class Program
         return new CommandLineOptions(targetPath, customThreads, skipHidden, customExcludes, showHelp, showVersion);
     }
 
-    private static int DetermineWorkerCount(CommandLineOptions parsed, bool isNetwork, bool isRotational)
-    {
-        if (parsed.CustomThreads.HasValue)
-        {
-            return parsed.CustomThreads.Value;
-        }
-        if (isNetwork)
-        {
-            return Math.Max(32, Environment.ProcessorCount * 2);
-        }
-        if (isRotational)
-        {
-            return 1;
-        }
-        return Environment.ProcessorCount;
-    }
-
     private static void PrintScannerConfig(ScanOptions options, bool isNetwork, bool isRotational, bool isCustomThreads)
     {
         if (!isCustomThreads)
@@ -112,9 +95,11 @@ public static class Program
         CommandLineOptions parsed,
         string targetPath)
     {
-        bool isNetwork = IsNetworkMount(targetPath);
-        bool isRotational = !isNetwork && DiskDeviceHelper.IsRotationalDrive(targetPath);
-        int finalWorkers = DetermineWorkerCount(parsed, isNetwork, isRotational);
+        int finalWorkers = MountHeuristics.ResolveWorkerBudget(
+            parsed.CustomThreads,
+            targetPath,
+            out bool isNetwork,
+            out bool isRotational);
 
         ScanOptions options = new ScanOptions
         {
@@ -335,52 +320,5 @@ public static class Program
         return metadata.Length >= 7 && metadata.All(Uri.IsHexDigit)
             ? $"{version} ({metadata[..7]})"
             : version;
-    }
-
-    private static bool IsNetworkMount(string path)
-    {
-        if (!OperatingSystem.IsLinux()) return false;
-        try
-        {
-            string fullPath = Path.GetFullPath(path);
-            if (!File.Exists("/proc/mounts")) return false;
-
-            string[] lines = File.ReadAllLines("/proc/mounts");
-            string bestMatchMount = "";
-            string bestMatchFsType = "";
-
-            foreach (string line in lines)
-            {
-                string[] parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length < 3) continue;
-
-                string mountPoint = parts[1];
-                string fsType = parts[2];
-
-                if (fullPath.StartsWith(mountPoint, StringComparison.Ordinal) && mountPoint.Length > bestMatchMount.Length)
-                {
-                    bestMatchMount = mountPoint;
-                    bestMatchFsType = fsType;
-                }
-            }
-
-            if (!string.IsNullOrEmpty(bestMatchFsType))
-            {
-                string fsLower = bestMatchFsType.ToLowerInvariant();
-                return fsLower.Contains("nfs") ||
-                       fsLower.Contains("cifs") ||
-                       fsLower.Contains("smb") ||
-                       fsLower.Contains("sshfs") ||
-                       fsLower.Contains("davfs") ||
-                       fsLower.Contains("glusterfs") ||
-                       fsLower.Contains("ceph");
-            }
-        }
-        catch
-        {
-            // Fallback to false if /proc/mounts cannot be read.
-        }
-
-        return false;
     }
 }

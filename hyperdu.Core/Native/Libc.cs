@@ -12,6 +12,7 @@ internal static unsafe partial class Libc
 
     internal const int EPERM = 1;
     internal const int ENOENT = 2;
+    internal const int EINTR = 4;
     internal const int EIO = 5;
     internal const int EACCES = 13;
     internal const int ENOTDIR = 20;
@@ -68,6 +69,9 @@ internal static unsafe partial class Libc
 
     [LibraryImport(Lib)]
     internal static partial nint read(int fd, byte* buf, nuint count);
+
+    [LibraryImport(Lib)]
+    internal static partial nint write(int fd, byte* buf, nuint count);
 
     [LibraryImport(Lib)]
     internal static partial int close(int fd);
