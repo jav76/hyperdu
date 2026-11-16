@@ -9,6 +9,7 @@
 
     <ItemGroup>
         <InternalsVisibleTo Include="hyperdu.Tests"/>
+        <InternalsVisibleTo Include="hyperdu.Benchmarks"/>
     </ItemGroup>
 
 </Project>

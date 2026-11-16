@@ -142,6 +142,8 @@ Proposed files:
 | `hyperdu.Cli/DuCommand.cs` | du persona entry point |
 | `hyperdu.Cli/Program.cs` | Persona dispatch before any console setup |
 | `hyperdu.Tests/` | xUnit unit tests |
+| `hyperdu.Benchmarks/` | Automated CLI comparison harness (`cli`) and `BenchmarkDotNet` microbenchmarks (`micro`) |
+| `tests/bench/` | Native AOT benchmark bootstrap script (`run-bench.sh`) |
 | `tests/compat/` | Fixture builder, differential runner, GNU suite runner |
 
 ## 5. Roadmap
@@ -189,7 +191,7 @@ Proposed files:
 
 - Ordered emitter, frontier priority, backpressure and adaptive fan-out (D3 B).
 - Harness runs every vector with `HYPERDU_THREADS=1`, `4` and the default; outputs must match.
-- Benchmarks (`hyperfine`) against GNU `du`: warm cache, cold cache, NFS, `-a` over 1M+ files, peak memory.
+- Run the automated benchmark suite (`tests/bench/run-bench.sh --suite full`, powered by `hyperdu.Benchmarks`) against GNU `du` and optional ecosystem tools: warm cache, cold cache, NFS, `-a` over 1M+ files, Time-to-First-Line (TTFL), and peak memory.
 
 **Done when:** output is identical across thread counts; faster than GNU on cold-cache large trees; within 10% on warm small trees; peak memory stays bounded with `-a`.
 

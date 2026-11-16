@@ -30,6 +30,7 @@ publish/
 project.lock.json
 project.fragment.lock.json
 artifacts/
+BenchmarkDotNet.Artifacts/
 
 # ASP.NET Scaffolding
 ScaffoldingReadMe.txt

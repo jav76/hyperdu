@@ -1,4 +1,5 @@
 <Solution>
+    <Project Path="hyperdu.Benchmarks/hyperdu.Benchmarks.csproj"/>
     <Project Path="hyperdu.Cli/hyperdu.Cli.csproj"/>
     <Project Path="hyperdu.Core/hyperdu.Core.csproj"/>
     <Project Path="hyperdu.Tests/hyperdu.Tests.csproj"/>

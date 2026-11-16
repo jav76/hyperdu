@@ -16,6 +16,7 @@
 
     <ItemGroup>
         <ProjectReference Include="..\hyperdu.Core\hyperdu.Core.csproj"/>
+        <ProjectReference Include="..\hyperdu.Benchmarks\hyperdu.Benchmarks.csproj"/>
     </ItemGroup>
 
     <ItemGroup>
