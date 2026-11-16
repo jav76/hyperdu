@@ -37,6 +37,11 @@ public readonly record struct BlockSizeSpec
     internal BlockSizeSpec WithGrouping(bool grouping) => new(Scale, Mode, Suffix, grouping);
 }
 
+/// <summary>
+/// Parsed --threshold (-t) specification.
+/// </summary>
+public readonly record struct ThresholdSpec(bool IsNegative, ulong Value);
+
 internal enum BlockSizeParseStatus
 {
     Ok,
@@ -46,7 +51,7 @@ internal enum BlockSizeParseStatus
 }
 
 /// <summary>
-/// Parses GNU block-size arguments and environment variables (DU_BLOCK_SIZE, BLOCK_SIZE, BLOCKSIZE).
+/// Parses GNU block-size arguments, --threshold values, and environment variables (DU_BLOCK_SIZE, BLOCK_SIZE, BLOCKSIZE).
 /// </summary>
 public static class BlockSize
 {
@@ -105,7 +110,7 @@ public static class BlockSize
         if (span[0] == '\'')
         {
             grouping = true;
-            span = span.Slice(1);
+            span = span[1..];
             if (span.IsEmpty)
             {
                 // Standalone "'" in BLOCK_SIZE enables grouping without changing scale when used via env; invalid on CLI -B.
@@ -130,58 +135,59 @@ public static class BlockSize
             return true;
         }
 
-        int digitEnd = 0;
-        while (digitEnd < span.Length && char.IsAsciiDigit(span[digitEnd]))
-            digitEnd++;
+        if (!TryParseScaledValue(span, allowZero: false, out ulong totalScale, out bool hasDigits, out string? bareSuffix, out errorStatus))
+            return false;
 
-        bool hasDigits = digitEnd > 0;
-        ulong multiplier = 1;
-        if (hasDigits)
+        // GNU du prints a unit suffix only when the user specified a bare unit (e.g. -BK, -BKiB, -BKB),
+        // never when a leading numeric multiplier is present (e.g. -B1K, -B1024).
+        spec = new BlockSizeSpec(totalScale, HumanMode.None, hasDigits ? null : bareSuffix, grouping);
+        return true;
+    }
+
+    internal static bool TryParseThreshold(string raw, out ThresholdSpec threshold, out BlockSizeParseStatus errorStatus)
+    {
+        threshold = default;
+        if (string.IsNullOrEmpty(raw))
         {
-            if (!ulong.TryParse(span.Slice(0, digitEnd), NumberStyles.None, CultureInfo.InvariantCulture, out multiplier))
-            {
-                errorStatus = BlockSizeParseStatus.Overflow;
-                return false;
-            }
-
-            if (multiplier == 0)
-            {
-                errorStatus = BlockSizeParseStatus.InvalidArgument;
-                return false;
-            }
-        }
-
-        ReadOnlySpan<char> suffixSpan = span.Slice(digitEnd);
-        if (suffixSpan.IsEmpty)
-        {
-            spec = new BlockSizeSpec(multiplier, HumanMode.None, null, grouping);
-            errorStatus = BlockSizeParseStatus.Ok;
-            return true;
-        }
-
-        if (!TryParseSuffix(suffixSpan, hasDigits, out int power, out bool isSi, out string? normalizedSuffix))
-        {
-            errorStatus = hasDigits ? BlockSizeParseStatus.InvalidSuffix : BlockSizeParseStatus.InvalidArgument;
+            errorStatus = BlockSizeParseStatus.InvalidArgument;
             return false;
         }
 
-        ulong unitBase = isSi ? 1000UL : 1024UL;
-        if (!TryComputeUnitMultiplier(multiplier, unitBase, power, out ulong totalScale))
+        ReadOnlySpan<char> span = raw.AsSpan();
+        bool isNegative = false;
+        if (span[0] == '-')
+        {
+            isNegative = true;
+            span = span[1..];
+        }
+        else if (span[0] == '+')
+        {
+            span = span[1..];
+        }
+
+        if (span.IsEmpty)
+        {
+            errorStatus = BlockSizeParseStatus.InvalidArgument;
+            return false;
+        }
+
+        if (!TryParseScaledValue(span, allowZero: !isNegative, out ulong magnitude, out _, out _, out errorStatus))
+            return false;
+
+        ulong maxSignedMagnitude = isNegative ? 9223372036854775808UL : (ulong)long.MaxValue;
+        if (magnitude > maxSignedMagnitude)
         {
             errorStatus = BlockSizeParseStatus.Overflow;
             return false;
         }
 
-        // GNU du prints a unit suffix only when the user specified a bare unit (e.g. -BK, -BKiB, -BKB),
-        // never when a leading numeric multiplier is present (e.g. -B1K, -B1024).
-        spec = new BlockSizeSpec(totalScale, HumanMode.None, hasDigits ? null : normalizedSuffix, grouping);
-        errorStatus = BlockSizeParseStatus.Ok;
+        threshold = new ThresholdSpec(isNegative, magnitude);
         return true;
     }
 
     internal static string FormatErrorMessage(string optionName, string rawArg, BlockSizeParseStatus status)
     {
-        string quoted = Messages.Quote(rawArg);
+        string quoted = Messages.QuoteAscii(rawArg);
         return status switch
         {
             BlockSizeParseStatus.InvalidSuffix => $"invalid suffix in {optionName} argument {quoted}",
@@ -190,9 +196,65 @@ public static class BlockSize
         };
     }
 
+    private static bool TryParseScaledValue(
+        ReadOnlySpan<char> span,
+        bool allowZero,
+        out ulong totalScale,
+        out bool hasDigits,
+        out string? normalizedSuffix,
+        out BlockSizeParseStatus errorStatus)
+    {
+        totalScale = 0;
+        normalizedSuffix = null;
+
+        int digitEnd = 0;
+        while (digitEnd < span.Length && char.IsAsciiDigit(span[digitEnd]))
+            digitEnd++;
+
+        hasDigits = digitEnd > 0;
+        ulong multiplier = 1;
+        if (hasDigits)
+        {
+            if (!ulong.TryParse(span[..digitEnd], NumberStyles.None, CultureInfo.InvariantCulture, out multiplier))
+            {
+                errorStatus = BlockSizeParseStatus.Overflow;
+                return false;
+            }
+
+            if (multiplier == 0 && !allowZero)
+            {
+                errorStatus = BlockSizeParseStatus.InvalidArgument;
+                return false;
+            }
+        }
+
+        ReadOnlySpan<char> suffixSpan = span[digitEnd..];
+        if (suffixSpan.IsEmpty)
+        {
+            totalScale = multiplier;
+            errorStatus = BlockSizeParseStatus.Ok;
+            return true;
+        }
+
+        if (!TryParseSuffix(suffixSpan, out int power, out bool isSi, out normalizedSuffix))
+        {
+            errorStatus = hasDigits ? BlockSizeParseStatus.InvalidSuffix : BlockSizeParseStatus.InvalidArgument;
+            return false;
+        }
+
+        ulong unitBase = isSi ? 1000UL : 1024UL;
+        if (!TryComputeUnitMultiplier(multiplier, unitBase, power, out totalScale))
+        {
+            errorStatus = BlockSizeParseStatus.Overflow;
+            return false;
+        }
+
+        errorStatus = BlockSizeParseStatus.Ok;
+        return true;
+    }
+
     private static bool TryParseSuffix(
         ReadOnlySpan<char> suffix,
-        bool hasDigits,
         out int power,
         out bool isSi,
         out string? normalizedSuffix)
@@ -238,7 +300,6 @@ public static class BlockSize
             return true;
         }
 
-        _ = hasDigits;
         return false;
     }
 

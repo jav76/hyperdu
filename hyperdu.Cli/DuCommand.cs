@@ -13,6 +13,7 @@ internal static class DuCommand
         if (restoreSigpipe)
             SequentialWalker.RestoreDefaultSigpipe();
 
+        using Stream stdin = Console.OpenStandardInput();
         using Stream stdout = Console.OpenStandardOutput();
         using Stream stderr = Console.OpenStandardError();
 
@@ -22,6 +23,7 @@ internal static class DuCommand
                 args,
                 programName,
                 version,
+                stdin,
                 stdout,
                 stderr,
                 out DuOptions? options);
@@ -30,7 +32,7 @@ internal static class DuCommand
             {
                 DuParseOutcome.ExitSuccess => 0,
                 DuParseOutcome.ExitFailure => 1,
-                DuParseOutcome.Run when options != null => new SequentialWalker(options, programName, stdout, stderr).Run(),
+                DuParseOutcome.Run when options != null => new SequentialWalker(options, programName, stdin, stdout, stderr).Run(),
                 _ => 1
             };
         }

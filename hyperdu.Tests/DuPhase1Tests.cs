@@ -223,7 +223,7 @@ public sealed partial class DuPhase1Tests
                 Assert.DoesNotContain("GNU coreutils", ver);
             }
 
-            foreach (string flag in new[] { "--inodes", "--time", "-L", "-x" })
+            foreach (string flag in new[] { "--time", "--time-style=full-iso" })
             {
                 using MemoryStream outF = new();
                 using MemoryStream errF = new();

@@ -33,14 +33,17 @@ public sealed unsafe class SequentialWalker
 
     private readonly DuOptions _options;
     private readonly string _programName;
+    private readonly Stream _stdin;
     private readonly Stream _stdout;
     private readonly Stream _stderr;
     private readonly byte[] _statBuffer = new byte[NativeIo.StatBufferSize];
     private readonly byte[] _outBuffer = new byte[OutputBufferSize];
     private readonly byte[] _direntBuffer = new byte[DirentReadBufferSize];
     private readonly HashSet<FileIdentity> _seen = [];
+    private readonly HashSet<FileIdentity> _activeAncestors = [];
     private readonly ulong _maxDepth;
     private readonly byte _lineTerminator;
+    private readonly bool _hasExcludes;
 
     private byte[] _nameArena = new byte[65536];
     private int _nameArenaPos;
@@ -51,35 +54,51 @@ public sealed unsafe class SequentialWalker
 
     private int _outPos;
     private int _openDirCount;
+    private ulong _rootDevice;
     private ulong _grandTotal;
     private bool _hasError;
 
     public SequentialWalker(DuOptions options, string programName, Stream stdout, Stream stderr)
+        : this(options, programName, Stream.Null, stdout, stderr)
+    {
+    }
+
+    public SequentialWalker(DuOptions options, string programName, Stream stdin, Stream stdout, Stream stderr)
     {
         _options = options;
         _programName = programName;
+        _stdin = stdin;
         _stdout = stdout;
         _stderr = stderr;
         _maxDepth = options.Summarize ? 0UL : (options.MaxDepth ?? ulong.MaxValue);
         _lineTerminator = options.NullTerminator ? (byte)'\0' : (byte)'\n';
+        _hasExcludes = !options.Excludes.IsEmpty;
     }
 
     public static void RestoreDefaultSigpipe() => NativeIo.RestoreDefaultSigpipe();
 
     public int Run()
     {
-        Span<byte> operandStackBuf = stackalloc byte[512];
-        foreach (string operand in _options.Operands)
+        if (_options.Files0From != null)
         {
-            int maxBytes = Encoding.UTF8.GetMaxByteCount(operand.Length);
-            if (maxBytes <= operandStackBuf.Length)
+            if (!Files0Reader.ReadAll(_options.Files0From, _stdin, _programName, _stderr, ProcessOperand))
+                _hasError = true;
+        }
+        else
+        {
+            Span<byte> operandStackBuf = stackalloc byte[512];
+            foreach (string operand in _options.Operands)
             {
-                int len = Encoding.UTF8.GetBytes(operand, operandStackBuf);
-                ProcessOperand(operandStackBuf[..len]);
-            }
-            else
-            {
-                ProcessOperand(Encoding.UTF8.GetBytes(operand));
+                int maxBytes = Encoding.UTF8.GetMaxByteCount(operand.Length);
+                if (maxBytes <= operandStackBuf.Length)
+                {
+                    int len = Encoding.UTF8.GetBytes(operand, operandStackBuf);
+                    ProcessOperand(operandStackBuf[..len]);
+                }
+                else
+                {
+                    ProcessOperand(Encoding.UTF8.GetBytes(operand));
+                }
             }
         }
 
@@ -106,6 +125,9 @@ public sealed unsafe class SequentialWalker
     {
         SetNormalizedRootPath(rawOperand);
 
+        if (_hasExcludes && _options.Excludes.IsExcluded(CurrentPathSpan))
+            return;
+
         byte[]? rentedNullTerm = null;
         Span<byte> nullTermSpan = rawOperand.Length + 1 <= 512
             ? stackalloc byte[512]
@@ -117,22 +139,28 @@ public sealed unsafe class SequentialWalker
             nullTermSpan[rawOperand.Length] = 0;
             ReadOnlySpan<byte> nullTermPath = nullTermSpan[..(rawOperand.Length + 1)];
 
-            if (!NativeIo.TryStatPath(nullTermPath, followSymlinks: false, _statBuffer, out NativeStat stat, out int errno))
+            bool followOperand = _options.SymlinkPolicy is SymlinkPolicy.DereferenceArgs or SymlinkPolicy.DereferenceAll;
+            if (!NativeIo.TryStatPath(nullTermPath, followOperand, _statBuffer, out NativeStat stat, out int errno))
             {
+                if (followOperand)
+                    errno = NormalizeDanglingSymlinkErrno(nullTermPath, errno);
                 FlushOutput();
                 Messages.WritePosixError(_stderr, _programName, "cannot access", CurrentPathSpan, errno);
                 _hasError = true;
                 return;
             }
 
-            if (!_seen.Add(new FileIdentity(stat.Device, stat.Inode)))
+            _rootDevice = stat.Device;
+            FileIdentity operandId = new(stat.Device, stat.Inode);
+            if (!_options.CountLinks && !_seen.Add(operandId))
                 return;
 
             if (stat.Kind != NativeEntryKind.Directory)
             {
-                ulong bytes = ComputeEntryBytes(in stat);
-                _grandTotal += bytes;
-                EmitLine(bytes, CurrentPathSpan);
+                ulong count = ComputeEntryValue(in stat);
+                _grandTotal += count;
+                if (ShouldEmitForThreshold(count))
+                    EmitLine(count, CurrentPathSpan);
                 return;
             }
 
@@ -154,7 +182,7 @@ public sealed unsafe class SequentialWalker
         in NativeStat dirStat,
         ulong depth)
     {
-        ulong ownBytes = ComputeEntryBytes(in dirStat);
+        ulong ownBytes = ComputeEntryValue(in dirStat);
         ulong directNonDirBytes = 0;
         ulong directSubdirReportedBytes = 0;
         ulong subdirFullBytes = 0;
@@ -165,11 +193,13 @@ public sealed unsafe class SequentialWalker
             FlushOutput();
             Messages.WritePosixError(_stderr, _programName, "cannot read directory", CurrentPathSpan, openErrno);
             _hasError = true;
-            if (depth <= _maxDepth)
+            if (depth <= _maxDepth && ShouldEmitForThreshold(ownBytes))
                 EmitLine(ownBytes, CurrentPathSpan);
             return (ownBytes, ownBytes);
         }
 
+        FileIdentity dirId = new(dirStat.Device, dirStat.Inode);
+        _activeAncestors.Add(dirId);
         _openDirCount++;
         int savedArenaPos = _nameArenaPos;
         int savedEntryPos = _entryStackPos;
@@ -189,62 +219,26 @@ public sealed unsafe class SequentialWalker
             if (count > InodeSortThreshold && NativeIo.ShouldSortDirectoryByInode(dirFd))
                 Array.Sort(_entryStack, entryStart, count, DirEntryInodeComparer.Instance);
 
+            bool followChild = _options.SymlinkPolicy == SymlinkPolicy.DereferenceAll;
             for (int i = entryStart; i < entryEnd; i++)
             {
-                DirEntry entry = _entryStack[i];
-                if (!TryStatArenaEntry(dirFd, entry.NameOffset, out NativeStat childStat, out int statErrno))
-                {
-                    int savedPath = PushPathSegment(entry.NameOffset, entry.NameLength);
-                    FlushOutput();
-                    Messages.WritePosixError(_stderr, _programName, "cannot access", CurrentPathSpan, statErrno);
-                    _pathLen = savedPath;
-                    _hasError = true;
-                    continue;
-                }
-
-                bool trackIdentity = childStat.Kind == NativeEntryKind.Directory ||
-                                     childStat.HardLinks > 1 ||
-                                     _options.All;
-                if (trackIdentity && !_seen.Add(new FileIdentity(childStat.Device, childStat.Inode)))
-                    continue;
-
-                if (childStat.Kind == NativeEntryKind.Directory)
-                {
-                    int savedPath = PushPathSegment(entry.NameOffset, entry.NameLength);
-                    if (deferredSubdirs != null)
-                    {
-                        deferredSubdirs.Add((CurrentPathSpan.ToArray(), childStat));
-                    }
-                    else
-                    {
-                        OpenChildDirectory(dirFd, fallbackDir, entry.NameOffset, entry.NameLength, out int childFd, out NativeDirectory? childFallback, out int subOpenErrno);
-                        (ulong subReported, ulong subFull) = WalkDirectory(
-                            childFd,
-                            childFallback,
-                            subOpenErrno,
-                            in childStat,
-                            childDepth);
-                        directSubdirReportedBytes += subReported;
-                        subdirFullBytes += subFull;
-                    }
-
-                    _pathLen = savedPath;
-                }
-                else
-                {
-                    ulong entryBytes = ComputeEntryBytes(in childStat);
-                    directNonDirBytes += entryBytes;
-                    if (_options.All && childDepth <= _maxDepth)
-                    {
-                        int savedPath = PushPathSegment(entry.NameOffset, entry.NameLength);
-                        EmitLine(entryBytes, CurrentPathSpan);
-                        _pathLen = savedPath;
-                    }
-                }
+                int savedPath = _pathLen;
+                ProcessChildEntry(
+                    dirFd,
+                    fallbackDir,
+                    _entryStack[i],
+                    followChild,
+                    childDepth,
+                    deferredSubdirs,
+                    ref directNonDirBytes,
+                    ref directSubdirReportedBytes,
+                    ref subdirFullBytes);
+                _pathLen = savedPath;
             }
         }
         finally
         {
+            _activeAncestors.Remove(dirId);
             if (fallbackDir != null)
                 fallbackDir.Dispose();
             else if (dirFd >= 0)
@@ -295,10 +289,139 @@ public sealed unsafe class SequentialWalker
         ulong reportedTotal = _options.SeparateDirs ? ownAndFiles : ownAndFiles + directSubdirReportedBytes;
         ulong fullTotal = ownAndFiles + subdirFullBytes;
 
-        if (depth <= _maxDepth)
+        if (depth <= _maxDepth && ShouldEmitForThreshold(reportedTotal))
             EmitLine(reportedTotal, CurrentPathSpan);
 
         return (_options.SeparateDirs ? 0UL : reportedTotal, fullTotal);
+    }
+
+    private void ProcessChildEntry(
+        int dirFd,
+        NativeDirectory? fallbackDir,
+        DirEntry entry,
+        bool followChild,
+        ulong childDepth,
+        List<(byte[] ChildPath, NativeStat Stat)>? deferredSubdirs,
+        ref ulong directNonDirBytes,
+        ref ulong directSubdirReportedBytes,
+        ref ulong subdirFullBytes)
+    {
+        bool pathPushed = false;
+        if (_hasExcludes)
+        {
+            PushPathSegment(entry.NameOffset, entry.NameLength);
+            pathPushed = true;
+            if (_options.Excludes.IsExcluded(CurrentPathSpan))
+                return;
+        }
+
+        NativeStat childStat;
+        int statErrno;
+        if (followChild)
+        {
+            // gnulib fts uses FTS_NOCHDIR under -L so kernel path resolution enforces ELOOP across symlink chains.
+            if (!pathPushed)
+            {
+                PushPathSegment(entry.NameOffset, entry.NameLength);
+                pathPushed = true;
+            }
+
+            ReadOnlySpan<byte> nullTermChildPath = NullTerminatedCurrentPath();
+            if (!NativeIo.TryStatPath(nullTermChildPath, followSymlinks: true, _statBuffer, out childStat, out statErrno))
+            {
+                statErrno = NormalizeDanglingSymlinkErrno(nullTermChildPath, statErrno);
+                FlushOutput();
+                Messages.WritePosixError(_stderr, _programName, "cannot access", CurrentPathSpan, statErrno);
+                _hasError = true;
+                return;
+            }
+        }
+        else if (!TryStatArenaEntry(dirFd, entry.NameOffset, followSymlinks: false, out childStat, out statErrno))
+        {
+            if (!pathPushed)
+                PushPathSegment(entry.NameOffset, entry.NameLength);
+
+            FlushOutput();
+            Messages.WritePosixError(_stderr, _programName, "cannot access", CurrentPathSpan, statErrno);
+            _hasError = true;
+            return;
+        }
+
+        if (_options.OneFileSystem && childStat.Device != _rootDevice)
+            return;
+
+        FileIdentity childId = new(childStat.Device, childStat.Inode);
+        if (childStat.Kind == NativeEntryKind.Directory && _activeAncestors.Contains(childId))
+            return;
+
+        if (!_options.CountLinks)
+        {
+            bool trackIdentity = childStat.Kind == NativeEntryKind.Directory ||
+                                 childStat.HardLinks > 1 ||
+                                 _options.All ||
+                                 followChild;
+            if (trackIdentity && !_seen.Add(childId))
+                return;
+        }
+
+        if (childStat.Kind == NativeEntryKind.Directory)
+        {
+            if (!pathPushed)
+                PushPathSegment(entry.NameOffset, entry.NameLength);
+
+            if (deferredSubdirs != null)
+            {
+                deferredSubdirs.Add((CurrentPathSpan.ToArray(), childStat));
+                return;
+            }
+
+            int childFd;
+            NativeDirectory? childFallback;
+            int subOpenErrno;
+            if (followChild)
+                OpenRootDirectory(NullTerminatedCurrentPath(), out childFd, out childFallback, out subOpenErrno);
+            else
+                OpenChildDirectory(dirFd, fallbackDir, entry.NameOffset, entry.NameLength, out childFd, out childFallback, out subOpenErrno);
+
+            (ulong subReported, ulong subFull) = WalkDirectory(
+                childFd,
+                childFallback,
+                subOpenErrno,
+                in childStat,
+                childDepth);
+            directSubdirReportedBytes += subReported;
+            subdirFullBytes += subFull;
+            return;
+        }
+
+        ulong entryValue = ComputeEntryValue(in childStat);
+        directNonDirBytes += entryValue;
+        if (_options.All && childDepth <= _maxDepth && ShouldEmitForThreshold(entryValue))
+        {
+            if (!pathPushed)
+                PushPathSegment(entry.NameOffset, entry.NameLength);
+            EmitLine(entryValue, CurrentPathSpan);
+        }
+    }
+
+    private int NormalizeDanglingSymlinkErrno(ReadOnlySpan<byte> nullTermPath, int statErrno)
+    {
+        if (statErrno == Libc.ENOENT &&
+            NativeIo.TryStatPath(nullTermPath, followSymlinks: false, _statBuffer, out NativeStat lstatStat, out _) &&
+            lstatStat.Kind == NativeEntryKind.Symlink)
+        {
+            return 0;
+        }
+
+        return statErrno;
+    }
+
+    private ReadOnlySpan<byte> NullTerminatedCurrentPath()
+    {
+        if (_pathLen + 1 > _pathStack.Length)
+            GrowByteArray(ref _pathStack, _pathLen + 1);
+        _pathStack[_pathLen] = 0;
+        return _pathStack.AsSpan(0, _pathLen + 1);
     }
 
     private void ReadEntriesGetdents64(int dirFd)
@@ -371,12 +494,12 @@ public sealed unsafe class SequentialWalker
         _entryStack[_entryStackPos++] = new DirEntry(inode, order, nameOffset, name.Length);
     }
 
-    private bool TryStatArenaEntry(int dirFd, int nameOffset, out NativeStat stat, out int errno)
+    private bool TryStatArenaEntry(int dirFd, int nameOffset, bool followSymlinks, out NativeStat stat, out int errno)
     {
         fixed (byte* pName = &_nameArena[nameOffset])
         fixed (byte* pStat = _statBuffer)
         {
-            return NativeIo.TryStatAt(dirFd, pName, followSymlinks: false, pStat, out stat, out errno);
+            return NativeIo.TryStatAt(dirFd, pName, followSymlinks, pStat, out stat, out errno);
         }
     }
 
@@ -498,12 +621,23 @@ public sealed unsafe class SequentialWalker
         Array.Resize(ref buffer, newSize);
     }
 
-    private ulong ComputeEntryBytes(in NativeStat stat)
+    private ulong ComputeEntryValue(in NativeStat stat)
     {
+        if (_options.Inodes)
+            return 1UL;
+
         if (_options.ApparentSize)
             return stat.Kind == NativeEntryKind.Directory || stat.Size <= 0 ? 0UL : (ulong)stat.Size;
 
         return stat.Blocks > 0 ? (ulong)stat.Blocks * 512UL : 0UL;
+    }
+
+    private bool ShouldEmitForThreshold(ulong value)
+    {
+        if (_options.Threshold is not ThresholdSpec t)
+            return true;
+
+        return t.IsNegative ? value <= t.Value : value >= t.Value;
     }
 
     private void EmitLine(ulong bytes, ReadOnlySpan<byte> pathBytes)

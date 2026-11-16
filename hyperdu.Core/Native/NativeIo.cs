@@ -161,6 +161,59 @@ internal static unsafe class NativeIo
         return fd >= 0 ? 0 : GetLastErrno();
     }
 
+    internal static bool TryOpenReadOnly(string path, out int fd, out int errno)
+    {
+        int maxBytes = System.Text.Encoding.UTF8.GetMaxByteCount(path.Length) + 1;
+        byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(maxBytes);
+        try
+        {
+            int len = System.Text.Encoding.UTF8.GetBytes(path, rented);
+            rented[len] = 0;
+            int flags = IsMacOS ? Libc.O_CLOEXEC_MACOS : Libc.O_CLOEXEC_LINUX;
+            fixed (byte* pPath = rented)
+            {
+                fd = Libc.open(pPath, flags);
+            }
+
+            if (fd >= 0)
+            {
+                errno = 0;
+                return true;
+            }
+
+            errno = GetLastErrno();
+            return false;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    internal static bool TryReadFd(int fd, Span<byte> buffer, out int bytesRead, out int errno)
+    {
+        fixed (byte* pBuf = buffer)
+        {
+            nint n = Libc.read(fd, pBuf, (nuint)buffer.Length);
+            if (n >= 0)
+            {
+                bytesRead = (int)n;
+                errno = 0;
+                return true;
+            }
+
+            bytesRead = 0;
+            errno = GetLastErrno();
+            return false;
+        }
+    }
+
+    internal static void CloseFd(int fd)
+    {
+        if (fd >= 0)
+            _ = Libc.close(fd);
+    }
+
     private static int WrapOpenDirectoryFd(int fd, out nint dir)
     {
         dir = 0;
