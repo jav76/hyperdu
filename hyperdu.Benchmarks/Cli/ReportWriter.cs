@@ -62,6 +62,8 @@ internal static class ReportWriter
         }
         sb.AppendLine();
 
+        AppendOverallPerformanceComparison(sb, report.Scenarios);
+
         sb.AppendLine("## Summary vs Reference `du`");
         sb.AppendLine();
         sb.AppendLine("| Scenario | Ref `du` Mean (ms) | `hyperdu` Mean (ms) | Speedup | `hyperdu` Peak RSS (MiB) | Ref `du` Peak RSS (MiB) | Parity |");
@@ -134,11 +136,234 @@ internal static class ReportWriter
             sb.AppendLine();
         }
 
+        AppendOverallBenchmarkScore(sb, report.Scenarios);
+
         return sb.ToString();
     }
 
+    private sealed record CategoryMetrics(
+        string Name,
+        int TotalScenarios,
+        int ActiveScenarios,
+        int ParityPassed,
+        int PendingScenarios,
+        double RefTotalMs,
+        double CandidateTotalMs,
+        double? AvgSpeedup,
+        double? GeoMeanSpeedup,
+        double? AvgHyperduRssMib,
+        double? AvgRefRssMib);
+
+    private static readonly string[] CategoryOrder =
+    [
+        "Startup Latency",
+        "Summary (-s / -sh)",
+        "Apparent Size (--apparent-size)",
+        "Depth-Limited (-d 1)",
+        "Full Listing (-a)",
+        "Traversal & Filtering"
+    ];
+
+    private static void AppendOverallPerformanceComparison(StringBuilder sb, IReadOnlyList<ScenarioResult> scenarios)
+    {
+        sb.AppendLine("## Overall Performance Comparison");
+        sb.AppendLine();
+        sb.AppendLine("Average speedup per category compares each headline `hyperdu` run (`hyperdu du`, falling back to `hyperdu` native) against the reference `du` (`> 1.00x` means `hyperdu` is faster).");
+        sb.AppendLine();
+
+        List<CategoryMetrics> byCategory = scenarios
+            .GroupBy(ClassifyWorkloadCategory)
+            .OrderBy(g =>
+            {
+                int idx = Array.IndexOf(CategoryOrder, g.Key);
+                return idx >= 0 ? idx : int.MaxValue;
+            })
+            .ThenBy(g => g.Key, StringComparer.Ordinal)
+            .Select(g => ComputeMetrics(g.Key, g.ToList(), PickHeadlineHyperduEntry))
+            .ToList();
+
+        sb.AppendLine("### Average Speedup by Workload Category");
+        sb.AppendLine();
+        AppendMetricsTable(sb, "Workload Category", byCategory);
+        sb.AppendLine();
+
+        List<CategoryMetrics> byDataset = scenarios
+            .GroupBy(s => s.FixtureName)
+            .Select(g => ComputeMetrics(g.Key, g.ToList(), PickHeadlineHyperduEntry))
+            .ToList();
+
+        sb.AppendLine("### Average Speedup by Dataset");
+        sb.AppendLine();
+        AppendMetricsTable(sb, "Dataset", byDataset);
+        sb.AppendLine();
+    }
+
+    private static void AppendMetricsTable(StringBuilder sb, string labelColumn, IReadOnlyList<CategoryMetrics> rows)
+    {
+        sb.AppendLine($"| {labelColumn} | Active / Total | Ref `du` Total (ms) | `hyperdu` Total (ms) | Avg Speedup | GeoMean Speedup | Avg `hyperdu` RSS (MiB) | Avg Ref RSS (MiB) |");
+        sb.AppendLine("| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+
+        foreach (CategoryMetrics m in rows)
+        {
+            string activeCol = $"{m.ActiveScenarios} / {m.TotalScenarios}";
+            string refTotal = m.ActiveScenarios > 0 ? m.RefTotalMs.ToString("F2", CultureInfo.InvariantCulture) : "-";
+            string candTotal = m.ActiveScenarios > 0 ? m.CandidateTotalMs.ToString("F2", CultureInfo.InvariantCulture) : "-";
+            string avgSpd = FormatSpeedup(m.AvgSpeedup);
+            string geoSpd = FormatSpeedup(m.GeoMeanSpeedup);
+            string hyperRss = m.AvgHyperduRssMib.HasValue ? m.AvgHyperduRssMib.Value.ToString("F2", CultureInfo.InvariantCulture) : "-";
+            string refRss = m.AvgRefRssMib.HasValue ? m.AvgRefRssMib.Value.ToString("F2", CultureInfo.InvariantCulture) : "-";
+
+            sb.AppendLine($"| {m.Name} | {activeCol} | {refTotal} | {candTotal} | {avgSpd} | {geoSpd} | {hyperRss} | {refRss} |");
+        }
+    }
+
+    private static void AppendOverallBenchmarkScore(StringBuilder sb, IReadOnlyList<ScenarioResult> scenarios)
+    {
+        CategoryMetrics headline = ComputeMetrics("Headline", scenarios, PickHeadlineHyperduEntry);
+        CategoryMetrics? duPersona = ComputeMetricsForTool("hyperdu du", scenarios, "hyperdu-du-auto");
+        CategoryMetrics? nativeTool = ComputeMetricsForTool("hyperdu (native, auto-threads)", scenarios, "hyperdu-native");
+
+        sb.AppendLine("## Overall Benchmark Score");
+        sb.AppendLine();
+        sb.AppendLine("Score Index normalizes the Reference `du` baseline to `100` (`round(GeoMean Speedup * 100)`); higher is faster.");
+        sb.AppendLine();
+        sb.AppendLine("| Metric | Active / Total | Avg Speedup | GeoMean Speedup | Score Index (Ref = 100) | Ref Total (ms) | `hyperdu` Total (ms) | Parity Passed |");
+        sb.AppendLine("| :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |");
+
+        AppendScoreRow(sb, "Overall Headline (`hyperdu`)", headline);
+        if (duPersona is { TotalScenarios: > 0 })
+            AppendScoreRow(sb, "`hyperdu du` Persona", duPersona);
+        if (nativeTool is { TotalScenarios: > 0 })
+            AppendScoreRow(sb, "`hyperdu` Native Engine (Tier 2)", nativeTool);
+
+        sb.AppendLine();
+
+        string scoreText = headline.GeoMeanSpeedup.HasValue
+            ? $"{Math.Round(headline.GeoMeanSpeedup.Value * 100.0).ToString("F0", CultureInfo.InvariantCulture)} / 100 baseline ({FormatSpeedup(headline.GeoMeanSpeedup)} geomean, {FormatSpeedup(headline.AvgSpeedup)} mean across {headline.ActiveScenarios}/{headline.TotalScenarios} scenarios)"
+            : "n/a (no active scenarios)";
+
+        sb.AppendLine($"- **Overall Score**: **{scoreText}**");
+        sb.AppendLine($"- **Parity Summary**: {headline.ParityPassed} / {headline.ActiveScenarios} active matched ({headline.PendingScenarios} pending)");
+        sb.AppendLine();
+    }
+
+    private static void AppendScoreRow(StringBuilder sb, string label, CategoryMetrics m)
+    {
+        string activeCol = $"{m.ActiveScenarios} / {m.TotalScenarios}";
+        string avgSpd = FormatSpeedup(m.AvgSpeedup);
+        string geoSpd = FormatSpeedup(m.GeoMeanSpeedup);
+        string scoreIdx = m.GeoMeanSpeedup.HasValue
+            ? Math.Round(m.GeoMeanSpeedup.Value * 100.0).ToString("F0", CultureInfo.InvariantCulture)
+            : "-";
+        string refTotal = m.ActiveScenarios > 0 ? m.RefTotalMs.ToString("F2", CultureInfo.InvariantCulture) : "-";
+        string candTotal = m.ActiveScenarios > 0 ? m.CandidateTotalMs.ToString("F2", CultureInfo.InvariantCulture) : "-";
+        string parityCol = m.ActiveScenarios > 0
+            ? $"{m.ParityPassed} / {m.ActiveScenarios} ({(100.0 * m.ParityPassed / m.ActiveScenarios).ToString("F1", CultureInfo.InvariantCulture)}%)"
+            : $"0 / 0 ({m.PendingScenarios} pending)";
+
+        sb.AppendLine($"| {label} | {activeCol} | {avgSpd} | {geoSpd} | {scoreIdx} | {refTotal} | {candTotal} | {parityCol} |");
+    }
+
+    private static CategoryMetrics? ComputeMetricsForTool(string name, IReadOnlyList<ScenarioResult> scenarios, string toolId)
+    {
+        List<ScenarioResult> relevant = scenarios
+            .Where(s => s.Entries.Any(e => e.ToolId == toolId))
+            .ToList();
+        return relevant.Count == 0
+            ? null
+            : ComputeMetrics(name, relevant, entries => entries.FirstOrDefault(e => e.ToolId == toolId));
+    }
+
+    private static CategoryMetrics ComputeMetrics(
+        string name,
+        IReadOnlyList<ScenarioResult> scenarios,
+        Func<IReadOnlyList<BenchmarkEntryResult>, BenchmarkEntryResult?> selector)
+    {
+        int active = 0;
+        int passed = 0;
+        int pending = 0;
+        double refSum = 0;
+        double candSum = 0;
+        List<double> speedups = [];
+        List<double> hyperRss = [];
+        List<double> refRss = [];
+
+        foreach (ScenarioResult scenario in scenarios)
+        {
+            BenchmarkEntryResult? refEntry = scenario.Entries.FirstOrDefault(e => e.IsReferenceDu);
+            BenchmarkEntryResult? candEntry = selector(scenario.Entries);
+
+            if (candEntry == null)
+                continue;
+
+            if (candEntry.IsPending)
+            {
+                pending++;
+                continue;
+            }
+
+            if (candEntry.Probe?.ParityMatched == true)
+                passed++;
+
+            if (candEntry.SpeedupVsReferenceDu is double spd && spd > 0 &&
+                refEntry?.Timing is { MeanMs: double rMs } &&
+                candEntry.Timing is { MeanMs: double cMs })
+            {
+                active++;
+                refSum += rMs;
+                candSum += cMs;
+                speedups.Add(spd);
+
+                if (candEntry.Probe?.PeakRssKb is long hKb && hKb > 0)
+                    hyperRss.Add(hKb / 1024.0);
+                if (refEntry.Probe?.PeakRssKb is long rKb && rKb > 0)
+                    refRss.Add(rKb / 1024.0);
+            }
+        }
+
+        double? avgSpeedup = speedups.Count > 0 ? speedups.Average() : null;
+        double? geoSpeedup = speedups.Count > 0
+            ? Math.Exp(speedups.Sum(s => Math.Log(s)) / speedups.Count)
+            : null;
+        double? avgHyperRss = hyperRss.Count > 0 ? hyperRss.Average() : null;
+        double? avgRefRss = refRss.Count > 0 ? refRss.Average() : null;
+
+        return new CategoryMetrics(
+            Name: name,
+            TotalScenarios: scenarios.Count,
+            ActiveScenarios: active,
+            ParityPassed: passed,
+            PendingScenarios: pending,
+            RefTotalMs: refSum,
+            CandidateTotalMs: candSum,
+            AvgSpeedup: avgSpeedup,
+            GeoMeanSpeedup: geoSpeedup,
+            AvgHyperduRssMib: avgHyperRss,
+            AvgRefRssMib: avgRefRss);
+    }
+
+    internal static string ClassifyWorkloadCategory(ScenarioResult scenario)
+    {
+        if (string.Equals(scenario.FixtureName, "tiny-startup", StringComparison.Ordinal))
+            return "Startup Latency";
+
+        int slash = scenario.Id.LastIndexOf('/');
+        string suffix = slash >= 0 ? scenario.Id[(slash + 1)..] : scenario.Id;
+
+        return suffix switch
+        {
+            "summarize" or "du-s" or "du-sh" => "Summary (-s / -sh)",
+            "apparent-summarize" or "du-apparent" => "Apparent Size (--apparent-size)",
+            "depth-1" or "du-d1" => "Depth-Limited (-d 1)",
+            "du-a" => "Full Listing (-a)",
+            _ => "Traversal & Filtering"
+        };
+    }
+
     private static BenchmarkEntryResult? PickHeadlineHyperduEntry(IReadOnlyList<BenchmarkEntryResult> entries) =>
-        entries.FirstOrDefault(e => e.ToolId == "hyperdu-du-auto")
+        entries.FirstOrDefault(e => e.ToolId == "hyperdu-du-auto" && !e.IsPending)
+        ?? entries.FirstOrDefault(e => e.ToolId == "hyperdu-native" && !e.IsPending)
+        ?? entries.FirstOrDefault(e => e.ToolId == "hyperdu-du-auto")
         ?? entries.FirstOrDefault(e => e.ToolId == "hyperdu-native");
 
     private static string FormatTimingSimple(TimingStats? timing) =>

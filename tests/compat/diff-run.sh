@@ -33,6 +33,7 @@ parser.add_argument("--timeout", type=float, default=2.0, help="Per-invocation t
 parser.add_argument("--jobs", type=int, default=4, help="Parallel worker count")
 parser.add_argument("--json", dest="json_out", help="Write JSON report to path")
 parser.add_argument("--markdown", dest="md_out", help="Write Markdown report to path")
+parser.add_argument("--category", action="append", help="Filter vectors by category (repeatable)")
 parser.add_argument("--baseline", action="store_true", help="Exit 0 regardless of score (Phase 0 baseline mode)")
 parser.add_argument("--min-score", type=float, default=100.0, help="Minimum passing percentage (ignored with --baseline)")
 args = parser.parse_args(argv)
@@ -198,6 +199,8 @@ try:
                 line = b"du:" + line[len(exe_bytes) + 1 :]
             elif base_bytes != b"du" and line.startswith(base_bytes + b":"):
                 line = b"du:" + line[len(base_bytes) + 1 :]
+            if exe_bytes != b"du":
+                line = line.replace(b"Try '" + exe_bytes + b" --help'", b"Try 'du --help'")
             out_lines.append(line)
         return b"".join(out_lines)
 
@@ -257,6 +260,10 @@ try:
             "cand_exit": cand_rc,
             "reasons": reasons,
         }
+
+    if args.category:
+        allowed_cats = set(args.category)
+        vectors = [v for v in vectors if v[1] in allowed_cats]
 
     started = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:

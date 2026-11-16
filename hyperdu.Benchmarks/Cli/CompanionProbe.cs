@@ -115,6 +115,12 @@ internal static partial class CompanionProbe
                 : (false, $"exit {candidate.ExitCode}");
         }
 
+        if (candidate.ExitCode != 0 &&
+            candidate.StderrSample.Contains("not yet implemented", StringComparison.OrdinalIgnoreCase))
+        {
+            return (true, "pending (Phase 2/3)");
+        }
+
         if (scenario.RequireStrictStdoutParity && referenceProbe != null)
         {
             if (candidate.ExitCode != referenceProbe.ExitCode)

@@ -401,6 +401,12 @@ public class BenchmarkHarnessTests
             Assert.Contains("2.00x", md);
             Assert.Contains("16.00", md); // 16384 KiB -> 16.00 MiB
             Assert.Contains("Pending Phase 1 (#15)", md);
+            Assert.Contains("## Overall Performance Comparison", md);
+            Assert.Contains("### Average Speedup by Workload Category", md);
+            Assert.Contains("### Average Speedup by Dataset", md);
+            Assert.Contains("## Overall Benchmark Score", md);
+            Assert.Contains("Score Index", md);
+            Assert.Contains("200", md);
             Assert.DoesNotContain("\u2014", md); // No em-dashes
         }
         finally

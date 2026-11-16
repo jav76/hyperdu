@@ -158,8 +158,65 @@ public static class Program
         return 0;
     }
 
+    private static bool TryDispatchDuPersona(string[] args, out int exitCode)
+    {
+        string rawArgv0 = ReadRawArgv0();
+        string baseName = Path.GetFileName(rawArgv0);
+        if (baseName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            baseName = baseName[..^4];
+
+        if (string.Equals(baseName, "du", StringComparison.Ordinal) ||
+            string.Equals(baseName, "gdu", StringComparison.Ordinal))
+        {
+            string programName = string.IsNullOrEmpty(rawArgv0) ? baseName : rawArgv0;
+            exitCode = DuCommand.Run(args, programName, GetDisplayVersion());
+            return true;
+        }
+
+        if (args.Length > 0 && string.Equals(args[0], "du", StringComparison.Ordinal))
+        {
+            exitCode = DuCommand.Run(args[1..], "du", GetDisplayVersion());
+            return true;
+        }
+
+        exitCode = 0;
+        return false;
+    }
+
+    private static string ReadRawArgv0()
+    {
+        if (OperatingSystem.IsLinux())
+        {
+            try
+            {
+                using FileStream fs = File.OpenRead("/proc/self/cmdline");
+                Span<byte> buf = stackalloc byte[512];
+                int read = fs.Read(buf);
+                if (read > 0)
+                {
+                    int nul = buf[..read].IndexOf((byte)0);
+                    int len = nul >= 0 ? nul : read;
+                    if (len > 0)
+                        return Encoding.UTF8.GetString(buf[..len]);
+                }
+            }
+            catch
+            {
+                // Fall back to managed argv[0] when /proc is unavailable.
+            }
+        }
+
+        string[] cmdArgs = Environment.GetCommandLineArgs();
+        return cmdArgs.Length > 0 ? cmdArgs[0] : "hyperdu";
+    }
+
     public static async Task<int> Main(string[] args)
     {
+        if (TryDispatchDuPersona(args, out int duExitCode))
+        {
+            return duExitCode;
+        }
+
         Console.OutputEncoding = Encoding.UTF8;
         CommandLineOptions parsed = ParseArguments(args);
 

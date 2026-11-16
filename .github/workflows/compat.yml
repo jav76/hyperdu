@@ -64,6 +64,15 @@ jobs:
             --jobs 4 \
             --json artifacts/compat/diff-results.json \
             --markdown artifacts/compat/diff-report.md
+          bash tests/compat/diff-run.sh \
+            --fixtures "$FIXTURES_DIR" \
+            --candidate-du artifacts/compat-bin/du \
+            --category phase1 \
+            --min-score 100 \
+            --timeout 2 \
+            --jobs 4 \
+            --json artifacts/compat/phase1-results.json \
+            --markdown artifacts/compat/phase1-report.md
 
       - name: Run GNU coreutils tests/du/ suite (baseline)
         run: |
