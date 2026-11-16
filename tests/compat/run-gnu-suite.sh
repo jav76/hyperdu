@@ -97,10 +97,19 @@ if [[ -z "$COREUTILS_DIR" ]]; then
   COREUTILS_DIR="$(mktemp -d -t coreutils-tests-XXXXXX)"
   SCRATCH_DIRS+=("$COREUTILS_DIR")
   echo "Fetching GNU coreutils tests/du at tag $PINNED_COREUTILS_TAG..."
-  git clone --quiet --depth 1 --filter=blob:none --sparse --branch "$PINNED_COREUTILS_TAG" \
-    https://github.com/coreutils/coreutils.git "$COREUTILS_DIR"
-  git -C "$COREUTILS_DIR" sparse-checkout set --no-cone \
-    /tests/du /tests/init.sh /init.cfg /tests/Coreutils.pm /tests/CuTmpdir.pm /tests/other-fs-tmpdir
+  if ! (
+    cd /tmp
+    git -c http.https://github.com/.extraheader= clone \
+      --quiet --depth 1 --filter=blob:none --sparse --branch "$PINNED_COREUTILS_TAG" \
+      https://github.com/coreutils/coreutils.git "$COREUTILS_DIR"
+  ); then
+    echo "git clone failed; downloading tarball archive..." >&2
+    TAR_URL="https://github.com/coreutils/coreutils/archive/refs/tags/${PINNED_COREUTILS_TAG}.tar.gz"
+    curl -fsSL "$TAR_URL" | tar -xz -C "$COREUTILS_DIR" --strip-components=1
+  else
+    git -C "$COREUTILS_DIR" sparse-checkout set --no-cone \
+      /tests/du /tests/init.sh /init.cfg /tests/Coreutils.pm /tests/CuTmpdir.pm /tests/other-fs-tmpdir
+  fi
 fi
 
 mkdir -p "$COREUTILS_DIR/src"
