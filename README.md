@@ -162,7 +162,7 @@ dotnet run --project hyperdu.Cli -- [path] [options]
 
 `./publish.sh` builds self-contained single-file binaries for `linux-x64`, `linux-arm64`, `win-x64`, `win-x86`, `osx-x64` and `osx-arm64` into `publish/`.
 
-Versions come from git tags via [MinVer](https://github.com/adamralph/minver). See [docs/publishing-guide.md](docs/publishing-guide.md) for the release process.
+Versions come from git tags via [MinVer](https://github.com/adamralph/minver).
 
 ## License
 
