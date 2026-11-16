@@ -29,10 +29,11 @@ internal static class ComparatorRegistry
 
     public static DiscoveredTools DiscoverTools(BenchmarkCliOptions options)
     {
-        (string duBin, string duVersion, bool isGnuDu) = ResolveReferenceDu(options.DuBinary);
+        (string duBin, string duVersion, bool supportsGnuFlags, bool refIsUutils, string refDisplayName) =
+            ResolveReferenceDu(options.DuBinary);
         ToolSpec refDu = new(
             Id: "ref-du",
-            DisplayName: isGnuDu ? "GNU du (reference)" : "du (reference)",
+            DisplayName: refDisplayName,
             Tier: ComparatorTier.Tier1Parity,
             Executable: duBin,
             BaseEnvironment: EmptyEnv,
@@ -130,14 +131,14 @@ internal static class ComparatorRegistry
             }
         }
 
-        (ToolSpec? uutilsDu, string? uutilsPrefix) = ResolveUutilsDu();
+        (ToolSpec? uutilsDu, string? uutilsPrefix) = ResolveUutilsDu(refIsUutils);
         ToolSpec? dust = ResolveSimpleTool("dust", "dust", "--version");
         ToolSpec? goGdu = ResolveGoGdu();
         ToolSpec? ncdu = ResolveSimpleTool("ncdu", "ncdu", "--version");
 
         return new DiscoveredTools(
             ReferenceDu: refDu,
-            ReferenceDuIsGnu: isGnuDu,
+            ReferenceDuIsGnu: supportsGnuFlags,
             ReferenceDuVersion: duVersion,
             HyperduNoUi: hyperduNative,
             HyperduNoUiSingleThread: hyperduSingle,
@@ -495,14 +496,30 @@ internal static class ComparatorRegistry
     private static string[] BuildUutilsArgs(string? prefix, params string[] rest) =>
         prefix != null ? [prefix, .. rest] : rest;
 
-    private static (string Executable, string VersionLine, bool IsGnu) ResolveReferenceDu(string? overridePath)
+    private static bool IsGnuDuVersion(string text) =>
+        text.Contains("GNU coreutils", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsUutilsDuVersion(string text) =>
+        text.Contains("uutils", StringComparison.OrdinalIgnoreCase);
+
+    private static string DescribeReferenceDu(string versionOutput)
+    {
+        if (IsGnuDuVersion(versionOutput))
+            return "GNU du (reference)";
+        if (IsUutilsDuVersion(versionOutput))
+            return "uutils du (reference)";
+        return "du (reference)";
+    }
+
+    private static (string Executable, string VersionLine, bool SupportsGnuFlags, bool IsUutils, string DisplayName)
+        ResolveReferenceDu(string? overridePath)
     {
         if (!string.IsNullOrWhiteSpace(overridePath))
         {
             (string stdout, _) = RunProbeProcess(overridePath, ["--version"]);
             string line = FirstLine(stdout) ?? Path.GetFileName(overridePath);
-            bool isGnu = stdout.Contains("GNU coreutils", StringComparison.OrdinalIgnoreCase);
-            return (overridePath, line, isGnu);
+            bool gnuFlags = IsGnuDuVersion(stdout) || IsUutilsDuVersion(stdout);
+            return (overridePath, line, gnuFlags, IsUutilsDuVersion(stdout), DescribeReferenceDu(stdout));
         }
 
         if (OperatingSystem.IsMacOS())
@@ -511,16 +528,28 @@ internal static class ComparatorRegistry
             if (gduPath != null)
             {
                 (string stdout, _) = RunProbeProcess(gduPath, ["--version"]);
-                if (stdout.Contains("GNU coreutils", StringComparison.OrdinalIgnoreCase))
-                    return (gduPath, FirstLine(stdout) ?? "GNU du (gdu)", true);
+                if (IsGnuDuVersion(stdout))
+                    return (gduPath, FirstLine(stdout) ?? "GNU du (gdu)", true, false, "GNU du (reference)");
+            }
+        }
+        else if (OperatingSystem.IsLinux())
+        {
+            // Ubuntu 25.10+ ships uutils as 'du' and GNU coreutils as 'gnudu'.
+            string? gnuduPath = FindOnPath("gnudu");
+            if (gnuduPath != null)
+            {
+                (string stdout, _) = RunProbeProcess(gnuduPath, ["--version"]);
+                if (IsGnuDuVersion(stdout))
+                    return (gnuduPath, FirstLine(stdout) ?? "GNU du (gnudu)", true, false, "GNU du (reference)");
             }
         }
 
         string duPath = FindOnPath("du") ?? "du";
         (string verOut, _) = RunProbeProcess(duPath, ["--version"]);
-        bool gnu = verOut.Contains("GNU coreutils", StringComparison.OrdinalIgnoreCase);
+        bool supportsGnu = IsGnuDuVersion(verOut) || IsUutilsDuVersion(verOut);
+        bool isUutils = IsUutilsDuVersion(verOut);
         string verLine = FirstLine(verOut) ?? (OperatingSystem.IsMacOS() ? "BSD du" : "system du");
-        return (duPath, verLine, gnu);
+        return (duPath, verLine, supportsGnu, isUutils, DescribeReferenceDu(verOut));
     }
 
     private static string? ResolveHyperduBinary(string? overridePath)
@@ -576,8 +605,11 @@ internal static class ComparatorRegistry
         return false;
     }
 
-    private static (ToolSpec? Tool, string? Prefix) ResolveUutilsDu()
+    private static (ToolSpec? Tool, string? Prefix) ResolveUutilsDu(bool referenceIsAlreadyUutils)
     {
+        if (referenceIsAlreadyUutils)
+            return (null, null);
+
         string? uuDu = FindOnPath("uu-du");
         if (uuDu != null)
         {

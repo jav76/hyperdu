@@ -169,9 +169,9 @@ public class BenchmarkHarnessTests
         Assert.Contains(scenarios, s => s.Tier == ComparatorTier.Tier1Parity && s.Id == "balanced-tree/du-a");
 
         IReadOnlyList<ScenarioDefinition> filtered =
-            ComparatorRegistry.BuildScenarios(tools, [balanced], BenchmarkSuite.Quick, filter: "du-apparent");
+            ComparatorRegistry.BuildScenarios(tools, [balanced], BenchmarkSuite.Quick, filter: "du-d1");
         Assert.Single(filtered);
-        Assert.Equal("balanced-tree/du-apparent", filtered[0].Id);
+        Assert.Equal("balanced-tree/du-d1", filtered[0].Id);
     }
 
     [UnixFact]
