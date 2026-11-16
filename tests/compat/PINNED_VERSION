@@ -1,0 +1,3 @@
+# Pinned reference GNU coreutils version for du drop-in compatibility testing.
+PINNED_GNU_DU_VERSION="9.4"
+PINNED_COREUTILS_TAG="v9.4"

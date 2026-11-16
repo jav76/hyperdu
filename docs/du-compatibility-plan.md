@@ -2,7 +2,7 @@
 
 **Goal:** `hyperdu` can be installed as `du` and existing scripts keep working, while `hyperdu` itself keeps the interactive explorer.
 
-**Status:** draft, 2026-10-31. Reference implementation: GNU coreutils `du` (9.7 on the dev machine; CI version to be pinned, see Phase 0).
+**Status:** decisions D1-D6 resolved (2026-11-16); Phase 0 harness active. Pinned CI reference implementation: GNU coreutils `du` 9.4 (`ubuntu-24.04`).
 
 ## 1. Definition of "drop-in"
 
@@ -49,6 +49,8 @@ Measured by a differential harness against the reference `du` and by the GNU cor
 
 **Recommendation: A.** It is the only option that is both a drop-in and non-breaking.
 
+**Decided: A** (2026-11-16).
+
 ### D2. Reference dialect
 
 | Option | Pros | Cons | Design Considerations |
@@ -59,6 +61,8 @@ Measured by a differential harness against the reference `du` and by the GNU cor
 
 **Recommendation: A now, C as Phase 6.** GNU covers the largest install base and comes with a conformance suite.
 
+**Decided: A (GNU coreutils 9.4 pinned on `ubuntu-24.04` in CI; C in Phase 6)** (2026-11-16).
+
 ### D3. Output ordering vs parallel scanning
 
 | Option | Pros | Cons | Design Considerations |
@@ -68,6 +72,8 @@ Measured by a differential harness against the reference `du` and by the GNU cor
 | **C: Sequential walker only** | • Trivially identical to du | • No speed advantage over du | • Loses the project's reason to exist |
 
 **Recommendation: B, built on C.** Ship the sequential walker first (Phase 1), keep it as the `HYPERDU_THREADS=1` path and as the test oracle for the parallel engine.
+
+**Decided: B, built on C** (2026-11-16).
 
 ### D4. Native filesystem access
 
@@ -90,6 +96,8 @@ Measured by a differential harness against the reference `du` and by the GNU cor
 
 **Recommendation: A for this effort**, revisit B in Phase 6.
 
+**Decided: A** (2026-11-16).
+
 ### D6. hyperdu-specific settings in the du persona (threads etc.)
 
 | Option | Pros | Cons | Design Considerations |
@@ -99,6 +107,8 @@ Measured by a differential harness against the reference `du` and by the GNU cor
 | **C: Plain names like `--threads`** | • Familiar | • `du --thr=1M` is valid today as `--threshold` (verified) and would become ambiguous | • Breaks scripts; reject |
 
 **Recommendation: A.**
+
+**Decided: A** (2026-11-16).
 
 ## 4. Target architecture
 
