@@ -35,6 +35,7 @@ internal sealed class FixtureGenerator : IDisposable
             specs.Add(CreateWideDir(fileCount: 20_000, siblingDirs: 10));
             specs.Add(CreateDeepChain(depth: 250));
             specs.Add(CreateHardlinksHeavy(uniqueFiles: 5_000, hardlinkCount: 5_000, symlinkCount: 100));
+            specs.Add(CreateDevMonorepo());
         }
 
         if (suite == BenchmarkSuite.Full)
@@ -227,6 +228,121 @@ internal sealed class FixtureGenerator : IDisposable
             $"{dirCount:N0} dirs x {filesPerDir:N0} files ({dirCount * filesPerDir:N0} total files)",
             dirCount * filesPerDir,
             1 + groupDirs + dirCount,
+            IsSynthetic: true);
+    }
+
+    /// <summary>
+    /// Realistic developer monorepo combining node_modules packages + .bin symlinks, .git/objects fanout, and src/bin/obj trees.
+    /// </summary>
+    public FixtureSpec CreateDevMonorepo(
+        int packageCount = 200,
+        int filesPerPackage = 50,
+        int gitObjectsCount = 2_000,
+        int srcFileCount = 3_000,
+        string name = "dev-monorepo")
+    {
+        string root = AllocateFixtureRoot(name);
+        string nodeModules = Path.Combine(root, "node_modules");
+        string binDir = Path.Combine(nodeModules, ".bin");
+        string gitObjects = Path.Combine(root, ".git", "objects");
+        string gitPack = Path.Combine(gitObjects, "pack");
+        string srcRoot = Path.Combine(root, "src");
+        string srcBin = Path.Combine(srcRoot, "bin", "Debug");
+        string srcObj = Path.Combine(srcRoot, "obj", "Debug");
+
+        Directory.CreateDirectory(binDir);
+        Directory.CreateDirectory(gitPack);
+        Directory.CreateDirectory(srcBin);
+        Directory.CreateDirectory(srcObj);
+
+        string[] pkgRoots = new string[packageCount];
+        for (int p = 0; p < packageCount; p++)
+        {
+            string pkg = Path.Combine(nodeModules, $"pkg_{p:D4}");
+            Directory.CreateDirectory(Path.Combine(pkg, "dist"));
+            Directory.CreateDirectory(Path.Combine(pkg, "lib"));
+            pkgRoots[p] = pkg;
+        }
+
+        const int gitBuckets = 64;
+        string[] gitBucketDirs = new string[gitBuckets];
+        for (int b = 0; b < gitBuckets; b++)
+        {
+            string bucket = Path.Combine(gitObjects, $"{b:x2}");
+            Directory.CreateDirectory(bucket);
+            gitBucketDirs[b] = bucket;
+        }
+
+        const int srcModules = 20;
+        string[] srcDirs = new string[srcModules];
+        for (int m = 0; m < srcModules; m++)
+        {
+            string mod = Path.Combine(srcRoot, $"mod_{m:D2}");
+            Directory.CreateDirectory(mod);
+            srcDirs[m] = mod;
+        }
+
+        byte[] payload = CreatePatternBuffer(64 * 1024);
+
+        // 1. node_modules packages
+        Parallel.For(0, packageCount, p =>
+        {
+            string pkg = pkgRoots[p];
+            WriteFileSpan(Path.Combine(pkg, "package.json"), payload.AsSpan(0, 256));
+            WriteFileSpan(Path.Combine(pkg, "dist", "index.js"), payload.AsSpan(0, 1024));
+            for (int f = 2; f < filesPerPackage; f++)
+            {
+                string sub = (f % 2 == 0) ? "lib" : "dist";
+                int size = DeterministicSize(p * filesPerPackage + f, 128, 2048);
+                WriteFileSpan(Path.Combine(pkg, sub, $"mod_{f:D3}.js"), payload.AsSpan(0, size));
+            }
+        });
+
+        int binLinks = Math.Min(20, packageCount);
+        for (int s = 0; s < binLinks; s++)
+        {
+            string targetRel = Path.Combine("..", $"pkg_{s:D4}", "dist", "index.js");
+            File.CreateSymbolicLink(Path.Combine(binDir, $"cli_{s:D2}"), targetRel);
+        }
+
+        // 2. .git/objects fanout + packfiles
+        Parallel.For(0, gitObjectsCount, i =>
+        {
+            string bucket = gitBucketDirs[i % gitBuckets];
+            int size = DeterministicSize(i + 100_000, 128, 2048);
+            WriteFileSpan(Path.Combine(bucket, $"obj_{i:x6}"), payload.AsSpan(0, size));
+        });
+
+        for (int k = 0; k < 4; k++)
+        {
+            WriteFileSpan(Path.Combine(gitPack, $"pack-{k:D2}.pack"), payload);
+        }
+
+        // 3. src + build artifacts
+        Parallel.For(0, srcFileCount, i =>
+        {
+            string dir = srcDirs[i % srcModules];
+            string ext = (i % 50 == 0) ? "tmp" : "cs";
+            int size = DeterministicSize(i + 200_000, 256, 4096);
+            WriteFileSpan(Path.Combine(dir, $"Component_{i:D4}.{ext}"), payload.AsSpan(0, size));
+        });
+
+        for (int a = 0; a < 20; a++)
+        {
+            WriteFileSpan(Path.Combine(srcBin, $"app_{a:D2}.dll"), payload.AsSpan(0, 8192));
+            WriteFileSpan(Path.Combine(srcObj, $"app_{a:D2}.cache"), payload.AsSpan(0, 4096));
+        }
+
+        int totalFiles = (packageCount * filesPerPackage) + binLinks + gitObjectsCount + 4 + srcFileCount + 40;
+        // root + node_modules + .bin + (packageCount * 3) + .git + objects + pack + gitBuckets + src + srcModules + bin + bin/Debug + obj + obj/Debug
+        int totalDirs = 1 + 2 + (packageCount * 3) + 3 + gitBuckets + 5 + srcModules;
+
+        return new FixtureSpec(
+            name,
+            root,
+            $"node_modules ({packageCount} pkgs, {packageCount * filesPerPackage:N0} files) + .git ({gitObjectsCount:N0} objs) + src ({srcFileCount:N0} files)",
+            totalFiles,
+            totalDirs,
             IsSynthetic: true);
     }
 

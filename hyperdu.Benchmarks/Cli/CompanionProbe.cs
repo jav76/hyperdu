@@ -21,6 +21,9 @@ internal static partial class CompanionProbe
             await RunStreamingProbeAsync(invocation, cancellationToken);
 
         long peakRssKb = await MeasurePeakRssKbAsync(invocation, cancellationToken);
+        double? earlyExitMs = scenario.MeasureEarlyExit
+            ? await MeasureEarlyExitHeadAsync(invocation, maxLines: 100, cancellationToken)
+            : null;
 
         ProbeResult raw = new(
             ExitCode: exitCode,
@@ -31,10 +34,72 @@ internal static partial class CompanionProbe
             StdoutSample: stdoutSample,
             StderrSample: stderrSample,
             ParityMatched: true,
-            ParityNote: "ok");
+            ParityNote: "ok",
+            EarlyExitHead100Ms: earlyExitMs);
 
         (bool parityMatched, string parityNote) = EvaluateParity(scenario, invocation, raw, referenceProbe);
         return raw with { ParityMatched = parityMatched, ParityNote = parityNote };
+    }
+
+    /// <summary>
+    /// Simulates a `| head -n N` consumer by reading <paramref name="maxLines"/> from stdout,
+    /// closing the read pipe to trigger SIGPIPE/EPIPE, and measuring total time until the child exits.
+    /// </summary>
+    public static async Task<double?> MeasureEarlyExitHeadAsync(
+        CommandInvocation invocation,
+        int maxLines = 100,
+        CancellationToken cancellationToken = default)
+    {
+        ProcessStartInfo psi = BuildStartInfo(invocation, redirectStdout: true, redirectStderr: true);
+        long startTimestamp = Stopwatch.GetTimestamp();
+
+        using Process? process = Process.Start(psi);
+        if (process == null)
+            return null;
+
+        Task drainErr = process.StandardError.BaseStream.CopyToAsync(Stream.Null, cancellationToken);
+
+        byte[] buffer = new byte[4096];
+        long lines = 0;
+        Stream stdout = process.StandardOutput.BaseStream;
+
+        try
+        {
+            while (lines < maxLines)
+            {
+                int read = await stdout.ReadAsync(buffer, cancellationToken);
+                if (read == 0)
+                    break;
+
+                for (int i = 0; i < read; i++)
+                {
+                    if (buffer[i] is (byte)'\n' or 0)
+                    {
+                        lines++;
+                        if (lines >= maxLines)
+                            break;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            // Closing stdout triggers SIGPIPE/EPIPE on the next child write, matching `| head`.
+            process.StandardOutput.Close();
+        }
+
+        using CancellationTokenSource waitCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        waitCts.CancelAfter(TimeSpan.FromSeconds(10));
+        try
+        {
+            await Task.WhenAll(drainErr, process.WaitForExitAsync(waitCts.Token));
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            try { process.Kill(true); } catch { }
+        }
+
+        return Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
     }
 
     internal static (bool Matched, string Note) EvaluateParity(

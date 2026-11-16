@@ -108,11 +108,46 @@ internal static class HyperfineRunner
             }
 
             string jsonText = await File.ReadAllTextAsync(jsonFile, cancellationToken);
-            HyperfineExport? parsed = JsonSerializer.Deserialize<HyperfineExport>(jsonText, JsonOptions)
-                ?? throw new InvalidOperationException("hyperfine produced empty JSON output.");
+            return ParseHyperfineJson(jsonText, options.EffectiveRuns);
+        }
+        finally
+        {
+            try { if (File.Exists(jsonFile)) File.Delete(jsonFile); } catch { }
+        }
+    }
 
-            List<TimingStats> results = new(parsed.Results.Count);
-            foreach (HyperfineEntry entry in parsed.Results)
+    /// <summary>Parses both hyperfine v1 and v2 (--export-json) result schemas into TimingStats.</summary>
+    internal static IReadOnlyList<TimingStats> ParseHyperfineJson(string jsonText, int defaultRuns)
+    {
+        HyperfineExport parsed = JsonSerializer.Deserialize<HyperfineExport>(jsonText, JsonOptions)
+            ?? throw new InvalidOperationException("hyperfine produced empty JSON output.");
+
+        List<TimingStats> results = new(parsed.Results.Count);
+        bool isV2 = parsed.SchemaVersion >= 2;
+
+        foreach (HyperfineEntry entry in parsed.Results)
+        {
+            if (isV2 || entry.Summary?.TimeWallClock != null)
+            {
+                HyperfineMetricSummary wall = entry.Summary?.TimeWallClock
+                    ?? throw new InvalidOperationException("hyperfine v2 JSON entry is missing summary.time_wall_clock.");
+                long? peakRssKb = entry.Summary?.MemoryPeakResident?.Max is double maxBytes && maxBytes > 0
+                    ? (long)Math.Round(maxBytes / 1024.0)
+                    : null;
+
+                results.Add(new TimingStats(
+                    MeanMs: wall.Mean * 1000.0,
+                    StdDevMs: wall.Stddev * 1000.0,
+                    MedianMs: wall.Median * 1000.0,
+                    MinMs: wall.Min * 1000.0,
+                    MaxMs: wall.Max * 1000.0,
+                    UserCpuMs: entry.Summary?.TimeUser != null ? entry.Summary.TimeUser.Mean * 1000.0 : null,
+                    SystemCpuMs: entry.Summary?.TimeSystem != null ? entry.Summary.TimeSystem.Mean * 1000.0 : null,
+                    Runs: wall.Count > 0 ? wall.Count : defaultRuns,
+                    Engine: "hyperfine",
+                    PeakRssKb: peakRssKb));
+            }
+            else
             {
                 results.Add(new TimingStats(
                     MeanMs: entry.Mean * 1000.0,
@@ -122,16 +157,12 @@ internal static class HyperfineRunner
                     MaxMs: entry.Max * 1000.0,
                     UserCpuMs: entry.User * 1000.0,
                     SystemCpuMs: entry.System * 1000.0,
-                    Runs: entry.Times?.Count ?? options.EffectiveRuns,
+                    Runs: entry.Times?.Count ?? defaultRuns,
                     Engine: "hyperfine"));
             }
+        }
 
-            return results;
-        }
-        finally
-        {
-            try { if (File.Exists(jsonFile)) File.Delete(jsonFile); } catch { }
-        }
+        return results;
     }
 
     private static async Task<IReadOnlyList<TimingStats>> RunWithStopwatchFallbackAsync(
@@ -331,6 +362,9 @@ internal static class HyperfineRunner
 
     private sealed class HyperfineExport
     {
+        [JsonPropertyName("schema_version")]
+        public int SchemaVersion { get; set; }
+
         [JsonPropertyName("results")]
         public List<HyperfineEntry> Results { get; set; } = new();
     }
@@ -363,5 +397,44 @@ internal static class HyperfineRunner
 
         [JsonPropertyName("times")]
         public List<double>? Times { get; set; }
+
+        [JsonPropertyName("summary")]
+        public HyperfineV2Summary? Summary { get; set; }
+    }
+
+    private sealed class HyperfineV2Summary
+    {
+        [JsonPropertyName("time_wall_clock")]
+        public HyperfineMetricSummary? TimeWallClock { get; set; }
+
+        [JsonPropertyName("time_user")]
+        public HyperfineMetricSummary? TimeUser { get; set; }
+
+        [JsonPropertyName("time_system")]
+        public HyperfineMetricSummary? TimeSystem { get; set; }
+
+        [JsonPropertyName("memory_peak_resident")]
+        public HyperfineMetricSummary? MemoryPeakResident { get; set; }
+    }
+
+    private sealed class HyperfineMetricSummary
+    {
+        [JsonPropertyName("count")]
+        public int Count { get; set; }
+
+        [JsonPropertyName("mean")]
+        public double Mean { get; set; }
+
+        [JsonPropertyName("stddev")]
+        public double? Stddev { get; set; }
+
+        [JsonPropertyName("median")]
+        public double Median { get; set; }
+
+        [JsonPropertyName("min")]
+        public double Min { get; set; }
+
+        [JsonPropertyName("max")]
+        public double Max { get; set; }
     }
 }

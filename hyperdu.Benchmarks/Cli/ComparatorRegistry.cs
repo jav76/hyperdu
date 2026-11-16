@@ -171,6 +171,11 @@ internal static class ComparatorRegistry
                 scenarios.Add(BuildDefaultSummarizeScenario(tools, fixture));
                 scenarios.Add(BuildDepthOneScenario(tools, fixture));
             }
+
+            if (fixture.Name == "dev-monorepo")
+            {
+                scenarios.Add(BuildExcludeDirectoryScenario(tools, fixture));
+            }
         }
 
         // Tier 1 du parity flag matrix runs on representative fixtures (or all custom paths).
@@ -320,6 +325,52 @@ internal static class ComparatorRegistry
             Invocations: invocations);
     }
 
+    private static ScenarioDefinition BuildExcludeDirectoryScenario(DiscoveredTools tools, FixtureSpec fixture)
+    {
+        string excludedDir = Path.Combine(fixture.RootPath, "node_modules");
+        List<CommandInvocation> invocations = new();
+        AddHyperduNoUiInvocations(tools, fixture.RootPath, invocations, ["-e", excludedDir]);
+
+        string[] refArgs = tools.ReferenceDuIsGnu
+            ? ["--exclude=node_modules", "-s", fixture.RootPath]
+            : ["-I", "node_modules", "-s", fixture.RootPath];
+        invocations.Add(new CommandInvocation(tools.ReferenceDu, refArgs, tools.ReferenceDu.BaseEnvironment));
+
+        if (tools.HyperduDuPersona is { IsPending: false } duPersona)
+        {
+            invocations.Add(new CommandInvocation(duPersona, WithPrefix(duPersona, "--exclude=node_modules", "-s", fixture.RootPath), duPersona.BaseEnvironment));
+        }
+
+        if (tools.UutilsDu != null)
+        {
+            invocations.Add(new CommandInvocation(tools.UutilsDu, BuildUutilsArgs(tools.UutilsSubcommandPrefix, "--exclude=node_modules", "-s", fixture.RootPath), tools.UutilsDu.BaseEnvironment));
+        }
+
+        if (tools.Dust != null)
+        {
+            invocations.Add(new CommandInvocation(tools.Dust, ["-v", "node_modules", "-d", "0", "-b", fixture.RootPath], tools.Dust.BaseEnvironment));
+        }
+
+        if (tools.GoGdu != null)
+        {
+            invocations.Add(new CommandInvocation(tools.GoGdu, ["-n", "-p", "-i", excludedDir, fixture.RootPath], tools.GoGdu.BaseEnvironment));
+        }
+
+        if (tools.Ncdu != null)
+        {
+            invocations.Add(new CommandInvocation(tools.Ncdu, ["-0", "-o", "-", "--exclude", "node_modules", fixture.RootPath], tools.Ncdu.BaseEnvironment));
+        }
+
+        return new ScenarioDefinition(
+            Id: $"{fixture.Name}/exclude-node-modules",
+            DisplayName: $"Directory subtree exclude (--exclude=node_modules) on {fixture.Name}",
+            FixtureName: fixture.Name,
+            TargetPath: fixture.RootPath,
+            Tier: ComparatorTier.Tier2Workload,
+            DuFlags: "--exclude=node_modules -s",
+            Invocations: invocations);
+    }
+
     private static ScenarioDefinition BuildParityScenario(
         DiscoveredTools tools,
         FixtureSpec fixture,
@@ -364,19 +415,25 @@ internal static class ComparatorRegistry
             DuFlags: string.Join(" ", flags),
             Invocations: invocations,
             RequireStrictStdoutParity: true,
-            PendingNote: tools.HasDuPersona ? null : "hyperdu du persona pending Phase 1 (#15)");
+            PendingNote: tools.HasDuPersona ? null : "hyperdu du persona pending Phase 1 (#15)",
+            MeasureEarlyExit: suffix == "a");
     }
 
-    private static void AddHyperduNoUiInvocations(DiscoveredTools tools, string targetPath, List<CommandInvocation> invocations)
+    private static void AddHyperduNoUiInvocations(
+        DiscoveredTools tools,
+        string targetPath,
+        List<CommandInvocation> invocations,
+        string[]? extraArgs = null)
     {
+        string[] prefix = extraArgs ?? [];
         if (tools.HyperduNoUi != null)
-            invocations.Add(new CommandInvocation(tools.HyperduNoUi, [targetPath], tools.HyperduNoUi.BaseEnvironment));
+            invocations.Add(new CommandInvocation(tools.HyperduNoUi, [.. prefix, targetPath], tools.HyperduNoUi.BaseEnvironment));
 
         if (tools.HyperduNoUiSingleThread != null)
-            invocations.Add(new CommandInvocation(tools.HyperduNoUiSingleThread, ["-t", "1", targetPath], tools.HyperduNoUiSingleThread.BaseEnvironment));
+            invocations.Add(new CommandInvocation(tools.HyperduNoUiSingleThread, ["-t", "1", .. prefix, targetPath], tools.HyperduNoUiSingleThread.BaseEnvironment));
 
         if (tools.HyperduNoUiManaged != null)
-            invocations.Add(new CommandInvocation(tools.HyperduNoUiManaged, [targetPath], tools.HyperduNoUiManaged.BaseEnvironment));
+            invocations.Add(new CommandInvocation(tools.HyperduNoUiManaged, [.. prefix, targetPath], tools.HyperduNoUiManaged.BaseEnvironment));
     }
 
     private static List<FixtureSpec> SelectParityFixtures(IReadOnlyList<FixtureSpec> fixtures, BenchmarkSuite suite)
@@ -385,7 +442,7 @@ internal static class ComparatorRegistry
         foreach (FixtureSpec fixture in fixtures)
         {
             if (!fixture.IsSynthetic ||
-                fixture.Name is "balanced-tree" or "wide-dir-20k" or "hardlinks-heavy" or "million-files")
+                fixture.Name is "balanced-tree" or "wide-dir-20k" or "hardlinks-heavy" or "dev-monorepo" or "million-files")
             {
                 selected.Add(fixture);
             }
@@ -415,6 +472,11 @@ internal static class ComparatorRegistry
             ("time", ["--time", "-s"], true),
             ("exclude", ["--exclude=*.tmp", "-s"], true)
         };
+
+        if (fixture.Name == "dev-monorepo")
+        {
+            vectors.Add(("exclude-dir", ["--exclude=node_modules", "-s"], true));
+        }
 
         if (suite == BenchmarkSuite.Quick || fixture.Name == "million-files")
         {

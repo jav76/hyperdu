@@ -69,6 +69,74 @@ public class BenchmarkHarnessTests
         Assert.False(Directory.Exists(baseDir));
     }
 
+    [Fact]
+    public void FixtureGenerator_CreateDevMonorepoCreatesExpectedLayout()
+    {
+        using FixtureGenerator generator = new();
+        FixtureSpec monorepo = generator.CreateDevMonorepo(packageCount: 4, filesPerPackage: 5, gitObjectsCount: 16, srcFileCount: 10);
+
+        Assert.True(Directory.Exists(Path.Combine(monorepo.RootPath, "node_modules", ".bin")));
+        Assert.True(Directory.Exists(Path.Combine(monorepo.RootPath, ".git", "objects", "pack")));
+        Assert.True(Directory.Exists(Path.Combine(monorepo.RootPath, "src", "bin", "Debug")));
+        Assert.Equal(4 * 5 + 4 + 16 + 4 + 10 + 40, monorepo.ExpectedFiles);
+    }
+
+    [UnixFact]
+    public void ComparatorRegistry_IncludesDevMonorepoExcludeAndEarlyExitFlags()
+    {
+        using FixtureGenerator generator = new();
+        FixtureSpec monorepo = generator.CreateDevMonorepo(packageCount: 2, filesPerPackage: 3, gitObjectsCount: 4, srcFileCount: 4);
+
+        DiscoveredTools tools = ComparatorRegistry.DiscoverTools(new BenchmarkCliOptions { Suite = BenchmarkSuite.Standard });
+        IReadOnlyList<ScenarioDefinition> scenarios =
+            ComparatorRegistry.BuildScenarios(tools, [monorepo], BenchmarkSuite.Standard, filter: null);
+
+        Assert.Contains(scenarios, s => s.Id == "dev-monorepo/exclude-node-modules");
+        ScenarioDefinition duA = Assert.Single(scenarios, s => s.Id == "dev-monorepo/du-a");
+        Assert.True(duA.MeasureEarlyExit);
+
+        if (tools.ReferenceDuIsGnu)
+        {
+            Assert.Contains(scenarios, s => s.Id == "dev-monorepo/du-exclude-dir");
+        }
+    }
+
+    [UnixFact]
+    public async Task CompanionProbe_MeasuresEarlyExitHead100()
+    {
+        ToolSpec tool = new(
+            Id: "stream-test",
+            DisplayName: "stream-test",
+            Tier: ComparatorTier.Tier1Parity,
+            Executable: "/bin/sh",
+            BaseEnvironment: new Dictionary<string, string>(),
+            IsReferenceDu: false,
+            SupportsDuFlags: true);
+
+        CommandInvocation inv = new(
+            tool,
+            ["-c", "seq 1 5000"],
+            tool.BaseEnvironment);
+
+        ScenarioDefinition scenario = new(
+            Id: "head-test",
+            DisplayName: "Head 100 test",
+            FixtureName: "test",
+            TargetPath: "/tmp",
+            Tier: ComparatorTier.Tier1Parity,
+            DuFlags: "-a",
+            Invocations: [inv],
+            RequireStrictStdoutParity: true,
+            MeasureEarlyExit: true);
+
+        ProbeResult probe = await CompanionProbe.ProbeAsync(scenario, inv, referenceProbe: null);
+
+        Assert.Equal(0, probe.ExitCode);
+        Assert.Equal(5000, probe.OutputLines);
+        Assert.NotNull(probe.EarlyExitHead100Ms);
+        Assert.True(probe.EarlyExitHead100Ms > 0);
+    }
+
     [UnixFact]
     public void FixtureGenerator_DeepChainCreatesAndDeletesBeyondPathMax()
     {
@@ -204,6 +272,63 @@ public class BenchmarkHarnessTests
         Assert.Equal("dotnet-stopwatch-fallback", stats[0].Engine);
         Assert.Equal(2, stats[0].Runs);
         Assert.True(stats[0].MeanMs >= 0);
+    }
+
+    [Fact]
+    public void HyperfineRunner_ParsesBothV1AndV2JsonSchemas()
+    {
+        const string v1Json = """
+            {
+              "results": [
+                {
+                  "command": "du -s .",
+                  "mean": 0.012,
+                  "stddev": 0.002,
+                  "median": 0.011,
+                  "user": 0.004,
+                  "system": 0.007,
+                  "min": 0.010,
+                  "max": 0.015,
+                  "times": [0.010, 0.012, 0.015]
+                }
+              ]
+            }
+            """;
+
+        IReadOnlyList<TimingStats> v1Stats = HyperfineRunner.ParseHyperfineJson(v1Json, defaultRuns: 3);
+        Assert.Single(v1Stats);
+        Assert.Equal(12.0, v1Stats[0].MeanMs, precision: 6);
+        Assert.Equal(2.0, v1Stats[0].StdDevMs!.Value, precision: 6);
+        Assert.Equal(4.0, v1Stats[0].UserCpuMs!.Value, precision: 6);
+        Assert.Equal(7.0, v1Stats[0].SystemCpuMs!.Value, precision: 6);
+        Assert.Equal(3, v1Stats[0].Runs);
+        Assert.Null(v1Stats[0].PeakRssKb);
+
+        const string v2Json = """
+            {
+              "schema_version": 2,
+              "results": [
+                {
+                  "command": "du -s .",
+                  "summary": {
+                    "time_wall_clock": { "count": 5, "mean": 0.005, "stddev": 0.0005, "median": 0.0049, "min": 0.0045, "max": 0.0056 },
+                    "time_user": { "mean": 0.001 },
+                    "time_system": { "mean": 0.004 },
+                    "memory_peak_resident": { "max": 2981888.0 }
+                  }
+                }
+              ]
+            }
+            """;
+
+        IReadOnlyList<TimingStats> v2Stats = HyperfineRunner.ParseHyperfineJson(v2Json, defaultRuns: 5);
+        Assert.Single(v2Stats);
+        Assert.Equal(5.0, v2Stats[0].MeanMs, precision: 6);
+        Assert.Equal(0.5, v2Stats[0].StdDevMs!.Value, precision: 6);
+        Assert.Equal(1.0, v2Stats[0].UserCpuMs!.Value, precision: 6);
+        Assert.Equal(4.0, v2Stats[0].SystemCpuMs!.Value, precision: 6);
+        Assert.Equal(5, v2Stats[0].Runs);
+        Assert.Equal(2912L, v2Stats[0].PeakRssKb);
     }
 
     [Fact]

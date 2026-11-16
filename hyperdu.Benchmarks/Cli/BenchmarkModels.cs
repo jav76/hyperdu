@@ -50,7 +50,8 @@ internal sealed record ScenarioDefinition(
     string? DuFlags,
     IReadOnlyList<CommandInvocation> Invocations,
     bool RequireStrictStdoutParity = false,
-    string? PendingNote = null
+    string? PendingNote = null,
+    bool MeasureEarlyExit = false
 );
 
 internal sealed record ProbeResult(
@@ -62,7 +63,8 @@ internal sealed record ProbeResult(
     string StdoutSample,
     string StderrSample,
     bool ParityMatched,
-    string ParityNote
+    string ParityNote,
+    double? EarlyExitHead100Ms = null
 );
 
 internal sealed record TimingStats(
@@ -74,7 +76,8 @@ internal sealed record TimingStats(
     double? UserCpuMs,
     double? SystemCpuMs,
     int Runs,
-    string Engine
+    string Engine,
+    long? PeakRssKb = null
 );
 
 internal sealed record BenchmarkEntryResult(

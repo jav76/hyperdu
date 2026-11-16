@@ -104,15 +104,15 @@ internal static class ReportWriter
                 sb.AppendLine();
             }
 
-            sb.AppendLine("| Tool | Mean ± StdDev (ms) | Median (ms) | Speedup vs Ref | User / Sys CPU (ms) | TTFL (ms) | Peak RSS (MiB) | Lines | Parity |");
-            sb.AppendLine("| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |");
+            sb.AppendLine("| Tool | Mean ± StdDev (ms) | Median (ms) | Speedup vs Ref | User / Sys CPU (ms) | TTFL (ms) | Head-100 Exit (ms) | Peak RSS (MiB) | Lines | Parity |");
+            sb.AppendLine("| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |");
 
             foreach (BenchmarkEntryResult entry in scenario.Entries)
             {
                 if (entry.IsPending)
                 {
                     string reason = entry.PendingReason ?? "Pending";
-                    sb.AppendLine($"| {entry.ToolName} | {reason} | - | - | - | - | - | - | {reason} |");
+                    sb.AppendLine($"| {entry.ToolName} | {reason} | - | - | - | - | - | - | - | {reason} |");
                     continue;
                 }
 
@@ -123,11 +123,12 @@ internal static class ReportWriter
                     ? $"{userMs.ToString("F2", CultureInfo.InvariantCulture)} / {sysMs.ToString("F2", CultureInfo.InvariantCulture)}"
                     : "-";
                 string ttfl = entry.Probe?.TtflMs is double t ? t.ToString("F2", CultureInfo.InvariantCulture) : "-";
+                string head100 = entry.Probe?.EarlyExitHead100Ms is double h ? h.ToString("F2", CultureInfo.InvariantCulture) : "-";
                 string rss = FormatRssMib(entry.Probe?.PeakRssKb);
                 string lines = entry.Probe != null ? entry.Probe.OutputLines.ToString("N0", CultureInfo.InvariantCulture) : "-";
                 string parity = FormatParity(entry.Probe);
 
-                sb.AppendLine($"| {entry.ToolName} | {meanStd} | {median} | {speedup} | {cpu} | {ttfl} | {rss} | {lines} | {parity} |");
+                sb.AppendLine($"| {entry.ToolName} | {meanStd} | {median} | {speedup} | {cpu} | {ttfl} | {head100} | {rss} | {lines} | {parity} |");
             }
 
             sb.AppendLine();

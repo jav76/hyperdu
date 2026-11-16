@@ -149,6 +149,11 @@ internal static class CliBenchmarkRunner
 
                 timingMap.TryGetValue(inv.Tool.Id, out TimingStats? timing);
                 probes.TryGetValue(inv.Tool.Id, out ProbeResult? probe);
+                if (probe != null && timing?.PeakRssKb is long hyperfineRssKb && hyperfineRssKb > 0)
+                {
+                    probe = probe with { PeakRssKb = hyperfineRssKb };
+                }
+
                 double? speedup = (refTiming != null && timing is { MeanMs: > 0 })
                     ? refTiming.MeanMs / timing.MeanMs
                     : null;
