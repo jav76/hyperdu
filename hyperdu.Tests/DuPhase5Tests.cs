@@ -9,7 +9,7 @@ namespace hyperdu.Tests;
 public sealed class DuPhase5Tests
 {
     [Fact]
-    public void DuCommand_BrokenPipeOnVersionAndTraversal_Returns141WithoutStderrNoise()
+    public void DuCommand_BrokenPipeOnVersion_Returns141WithoutStderrNoise()
     {
         using MemoryStream stdin = new();
         using MemoryStream stderr = new();
@@ -23,7 +23,13 @@ public sealed class DuPhase5Tests
             restoreSigpipe: false);
         Assert.Equal(141, versionRc);
         Assert.Empty(stderr.ToArray());
+    }
 
+    [UnixFact]
+    public void DuCommand_BrokenPipeDuringTraversal_Returns141WithoutStderrNoise()
+    {
+        using MemoryStream stdin = new();
+        using MemoryStream stderr = new();
         using TempTree tree = new();
         for (int i = 0; i < 16; i++)
             tree.File($"f_{i:D2}.dat", 256);
