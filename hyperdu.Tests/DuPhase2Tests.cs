@@ -133,7 +133,7 @@ public sealed partial class DuPhase2Tests
     }
 
     [Fact]
-    public void Threshold_ParsesFormatsUsesAsciiQuotesAndFiltersWithoutChangingSums()
+    public void Threshold_ParsesFormatsAndUsesAsciiQuotes()
     {
         Assert.True(BlockSize.TryParseThreshold("0", out ThresholdSpec t0, out _));
         Assert.Equal(new ThresholdSpec(false, 0), t0);
@@ -160,7 +160,11 @@ public sealed partial class DuPhase2Tests
             Assert.Equal(1, rcOver);
             Assert.Equal("du: --threshold argument '1Y' too large\n", errOver);
         });
+    }
 
+    [UnixFact]
+    public void Threshold_FiltersOutputWithoutChangingSums()
+    {
         using TempTree tree = new();
         string d = tree.Dir("d");
         tree.File("d/small.bin", 100);
