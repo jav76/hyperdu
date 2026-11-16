@@ -62,6 +62,8 @@ public static class Messages
         return string.Concat("'", value, "'");
     }
 
+    internal static string QuoteAscii(string value) => string.Concat("'", value, "'");
+
     internal static void WriteError(Stream stderr, string programName, string message)
     {
         WriteUtf8(stderr, $"{programName}: {message}\n");
@@ -79,11 +81,11 @@ public static class Messages
 
     internal static void WritePosixError(Stream stderr, string programName, string verb, ReadOnlySpan<byte> pathBytes, int errno)
     {
-        bool utf8 = IsUtf8Locale();
-        byte[] openQuote = utf8 ? Utf8QuoteOpen : CQuoteOpen;
-        byte[] closeQuote = utf8 ? Utf8QuoteClose : CQuoteClose;
+        // gnulib quotearg_colon always uses ASCII straight single quotes for path diagnostics.
+        byte[] openQuote = CQuoteOpen;
+        byte[] closeQuote = CQuoteClose;
         string prefix = $"{programName}: {verb} ";
-        string suffix = $": {NativeIo.DescribePosixError(errno)}\n";
+        string suffix = errno == 0 ? "\n" : $": {NativeIo.DescribePosixError(errno)}\n";
 
         int prefixLen = Encoding.UTF8.GetByteCount(prefix);
         int suffixLen = Encoding.UTF8.GetByteCount(suffix);

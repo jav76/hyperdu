@@ -9,8 +9,15 @@ public enum DuParseOutcome
     ExitFailure
 }
 
+public enum SymlinkPolicy
+{
+    NoDereference,
+    DereferenceArgs,
+    DereferenceAll
+}
+
 /// <summary>
-/// Full GNU du option table parser for Phase 1 flags, recognizing Phase 2/3 options
+/// Full GNU du option table parser for Phase 1 and Phase 2 flags, recognizing Phase 3 options
 /// with explicit not-yet-implemented errors.
 /// </summary>
 public sealed class DuOptions
@@ -63,6 +70,13 @@ public sealed class DuOptions
     public bool Summarize { get; private set; }
     public bool Total { get; private set; }
     public bool SeparateDirs { get; private set; }
+    public bool OneFileSystem { get; private set; }
+    public bool CountLinks { get; private set; }
+    public bool Inodes { get; private set; }
+    public SymlinkPolicy SymlinkPolicy { get; private set; } = SymlinkPolicy.NoDereference;
+    public ThresholdSpec? Threshold { get; private set; }
+    public string? Files0From { get; private set; }
+    public ExcludeMatcher Excludes { get; } = new();
     public ulong? MaxDepth { get; private set; }
     public BlockSizeSpec BlockSizeSpec { get; private set; }
     public IReadOnlyList<string> Operands { get; private set; } = [];
@@ -71,6 +85,16 @@ public sealed class DuOptions
         string[] args,
         string programName,
         string version,
+        Stream stdout,
+        Stream stderr,
+        out DuOptions? parsedOptions) =>
+        Parse(args, programName, version, Stream.Null, stdout, stderr, out parsedOptions);
+
+    public static DuParseOutcome Parse(
+        string[] args,
+        string programName,
+        string version,
+        Stream stdin,
         Stream stdout,
         Stream stderr,
         out DuOptions? parsedOptions)
@@ -185,19 +209,57 @@ public sealed class DuOptions
                     break;
 
                 case 'P':
-                    // Default policy in Phase 1 is never dereferencing symlinks.
+                    result.SymlinkPolicy = SymlinkPolicy.NoDereference;
                     break;
 
                 case 'D':
                 case 'H':
+                    result.SymlinkPolicy = SymlinkPolicy.DereferenceArgs;
+                    break;
+
                 case 'L':
+                    result.SymlinkPolicy = SymlinkPolicy.DereferenceAll;
+                    break;
+
                 case 'l':
-                case 't':
-                case 'X':
+                    result.CountLinks = true;
+                    break;
+
                 case 'x':
-                case OptExclude:
-                case OptFiles0From:
+                    result.OneFileSystem = true;
+                    break;
+
                 case OptInodes:
+                    result.Inodes = true;
+                    break;
+
+                case 't':
+                {
+                    string rawThreshold = opt.Argument ?? string.Empty;
+                    if (!BlockSize.TryParseThreshold(rawThreshold, out ThresholdSpec parsedThreshold, out BlockSizeParseStatus err))
+                    {
+                        string optLabel = opt.LongName != null ? $"--{opt.LongName}" : "-t";
+                        Messages.WriteError(stderr, programName, BlockSize.FormatErrorMessage(optLabel, rawThreshold, err));
+                        return DuParseOutcome.ExitFailure;
+                    }
+
+                    result.Threshold = parsedThreshold;
+                    break;
+                }
+
+                case OptExclude:
+                    result.Excludes.AddPattern(opt.Argument ?? string.Empty);
+                    break;
+
+                case 'X':
+                    if (!result.Excludes.TryAddFromFile(opt.Argument ?? string.Empty, stdin, programName, stderr))
+                        return DuParseOutcome.ExitFailure;
+                    break;
+
+                case OptFiles0From:
+                    result.Files0From = opt.Argument ?? string.Empty;
+                    break;
+
                 case OptTime:
                 case OptTimeStyle:
                 {
@@ -229,10 +291,25 @@ public sealed class DuOptions
             }
         }
 
-        result.BlockSizeSpec = hasExplicitBlockSize
+        if (result.Inodes && result.ApparentSize)
+            Messages.WriteWarning(stderr, programName, "options --apparent-size and -b are ineffective with --inodes");
+
+        if (result.Files0From != null && operands.Count > 0)
+        {
+            Messages.WriteError(stderr, programName, $"extra operand {Messages.Quote(operands[0])}");
+            Messages.WriteUtf8(stderr, "file operands cannot be combined with --files0-from\n");
+            Messages.WriteTryHelp(stderr, programName);
+            return DuParseOutcome.ExitFailure;
+        }
+
+        BlockSizeSpec resolvedBlockSize = hasExplicitBlockSize
             ? explicitBlockSize
             : BlockSize.ResolveDefault(humanOverride);
 
+        if (result.Inodes && resolvedBlockSize.Mode == HumanMode.None)
+            resolvedBlockSize = BlockSizeSpec.Bytes.WithGrouping(resolvedBlockSize.Grouping);
+
+        result.BlockSizeSpec = resolvedBlockSize;
         result.Operands = operands.Count > 0 ? operands : ["."];
         parsedOptions = result;
         return DuParseOutcome.Run;
@@ -254,6 +331,7 @@ public sealed class DuOptions
     public static string FormatHelp(string programName) =>
         $"""
         Usage: {programName} [OPTION]... [FILE]...
+          or:  {programName} [OPTION]... --files0-from=F
         Summarize device usage of the set of FILEs, recursively for directories.
 
         Mandatory arguments to long options are mandatory for short options too.
@@ -263,14 +341,25 @@ public sealed class DuOptions
           -B, --block-size=SIZE scale sizes by SIZE before printing them
           -b, --bytes           equivalent to '--apparent-size --block-size=1'
           -c, --total           produce a grand total
+          -D, --dereference-args  dereference only symlinks on the command line
           -d, --max-depth=N     print the total for a directory only if N or fewer levels deep
+              --files0-from=F   summarize device usage of NUL-terminated file names in F
+          -H                    equivalent to --dereference-args (-D)
           -h, --human-readable  print sizes in human readable format (e.g., 1K 234M 2G)
+              --inodes          list inode usage information instead of block usage
           -k                    like --block-size=1K
+          -L, --dereference     dereference all symbolic links
+          -l, --count-links     count sizes many times if hard linked
           -m                    like --block-size=1M
           -P, --no-dereference  don't follow any symbolic links (this is the default)
           -S, --separate-dirs   for directories do not include size of subdirectories
               --si              like -h, but use powers of 1000 not 1024
           -s, --summarize       display only a total for each argument
+          -t, --threshold=SIZE  exclude entries smaller than SIZE if positive,
+                                  or entries greater than SIZE if negative
+          -X, --exclude-from=FILE  exclude files that match any pattern in FILE
+              --exclude=PATTERN    exclude files that match PATTERN
+          -x, --one-file-system    skip directories on different file systems
               --help            display this help and exit
               --version         output version information and exit
 

@@ -8,6 +8,7 @@ COREUTILS_DIR=""
 CANDIDATE_DU=""
 HYPERDU_BIN=""
 BASELINE=0
+MIN_PASS_RATE=""
 TIMEOUT_SEC=5
 JSON_OUT=""
 MD_OUT=""
@@ -42,8 +43,12 @@ while [[ $# -gt 0 ]]; do
       BASELINE=1
       shift
       ;;
+    --min-pass-rate)
+      MIN_PASS_RATE="$2"
+      shift 2
+      ;;
     -h|--help)
-      echo "Usage: $0 [--candidate-du <path> | --hyperdu <path>] [--coreutils-dir <dir>] [--timeout <sec>] [--json <file>] [--markdown <file>] [--baseline]"
+      echo "Usage: $0 [--candidate-du <path> | --hyperdu <path>] [--coreutils-dir <dir>] [--timeout <sec>] [--json <file>] [--markdown <file>] [--baseline | --min-pass-rate <pct>]"
       exit 0
       ;;
     *)
@@ -131,6 +136,7 @@ for test_script in "$COREUTILS_DIR"/tests/du/*.sh; do
   (
     cd "$COREUTILS_DIR"
     exec 9>&2
+    LC_ALL=C \
     AWK=awk \
     CONFIG_HEADER="$COREUTILS_DIR/config.h" \
     abs_srcdir="$COREUTILS_DIR" \
@@ -161,24 +167,29 @@ for test_script in "$COREUTILS_DIR"/tests/du/*.sh; do
   RESULTS_LINES+=("$name|$status")
 done
 
+RUNNABLE=$((TOTAL - SKIPPED))
+PASS_RATE="$(python3 -c "import sys; p, r = int(sys.argv[1]), int(sys.argv[2]); print(f'{(100.0 * p / r) if r > 0 else 0.0:.1f}')" "$PASSED" "$RUNNABLE")"
+
 echo "GNU coreutils ($PINNED_COREUTILS_TAG) tests/du/*.sh results:"
-echo "  Passed: $PASSED / $TOTAL (Skipped: $SKIPPED, Failed: $FAILED, Timed out: $TIMED_OUT)"
+echo "  Passed: $PASSED / $TOTAL (Skipped: $SKIPPED, Failed: $FAILED, Timed out: $TIMED_OUT, Runnable pass rate: ${PASS_RATE}% [$PASSED/$RUNNABLE])"
 
 if [[ -n "$JSON_OUT" ]]; then
   mkdir -p "$(dirname "$JSON_OUT")"
-  python3 - "$JSON_OUT" "$PINNED_COREUTILS_TAG" "$CANDIDATE_DU" "$TOTAL" "$PASSED" "$SKIPPED" "$FAILED" "$TIMED_OUT" "${RESULTS_LINES[@]}" <<'PY'
+  python3 - "$JSON_OUT" "$PINNED_COREUTILS_TAG" "$CANDIDATE_DU" "$TOTAL" "$PASSED" "$SKIPPED" "$FAILED" "$TIMED_OUT" "$RUNNABLE" "$PASS_RATE" "${RESULTS_LINES[@]}" <<'PY'
 import json, sys
-out_path, tag, cand, total, passed, skipped, failed, timed_out = sys.argv[1:9]
-rows = [item.split("|", 1) for item in sys.argv[9:]]
+out_path, tag, cand, total, passed, skipped, failed, timed_out, runnable, pass_rate = sys.argv[1:11]
+rows = [item.split("|", 1) for item in sys.argv[11:]]
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump({
         "coreutils_tag": tag,
         "candidate_du": cand,
         "total": int(total),
+        "runnable": int(runnable),
         "passed": int(passed),
         "skipped": int(skipped),
         "failed": int(failed),
         "timed_out": int(timed_out),
+        "pass_rate_percent": float(pass_rate),
         "tests": [{"name": n, "status": s} for n, s in rows],
     }, f, indent=2)
 PY
@@ -191,6 +202,7 @@ if [[ -n "$MD_OUT" ]]; then
     echo ""
     echo "- **Candidate**: \`$CANDIDATE_DU\`"
     echo "- **Passed**: **$PASSED / $TOTAL** (Skipped: $SKIPPED, Failed: $FAILED, Timed out: $TIMED_OUT)"
+    echo "- **Runnable Pass Rate**: **${PASS_RATE}%** ($PASSED / $RUNNABLE non-skipped)"
     echo ""
     echo "| Test | Status |"
     echo "| :--- | :--- |"
@@ -202,7 +214,12 @@ if [[ -n "$MD_OUT" ]]; then
   } > "$MD_OUT"
 fi
 
-if [[ "$BASELINE" -eq 0 ]] && [[ "$FAILED" -gt 0 ]]; then
+if [[ -n "$MIN_PASS_RATE" ]]; then
+  if ! python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)" "$PASS_RATE" "$MIN_PASS_RATE"; then
+    echo "Fail: GNU suite runnable pass rate ${PASS_RATE}% is below required ${MIN_PASS_RATE}%." >&2
+    exit 1
+  fi
+elif [[ "$BASELINE" -eq 0 ]] && [[ "$FAILED" -gt 0 ]]; then
   exit 1
 fi
 exit 0

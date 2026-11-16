@@ -63,6 +63,9 @@ internal static unsafe partial class Libc
     internal static partial int openat(int dirFd, byte* path, int flags);
 
     [LibraryImport(Lib)]
+    internal static partial nint read(int fd, byte* buf, nuint count);
+
+    [LibraryImport(Lib)]
     internal static partial int close(int fd);
 
     [LibraryImport(Lib)]
