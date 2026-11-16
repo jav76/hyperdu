@@ -116,12 +116,15 @@ internal static class CliBenchmarkRunner
                     parityFailed = true;
             }
 
-            // Pass 2: Pure timing runs (hyperfine or Stopwatch fallback)
-            IReadOnlyList<TimingStats> timings = await HyperfineRunner.RunScenarioAsync(runnable, options, cancellationToken);
+            // Pass 2: Pure timing runs (hyperfine or Stopwatch fallback) for implemented invocations
+            List<CommandInvocation> timedInvocations = runnable
+                .Where(i => !probes[i.Tool.Id].ParityNote.StartsWith("pending", StringComparison.Ordinal))
+                .ToList();
+            IReadOnlyList<TimingStats> timings = await HyperfineRunner.RunScenarioAsync(timedInvocations, options, cancellationToken);
             Dictionary<string, TimingStats> timingMap = new();
-            for (int i = 0; i < runnable.Count && i < timings.Count; i++)
+            for (int i = 0; i < timedInvocations.Count && i < timings.Count; i++)
             {
-                timingMap[runnable[i].Tool.Id] = timings[i];
+                timingMap[timedInvocations[i].Tool.Id] = timings[i];
             }
 
             TimingStats? refTiming = runnable
@@ -133,22 +136,22 @@ internal static class CliBenchmarkRunner
             List<BenchmarkEntryResult> entries = new(scenario.Invocations.Count);
             foreach (CommandInvocation inv in scenario.Invocations)
             {
-                if (inv.Tool.IsPending)
+                probes.TryGetValue(inv.Tool.Id, out ProbeResult? probe);
+                if (inv.Tool.IsPending || (probe != null && probe.ParityNote.StartsWith("pending", StringComparison.Ordinal)))
                 {
                     entries.Add(new BenchmarkEntryResult(
                         ToolId: inv.Tool.Id,
                         ToolName: inv.Tool.DisplayName,
                         IsReferenceDu: false,
                         Timing: null,
-                        Probe: null,
+                        Probe: probe,
                         SpeedupVsReferenceDu: null,
                         IsPending: true,
-                        PendingReason: inv.Tool.PendingReason));
+                        PendingReason: inv.Tool.PendingReason ?? probe?.ParityNote));
                     continue;
                 }
 
                 timingMap.TryGetValue(inv.Tool.Id, out TimingStats? timing);
-                probes.TryGetValue(inv.Tool.Id, out ProbeResult? probe);
                 if (probe != null && timing?.PeakRssKb is long hyperfineRssKb && hyperfineRssKb > 0)
                 {
                     probe = probe with { PeakRssKb = hyperfineRssKb };

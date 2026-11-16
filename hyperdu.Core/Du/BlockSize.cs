@@ -1,0 +1,261 @@
+using System.Globalization;
+
+namespace hyperdu.Core.Du;
+
+internal enum HumanMode
+{
+    None,
+    Binary,
+    Si
+}
+
+/// <summary>
+/// Parsed block-size display specification from CLI options or environment variables.
+/// </summary>
+public readonly record struct BlockSizeSpec
+{
+    internal BlockSizeSpec(ulong scale, HumanMode mode, string? suffix, bool grouping)
+    {
+        Scale = scale;
+        Mode = mode;
+        Suffix = suffix;
+        Grouping = grouping;
+    }
+
+    public ulong Scale { get; }
+    internal HumanMode Mode { get; }
+    public string? Suffix { get; }
+    public bool Grouping { get; }
+
+    public static BlockSizeSpec Default1024 => new(1024, HumanMode.None, null, false);
+    public static BlockSizeSpec Default512 => new(512, HumanMode.None, null, false);
+    public static BlockSizeSpec Bytes => new(1, HumanMode.None, null, false);
+    public static BlockSizeSpec Megabytes => new(1048576, HumanMode.None, null, false);
+    public static BlockSizeSpec HumanBinary => new(1024, HumanMode.Binary, null, false);
+    public static BlockSizeSpec HumanSi => new(1000, HumanMode.Si, null, false);
+
+    internal BlockSizeSpec WithGrouping(bool grouping) => new(Scale, Mode, Suffix, grouping);
+}
+
+internal enum BlockSizeParseStatus
+{
+    Ok,
+    InvalidArgument,
+    InvalidSuffix,
+    Overflow
+}
+
+/// <summary>
+/// Parses GNU block-size arguments and environment variables (DU_BLOCK_SIZE, BLOCK_SIZE, BLOCKSIZE).
+/// </summary>
+public static class BlockSize
+{
+    private static readonly (char Letter, int Power)[] UnitPowers =
+    [
+        ('K', 1),
+        ('k', 1),
+        ('M', 2),
+        ('G', 3),
+        ('T', 4),
+        ('P', 5),
+        ('E', 6),
+        ('Z', 7),
+        ('Y', 8)
+    ];
+
+    internal static BlockSizeSpec ResolveDefault(bool? humanReadableOverride = null)
+    {
+        string?[] envVars =
+        [
+            Environment.GetEnvironmentVariable("DU_BLOCK_SIZE"),
+            Environment.GetEnvironmentVariable("BLOCK_SIZE"),
+            Environment.GetEnvironmentVariable("BLOCKSIZE")
+        ];
+
+        foreach (string? raw in envVars)
+        {
+            if (raw != null && TryParse(raw, out BlockSizeSpec parsed, out _) && parsed.Scale > 0)
+                return ApplyHumanOverride(parsed, humanReadableOverride);
+        }
+
+        ulong scale = Environment.GetEnvironmentVariable("POSIXLY_CORRECT") != null ? 512UL : 1024UL;
+        return ApplyHumanOverride(new BlockSizeSpec(scale, HumanMode.None, null, false), humanReadableOverride);
+    }
+
+    private static BlockSizeSpec ApplyHumanOverride(BlockSizeSpec spec, bool? humanReadableOverride)
+    {
+        if (humanReadableOverride == true)
+            return new BlockSizeSpec(1024, HumanMode.Binary, null, spec.Grouping);
+        if (humanReadableOverride == false)
+            return new BlockSizeSpec(1000, HumanMode.Si, null, spec.Grouping);
+        return spec;
+    }
+
+    internal static bool TryParse(string raw, out BlockSizeSpec spec, out BlockSizeParseStatus errorStatus)
+    {
+        spec = default;
+        if (string.IsNullOrEmpty(raw))
+        {
+            errorStatus = BlockSizeParseStatus.InvalidArgument;
+            return false;
+        }
+
+        bool grouping = false;
+        ReadOnlySpan<char> span = raw.AsSpan();
+        if (span[0] == '\'')
+        {
+            grouping = true;
+            span = span.Slice(1);
+            if (span.IsEmpty)
+            {
+                // Standalone "'" in BLOCK_SIZE enables grouping without changing scale when used via env; invalid on CLI -B.
+                spec = new BlockSizeSpec(0, HumanMode.None, null, true);
+                errorStatus = BlockSizeParseStatus.InvalidArgument;
+                return false;
+            }
+        }
+
+        if (span.Equals("human-readable", StringComparison.Ordinal) ||
+            span.Equals("human", StringComparison.Ordinal))
+        {
+            spec = new BlockSizeSpec(1024, HumanMode.Binary, null, grouping);
+            errorStatus = BlockSizeParseStatus.Ok;
+            return true;
+        }
+
+        if (span.Equals("si", StringComparison.Ordinal))
+        {
+            spec = new BlockSizeSpec(1000, HumanMode.Si, null, grouping);
+            errorStatus = BlockSizeParseStatus.Ok;
+            return true;
+        }
+
+        int digitEnd = 0;
+        while (digitEnd < span.Length && char.IsAsciiDigit(span[digitEnd]))
+            digitEnd++;
+
+        bool hasDigits = digitEnd > 0;
+        ulong multiplier = 1;
+        if (hasDigits)
+        {
+            if (!ulong.TryParse(span.Slice(0, digitEnd), NumberStyles.None, CultureInfo.InvariantCulture, out multiplier))
+            {
+                errorStatus = BlockSizeParseStatus.Overflow;
+                return false;
+            }
+
+            if (multiplier == 0)
+            {
+                errorStatus = BlockSizeParseStatus.InvalidArgument;
+                return false;
+            }
+        }
+
+        ReadOnlySpan<char> suffixSpan = span.Slice(digitEnd);
+        if (suffixSpan.IsEmpty)
+        {
+            spec = new BlockSizeSpec(multiplier, HumanMode.None, null, grouping);
+            errorStatus = BlockSizeParseStatus.Ok;
+            return true;
+        }
+
+        if (!TryParseSuffix(suffixSpan, hasDigits, out int power, out bool isSi, out string? normalizedSuffix))
+        {
+            errorStatus = hasDigits ? BlockSizeParseStatus.InvalidSuffix : BlockSizeParseStatus.InvalidArgument;
+            return false;
+        }
+
+        ulong unitBase = isSi ? 1000UL : 1024UL;
+        if (!TryComputeUnitMultiplier(multiplier, unitBase, power, out ulong totalScale))
+        {
+            errorStatus = BlockSizeParseStatus.Overflow;
+            return false;
+        }
+
+        // GNU du prints a unit suffix only when the user specified a bare unit (e.g. -BK, -BKiB, -BKB),
+        // never when a leading numeric multiplier is present (e.g. -B1K, -B1024).
+        spec = new BlockSizeSpec(totalScale, HumanMode.None, hasDigits ? null : normalizedSuffix, grouping);
+        errorStatus = BlockSizeParseStatus.Ok;
+        return true;
+    }
+
+    internal static string FormatErrorMessage(string optionName, string rawArg, BlockSizeParseStatus status)
+    {
+        string quoted = Messages.Quote(rawArg);
+        return status switch
+        {
+            BlockSizeParseStatus.InvalidSuffix => $"invalid suffix in {optionName} argument {quoted}",
+            BlockSizeParseStatus.Overflow => $"{optionName} argument {quoted} too large",
+            _ => $"invalid {optionName} argument {quoted}"
+        };
+    }
+
+    private static bool TryParseSuffix(
+        ReadOnlySpan<char> suffix,
+        bool hasDigits,
+        out int power,
+        out bool isSi,
+        out string? normalizedSuffix)
+    {
+        power = 0;
+        isSi = false;
+        normalizedSuffix = null;
+
+        char first = suffix[0];
+        foreach ((char letter, int p) in UnitPowers)
+        {
+            if (letter == first)
+            {
+                power = p;
+                break;
+            }
+        }
+
+        if (power == 0)
+            return false;
+
+        char canonicalUpper = char.ToUpperInvariant(first);
+
+        if (suffix.Length == 1)
+        {
+            isSi = false;
+            normalizedSuffix = canonicalUpper.ToString();
+            return true;
+        }
+
+        if (suffix.Length == 2 && suffix[1] == 'B')
+        {
+            isSi = true;
+            // GNU du prints lowercase "kB" for 1000^1 and uppercase "MB", "GB", ... for higher SI units.
+            normalizedSuffix = power == 1 ? "kB" : string.Concat(canonicalUpper.ToString(), "B");
+            return true;
+        }
+
+        if (suffix.Length == 3 && suffix[1] == 'i' && suffix[2] == 'B' && first != 'k')
+        {
+            isSi = false;
+            normalizedSuffix = string.Concat(canonicalUpper.ToString(), "iB");
+            return true;
+        }
+
+        _ = hasDigits;
+        return false;
+    }
+
+    private static bool TryComputeUnitMultiplier(ulong prefix, ulong unitBase, int power, out ulong result)
+    {
+        UInt128 factor = 1;
+        for (int i = 0; i < power; i++)
+            factor *= unitBase;
+
+        UInt128 product = (UInt128)prefix * factor;
+        if (product > ulong.MaxValue)
+        {
+            result = 0;
+            return false;
+        }
+
+        result = (ulong)product;
+        return true;
+    }
+}

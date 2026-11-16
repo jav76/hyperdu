@@ -14,11 +14,30 @@ internal enum NativeEntryKind : byte
 internal readonly struct NativeStat
 {
     public NativeStat(int mode, long size, long blocks, uint flags)
+        : this(mode, size, blocks, flags, device: 0, inode: 0, hardLinks: 0, mtimeSec: 0, mtimeNsec: 0)
+    {
+    }
+
+    public NativeStat(
+        int mode,
+        long size,
+        long blocks,
+        uint flags,
+        ulong device,
+        ulong inode,
+        uint hardLinks,
+        long mtimeSec,
+        uint mtimeNsec)
     {
         Mode = mode;
         Size = size;
         Blocks = blocks;
         Flags = flags;
+        Device = device;
+        Inode = inode;
+        HardLinks = hardLinks;
+        MtimeSec = mtimeSec;
+        MtimeNsec = mtimeNsec;
     }
 
     public int Mode { get; }
@@ -28,6 +47,11 @@ internal readonly struct NativeStat
     public long Blocks { get; }
 
     public uint Flags { get; }
+    public ulong Device { get; }
+    public ulong Inode { get; }
+    public uint HardLinks { get; }
+    public long MtimeSec { get; }
+    public uint MtimeNsec { get; }
 
     public NativeEntryKind Kind => (Mode & Libc.S_IFMT) switch
     {
@@ -87,8 +111,20 @@ internal static unsafe class NativeIo
     /// <summary>Opens a directory stream. Returns 0 on success, otherwise the errno.</summary>
     internal static int OpenDirectory(byte* path, out nint dir, out int fd)
     {
-        dir = 0;
         fd = Libc.open(path, OpenDirectoryFlags);
+        return WrapOpenDirectoryFd(fd, out dir);
+    }
+
+    /// <summary>Opens a directory stream relative to <paramref name="dirFd"/>. Returns 0 on success, otherwise the errno.</summary>
+    internal static int OpenDirectoryRelative(int dirFd, byte* name, out nint dir, out int fd)
+    {
+        fd = Libc.openat(dirFd, name, OpenDirectoryFlags);
+        return WrapOpenDirectoryFd(fd, out dir);
+    }
+
+    private static int WrapOpenDirectoryFd(int fd, out nint dir)
+    {
+        dir = 0;
         if (fd < 0) return Marshal.GetLastPInvokeError();
 
         dir = s_platform == Platform.MacOSInode64 ? Libc.fdopendir_inode64(fd) : Libc.fdopendir(fd);
@@ -96,12 +132,14 @@ internal static unsafe class NativeIo
 
         int error = Marshal.GetLastPInvokeError();
         _ = Libc.close(fd);
-        fd = -1;
         return error;
     }
 
-    internal static byte* ReadEntry(nint dir) =>
-        s_platform == Platform.MacOSInode64 ? Libc.readdir_inode64(dir) : Libc.readdir(dir);
+    internal static byte* ReadEntry(nint dir)
+    {
+        Marshal.SetLastPInvokeError(0);
+        return s_platform == Platform.MacOSInode64 ? Libc.readdir_inode64(dir) : Libc.readdir(dir);
+    }
 
     internal static NativeEntryKind KindFromDirentType(byte type) => type switch
     {
@@ -113,20 +151,38 @@ internal static unsafe class NativeIo
     };
 
     /// <summary>Stats <paramref name="path"/> relative to <paramref name="dirFd"/>. <paramref name="buffer"/> must hold <see cref="StatBufferSize"/> bytes.</summary>
-    internal static bool TryStatAt(int dirFd, byte* path, bool followSymlinks, byte* buffer, out NativeStat stat)
+    internal static bool TryStatAt(int dirFd, byte* path, bool followSymlinks, byte* buffer, out NativeStat stat) =>
+        TryStatAt(dirFd, path, followSymlinks, buffer, out stat, out _);
+
+    /// <summary>Stats <paramref name="path"/> relative to <paramref name="dirFd"/> and outputs errno on failure.</summary>
+    internal static bool TryStatAt(int dirFd, byte* path, bool followSymlinks, byte* buffer, out NativeStat stat, out int errno)
     {
         if (s_platform == Platform.Linux)
         {
             int flags = followSymlinks ? 0 : Libc.AT_SYMLINK_NOFOLLOW_LINUX;
-            uint mask = Libc.STATX_TYPE | Libc.STATX_MODE | Libc.STATX_SIZE | Libc.STATX_BLOCKS;
+            uint mask = Libc.STATX_TYPE | Libc.STATX_MODE | Libc.STATX_NLINK |
+                        Libc.STATX_INO | Libc.STATX_SIZE | Libc.STATX_BLOCKS | Libc.STATX_MTIME;
             if (Libc.statx(dirFd, path, flags, mask, buffer) != 0)
             {
+                errno = Marshal.GetLastPInvokeError();
                 stat = default;
                 return false;
             }
 
-            // struct statx: stx_mode u16 @28, stx_size u64 @40, stx_blocks u64 @48
-            stat = new NativeStat(*(ushort*)(buffer + 28), *(long*)(buffer + 40), *(long*)(buffer + 48), 0);
+            // struct statx: nlink u32 @16, mode u16 @28, ino u64 @32, size u64 @40,
+            // blocks u64 @48, mtime.tv_sec i64 @112, mtime.tv_nsec u32 @120, dev_major u32 @136, dev_minor u32 @140.
+            ulong device = ((ulong)*(uint*)(buffer + 136) << 32) | *(uint*)(buffer + 140);
+            stat = new NativeStat(
+                mode: *(ushort*)(buffer + 28),
+                size: *(long*)(buffer + 40),
+                blocks: *(long*)(buffer + 48),
+                flags: 0,
+                device: device,
+                inode: *(ulong*)(buffer + 32),
+                hardLinks: *(uint*)(buffer + 16),
+                mtimeSec: *(long*)(buffer + 112),
+                mtimeNsec: *(uint*)(buffer + 120));
+            errno = 0;
             return true;
         }
 
@@ -136,13 +192,40 @@ internal static unsafe class NativeIo
             : Libc.fstatat(dirFd, path, buffer, atFlags);
         if (result != 0)
         {
+            errno = Marshal.GetLastPInvokeError();
             stat = default;
             return false;
         }
 
-        // 64-bit inode struct stat: st_mode u16 @4, st_size i64 @96, st_blocks i64 @104, st_flags u32 @116
-        stat = new NativeStat(*(ushort*)(buffer + 4), *(long*)(buffer + 96), *(long*)(buffer + 104), *(uint*)(buffer + 116));
+        // 64-bit inode struct stat: dev u32 @0, mode u16 @4, nlink u16 @6, ino u64 @8,
+        // mtime.tv_sec i64 @48, mtime.tv_nsec i64 @56, size i64 @96, blocks i64 @104, flags u32 @116.
+        stat = new NativeStat(
+            mode: *(ushort*)(buffer + 4),
+            size: *(long*)(buffer + 96),
+            blocks: *(long*)(buffer + 104),
+            flags: *(uint*)(buffer + 116),
+            device: *(uint*)(buffer + 0),
+            inode: *(ulong*)(buffer + 8),
+            hardLinks: *(ushort*)(buffer + 6),
+            mtimeSec: *(long*)(buffer + 48),
+            mtimeNsec: (uint)*(long*)(buffer + 56));
+        errno = 0;
         return true;
+    }
+
+    /// <summary>Stats a null-terminated path relative to the current working directory.</summary>
+    internal static bool TryStatPath(ReadOnlySpan<byte> nullTerminatedPath, bool followSymlinks, Span<byte> buffer, out NativeStat stat, out int errno)
+    {
+        if (nullTerminatedPath.IsEmpty || nullTerminatedPath[^1] != 0)
+            throw new ArgumentException("Path must be null-terminated.", nameof(nullTerminatedPath));
+        if (buffer.Length < StatBufferSize)
+            throw new ArgumentException("Buffer is smaller than StatBufferSize.", nameof(buffer));
+
+        fixed (byte* p = nullTerminatedPath)
+        fixed (byte* b = buffer)
+        {
+            return TryStatAt(AtFdCwd, p, followSymlinks, b, out stat, out errno);
+        }
     }
 
     /// <summary>Maps an errno to the same messages the managed scanner reports.</summary>
@@ -152,6 +235,16 @@ internal static unsafe class NativeIo
         Libc.ENOENT or Libc.ENOTDIR => "Directory Not Found",
         _ => Marshal.GetPInvokeErrorMessage(errno)
     };
+
+    /// <summary>Returns the exact POSIX strerror message matching libc/GNU tools.</summary>
+    internal static string DescribePosixError(int errno) => Marshal.GetPInvokeErrorMessage(errno);
+
+    /// <summary>Restores default SIGPIPE termination so downstream pipe closes yield exit code 141 without .NET exceptions.</summary>
+    internal static void RestoreDefaultSigpipe()
+    {
+        if (s_platform != Platform.Unsupported)
+            _ = Libc.signal(Libc.SIGPIPE, 0);
+    }
 
     /// <summary>
     /// Binds every entry point once and checks the struct layouts against "/", so a platform

@@ -47,6 +47,30 @@ internal sealed unsafe class NativeDirectory : IDisposable
         return error == 0 ? new NativeDirectory(dir, fd) : null;
     }
 
+    /// <summary>Opens <paramref name="name"/> (null-terminated) relative to <paramref name="parentFd"/>.</summary>
+    public static NativeDirectory? OpenRelative(int parentFd, ReadOnlySpan<byte> name, out int error)
+    {
+        if (name.IsEmpty || name[^1] != 0)
+            throw new ArgumentException("Name must be null-terminated.", nameof(name));
+
+        nint dir;
+        int fd;
+        fixed (byte* p = name)
+        {
+            error = NativeIo.OpenDirectoryRelative(parentFd, p, out dir, out fd);
+        }
+
+        return error == 0 ? new NativeDirectory(dir, fd) : null;
+    }
+
+    /// <summary>Opens a child directory relative to the current directory stream.</summary>
+    public NativeDirectory? OpenCurrentDirectory(out int error)
+    {
+        int fd;
+        error = NativeIo.OpenDirectoryRelative(Fd, CurrentNamePointer, out nint dir, out fd);
+        return error == 0 ? new NativeDirectory(dir, fd) : null;
+    }
+
     /// <summary>Advances to the next entry, skipping "." and "..".</summary>
     public bool MoveNext()
     {
@@ -72,14 +96,18 @@ internal sealed unsafe class NativeDirectory : IDisposable
     }
 
     /// <summary>Stats the current entry. <paramref name="buffer"/> must hold at least <see cref="NativeIo.StatBufferSize"/> bytes.</summary>
-    public bool TryStatCurrent(bool followSymlinks, Span<byte> buffer, out NativeStat stat)
+    public bool TryStatCurrent(bool followSymlinks, Span<byte> buffer, out NativeStat stat) =>
+        TryStatCurrent(followSymlinks, buffer, out stat, out _);
+
+    /// <summary>Stats the current entry and outputs errno on failure.</summary>
+    public bool TryStatCurrent(bool followSymlinks, Span<byte> buffer, out NativeStat stat, out int errno)
     {
         if (buffer.Length < NativeIo.StatBufferSize)
             throw new ArgumentException("Buffer is smaller than NativeIo.StatBufferSize.", nameof(buffer));
 
         fixed (byte* p = buffer)
         {
-            return NativeIo.TryStatAt(Fd, CurrentNamePointer, followSymlinks, p, out stat);
+            return NativeIo.TryStatAt(Fd, CurrentNamePointer, followSymlinks, p, out stat, out errno);
         }
     }
 
