@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Runtime.InteropServices;
 using System.Text;
 using hyperdu.Core.Native;
 
@@ -7,13 +8,26 @@ namespace hyperdu.Core.Du;
 /// <summary>
 /// Sequential post-order directory walker providing exact GNU du Phase 1 accounting,
 /// raw byte path handling, trailing slash preservation, and hard-link deduplication.
+/// Uses reusable stack arenas and direct Linux getdents64 reads to minimize GC allocations.
 /// </summary>
-public sealed class SequentialWalker
+public sealed unsafe class SequentialWalker
 {
     private readonly record struct FileIdentity(ulong Device, ulong Inode);
-    private readonly record struct DirEntry(ulong Inode, int Order, byte[] NullTermName);
+    private readonly record struct DirEntry(ulong Inode, int Order, int NameOffset, int NameLength);
+
+    private sealed class DirEntryInodeComparer : IComparer<DirEntry>
+    {
+        public static readonly DirEntryInodeComparer Instance = new();
+
+        public int Compare(DirEntry x, DirEntry y)
+        {
+            int cmp = x.Inode.CompareTo(y.Inode);
+            return cmp != 0 ? cmp : x.Order.CompareTo(y.Order);
+        }
+    }
 
     private const int OutputBufferSize = 65536;
+    private const int DirentReadBufferSize = 65536;
     private const int InodeSortThreshold = 10000;
     private static readonly int OpenFdSafetyCap = OperatingSystem.IsMacOS() ? 200 : 850;
 
@@ -23,9 +37,17 @@ public sealed class SequentialWalker
     private readonly Stream _stderr;
     private readonly byte[] _statBuffer = new byte[NativeIo.StatBufferSize];
     private readonly byte[] _outBuffer = new byte[OutputBufferSize];
+    private readonly byte[] _direntBuffer = new byte[DirentReadBufferSize];
     private readonly HashSet<FileIdentity> _seen = [];
     private readonly ulong _maxDepth;
     private readonly byte _lineTerminator;
+
+    private byte[] _nameArena = new byte[65536];
+    private int _nameArenaPos;
+    private DirEntry[] _entryStack = new DirEntry[4096];
+    private int _entryStackPos;
+    private byte[] _pathStack = new byte[8192];
+    private int _pathLen;
 
     private int _outPos;
     private int _openDirCount;
@@ -46,10 +68,19 @@ public sealed class SequentialWalker
 
     public int Run()
     {
+        Span<byte> operandStackBuf = stackalloc byte[512];
         foreach (string operand in _options.Operands)
         {
-            byte[] rawBytes = Encoding.UTF8.GetBytes(operand);
-            ProcessOperand(rawBytes);
+            int maxBytes = Encoding.UTF8.GetMaxByteCount(operand.Length);
+            if (maxBytes <= operandStackBuf.Length)
+            {
+                int len = Encoding.UTF8.GetBytes(operand, operandStackBuf);
+                ProcessOperand(operandStackBuf[..len]);
+            }
+            else
+            {
+                ProcessOperand(Encoding.UTF8.GetBytes(operand));
+            }
         }
 
         if (_options.Total)
@@ -71,39 +102,55 @@ public sealed class SequentialWalker
         return _hasError ? 1 : 0;
     }
 
-    private void ProcessOperand(byte[] rawOperand)
+    private void ProcessOperand(ReadOnlySpan<byte> rawOperand)
     {
-        byte[] displayPath = NormalizeDisplayPath(rawOperand);
-        byte[] nullTermPath = NullTerminate(rawOperand);
+        SetNormalizedRootPath(rawOperand);
 
-        if (!NativeIo.TryStatPath(nullTermPath, followSymlinks: false, _statBuffer, out NativeStat stat, out int errno))
+        byte[]? rentedNullTerm = null;
+        Span<byte> nullTermSpan = rawOperand.Length + 1 <= 512
+            ? stackalloc byte[512]
+            : (rentedNullTerm = ArrayPool<byte>.Shared.Rent(rawOperand.Length + 1));
+
+        try
         {
-            FlushOutput();
-            Messages.WritePosixError(_stderr, _programName, "cannot access", displayPath, errno);
-            _hasError = true;
-            return;
+            rawOperand.CopyTo(nullTermSpan);
+            nullTermSpan[rawOperand.Length] = 0;
+            ReadOnlySpan<byte> nullTermPath = nullTermSpan[..(rawOperand.Length + 1)];
+
+            if (!NativeIo.TryStatPath(nullTermPath, followSymlinks: false, _statBuffer, out NativeStat stat, out int errno))
+            {
+                FlushOutput();
+                Messages.WritePosixError(_stderr, _programName, "cannot access", CurrentPathSpan, errno);
+                _hasError = true;
+                return;
+            }
+
+            if (!_seen.Add(new FileIdentity(stat.Device, stat.Inode)))
+                return;
+
+            if (stat.Kind != NativeEntryKind.Directory)
+            {
+                ulong bytes = ComputeEntryBytes(in stat);
+                _grandTotal += bytes;
+                EmitLine(bytes, CurrentPathSpan);
+                return;
+            }
+
+            OpenRootDirectory(nullTermPath, out int dirFd, out NativeDirectory? fallbackDir, out int openErrno);
+            (ulong _, ulong fullBytes) = WalkDirectory(dirFd, fallbackDir, openErrno, in stat, depth: 0);
+            _grandTotal += fullBytes;
         }
-
-        if (!_seen.Add(new FileIdentity(stat.Device, stat.Inode)))
-            return;
-
-        if (stat.Kind != NativeEntryKind.Directory)
+        finally
         {
-            ulong bytes = ComputeEntryBytes(in stat);
-            _grandTotal += bytes;
-            EmitLine(bytes, displayPath);
-            return;
+            if (rentedNullTerm != null)
+                ArrayPool<byte>.Shared.Return(rentedNullTerm);
         }
-
-        using NativeDirectory? rootDir = NativeDirectory.Open(nullTermPath, out int openErrno);
-        (ulong _, ulong fullBytes) = WalkDirectory(rootDir, openErrno, displayPath, in stat, depth: 0);
-        _grandTotal += fullBytes;
     }
 
     private (ulong ReportedToParent, ulong FullBytes) WalkDirectory(
-        NativeDirectory? dir,
+        int dirFd,
+        NativeDirectory? fallbackDir,
         int openErrno,
-        byte[] displayPath,
         in NativeStat dirStat,
         ulong depth)
     {
@@ -113,42 +160,44 @@ public sealed class SequentialWalker
         ulong subdirFullBytes = 0;
         ulong childDepth = depth + 1;
 
-        if (dir == null)
+        if (openErrno != 0)
         {
             FlushOutput();
-            Messages.WritePosixError(_stderr, _programName, "cannot read directory", displayPath, openErrno);
+            Messages.WritePosixError(_stderr, _programName, "cannot read directory", CurrentPathSpan, openErrno);
             _hasError = true;
             if (depth <= _maxDepth)
-                EmitLine(ownBytes, displayPath);
+                EmitLine(ownBytes, CurrentPathSpan);
             return (ownBytes, ownBytes);
         }
 
-        // Keep open FDs bounded so deeply nested trees cannot hit RLIMIT_NOFILE.
         _openDirCount++;
+        int savedArenaPos = _nameArenaPos;
+        int savedEntryPos = _entryStackPos;
         List<(byte[] ChildPath, NativeStat Stat)>? deferredSubdirs =
             _openDirCount >= OpenFdSafetyCap ? [] : null;
 
         try
         {
-            List<DirEntry> entries = ReadDirectoryEntries(dir, displayPath);
-            if (entries.Count > InodeSortThreshold && NativeIo.ShouldSortDirectoryByInode(dir.Fd))
-            {
-                entries.Sort(static (a, b) =>
-                {
-                    int cmp = a.Inode.CompareTo(b.Inode);
-                    return cmp != 0 ? cmp : a.Order.CompareTo(b.Order);
-                });
-            }
+            int entryStart = _entryStackPos;
+            if (fallbackDir == null)
+                ReadEntriesGetdents64(dirFd);
+            else
+                ReadEntriesFallback(fallbackDir);
+            int entryEnd = _entryStackPos;
+            int count = entryEnd - entryStart;
 
-            foreach (DirEntry entry in entries)
-            {
-                ReadOnlySpan<byte> entryName = entry.NullTermName.AsSpan(0, entry.NullTermName.Length - 1);
-                byte[] childPath = JoinPath(displayPath, entryName);
+            if (count > InodeSortThreshold && NativeIo.ShouldSortDirectoryByInode(dirFd))
+                Array.Sort(_entryStack, entryStart, count, DirEntryInodeComparer.Instance);
 
-                if (!dir.TryStatRelative(entry.NullTermName, followSymlinks: false, _statBuffer, out NativeStat childStat, out int statErrno))
+            for (int i = entryStart; i < entryEnd; i++)
+            {
+                DirEntry entry = _entryStack[i];
+                if (!TryStatArenaEntry(dirFd, entry.NameOffset, out NativeStat childStat, out int statErrno))
                 {
+                    int savedPath = PushPathSegment(entry.NameOffset, entry.NameLength);
                     FlushOutput();
-                    Messages.WritePosixError(_stderr, _programName, "cannot access", childPath, statErrno);
+                    Messages.WritePosixError(_stderr, _programName, "cannot access", CurrentPathSpan, statErrno);
+                    _pathLen = savedPath;
                     _hasError = true;
                     continue;
                 }
@@ -161,53 +210,85 @@ public sealed class SequentialWalker
 
                 if (childStat.Kind == NativeEntryKind.Directory)
                 {
+                    int savedPath = PushPathSegment(entry.NameOffset, entry.NameLength);
                     if (deferredSubdirs != null)
                     {
-                        deferredSubdirs.Add((childPath, childStat));
+                        deferredSubdirs.Add((CurrentPathSpan.ToArray(), childStat));
                     }
                     else
                     {
-                        using NativeDirectory? subDir = NativeDirectory.OpenRelative(dir.Fd, entry.NullTermName, out int subOpenErrno);
+                        OpenChildDirectory(dirFd, fallbackDir, entry.NameOffset, entry.NameLength, out int childFd, out NativeDirectory? childFallback, out int subOpenErrno);
                         (ulong subReported, ulong subFull) = WalkDirectory(
-                            subDir,
+                            childFd,
+                            childFallback,
                             subOpenErrno,
-                            childPath,
                             in childStat,
                             childDepth);
                         directSubdirReportedBytes += subReported;
                         subdirFullBytes += subFull;
                     }
+
+                    _pathLen = savedPath;
                 }
                 else
                 {
                     ulong entryBytes = ComputeEntryBytes(in childStat);
                     directNonDirBytes += entryBytes;
                     if (_options.All && childDepth <= _maxDepth)
-                        EmitLine(entryBytes, childPath);
+                    {
+                        int savedPath = PushPathSegment(entry.NameOffset, entry.NameLength);
+                        EmitLine(entryBytes, CurrentPathSpan);
+                        _pathLen = savedPath;
+                    }
                 }
             }
         }
         finally
         {
-            dir.Dispose();
+            if (fallbackDir != null)
+                fallbackDir.Dispose();
+            else if (dirFd >= 0)
+                _ = Libc.close(dirFd);
+
+            _entryStackPos = savedEntryPos;
+            _nameArenaPos = savedArenaPos;
             _openDirCount--;
         }
 
         if (deferredSubdirs != null)
         {
+            int savedPath = _pathLen;
+            Span<byte> deferredStackBuf = stackalloc byte[512];
             foreach ((byte[] childPath, NativeStat childStat) in deferredSubdirs)
             {
-                byte[] pathNullTerm = NullTerminate(childPath);
-                using NativeDirectory? subDir = NativeDirectory.Open(pathNullTerm, out int subOpenErrno);
-                (ulong subReported, ulong subFull) = WalkDirectory(
-                    subDir,
-                    subOpenErrno,
-                    childPath,
-                    in childStat,
-                    childDepth);
-                directSubdirReportedBytes += subReported;
-                subdirFullBytes += subFull;
+                SetExactPath(childPath);
+                byte[]? rentedNullTerm = null;
+                Span<byte> buf = childPath.Length + 1 <= deferredStackBuf.Length
+                    ? deferredStackBuf
+                    : (rentedNullTerm = ArrayPool<byte>.Shared.Rent(childPath.Length + 1));
+
+                try
+                {
+                    childPath.CopyTo(buf);
+                    buf[childPath.Length] = 0;
+                    OpenRootDirectory(buf[..(childPath.Length + 1)], out int subFd, out NativeDirectory? subFallback, out int subOpenErrno);
+                    (ulong subReported, ulong subFull) = WalkDirectory(
+                        subFd,
+                        subFallback,
+                        subOpenErrno,
+                        in childStat,
+                        childDepth);
+                    directSubdirReportedBytes += subReported;
+                    subdirFullBytes += subFull;
+                }
+                finally
+                {
+                    if (rentedNullTerm != null)
+                        ArrayPool<byte>.Shared.Return(rentedNullTerm);
+                }
             }
+
+            _pathLen = savedPath;
         }
 
         ulong ownAndFiles = ownBytes + directNonDirBytes;
@@ -215,28 +296,206 @@ public sealed class SequentialWalker
         ulong fullTotal = ownAndFiles + subdirFullBytes;
 
         if (depth <= _maxDepth)
-            EmitLine(reportedTotal, displayPath);
+            EmitLine(reportedTotal, CurrentPathSpan);
 
         return (_options.SeparateDirs ? 0UL : reportedTotal, fullTotal);
     }
 
-    private List<DirEntry> ReadDirectoryEntries(NativeDirectory dir, byte[] displayPath)
+    private void ReadEntriesGetdents64(int dirFd)
     {
-        List<DirEntry> entries = [];
+        int order = 0;
+        fixed (byte* pBuf = _direntBuffer)
+        {
+            while (true)
+            {
+                nint read = Libc.getdents64(dirFd, pBuf, (nuint)_direntBuffer.Length);
+                if (read == 0)
+                    return;
+
+                if (read < 0)
+                {
+                    FlushOutput();
+                    Messages.WritePosixError(_stderr, _programName, "cannot read directory", CurrentPathSpan, NativeIo.GetLastErrno());
+                    _hasError = true;
+                    return;
+                }
+
+                int offset = 0;
+                int limit = (int)read;
+                while (offset < limit)
+                {
+                    byte* rec = pBuf + offset;
+                    ushort reclen = *(ushort*)(rec + 16);
+                    offset += reclen;
+
+                    byte* namePtr = rec + 19;
+                    if (namePtr[0] == '.' && (namePtr[1] == 0 || (namePtr[1] == '.' && namePtr[2] == 0)))
+                        continue;
+
+                    ulong inode = *(ulong*)rec;
+                    ReadOnlySpan<byte> nameSpan = MemoryMarshal.CreateReadOnlySpanFromNullTerminated(namePtr);
+                    PushEntry(inode, order++, nameSpan);
+                }
+            }
+        }
+    }
+
+    private void ReadEntriesFallback(NativeDirectory dir)
+    {
         int order = 0;
         while (dir.MoveNext())
-        {
-            entries.Add(new DirEntry(dir.CurrentInode, order++, NullTerminate(dir.CurrentName)));
-        }
+            PushEntry(dir.CurrentInode, order++, dir.CurrentName);
 
         if (dir.Error != 0)
         {
             FlushOutput();
-            Messages.WritePosixError(_stderr, _programName, "cannot read directory", displayPath, dir.Error);
+            Messages.WritePosixError(_stderr, _programName, "cannot read directory", CurrentPathSpan, dir.Error);
             _hasError = true;
         }
+    }
 
-        return entries;
+    private void PushEntry(ulong inode, int order, ReadOnlySpan<byte> name)
+    {
+        int requiredArena = _nameArenaPos + name.Length + 1;
+        if (requiredArena > _nameArena.Length)
+            GrowByteArray(ref _nameArena, requiredArena);
+
+        int nameOffset = _nameArenaPos;
+        name.CopyTo(_nameArena.AsSpan(nameOffset));
+        _nameArena[nameOffset + name.Length] = 0;
+        _nameArenaPos = requiredArena;
+
+        if (_entryStackPos == _entryStack.Length)
+            Array.Resize(ref _entryStack, _entryStack.Length * 2);
+
+        _entryStack[_entryStackPos++] = new DirEntry(inode, order, nameOffset, name.Length);
+    }
+
+    private bool TryStatArenaEntry(int dirFd, int nameOffset, out NativeStat stat, out int errno)
+    {
+        fixed (byte* pName = &_nameArena[nameOffset])
+        fixed (byte* pStat = _statBuffer)
+        {
+            return NativeIo.TryStatAt(dirFd, pName, followSymlinks: false, pStat, out stat, out errno);
+        }
+    }
+
+    private void OpenRootDirectory(
+        ReadOnlySpan<byte> nullTermPath,
+        out int dirFd,
+        out NativeDirectory? fallbackDir,
+        out int errno)
+    {
+        if (NativeIo.UsesGetdents64)
+        {
+            fixed (byte* pPath = nullTermPath)
+            {
+                errno = NativeIo.OpenRawDirectoryFd(pPath, out dirFd);
+            }
+
+            fallbackDir = null;
+            return;
+        }
+
+        fallbackDir = NativeDirectory.Open(nullTermPath, out errno);
+        dirFd = fallbackDir?.Fd ?? -1;
+    }
+
+    private void OpenChildDirectory(
+        int parentFd,
+        NativeDirectory? parentFallback,
+        int nameOffset,
+        int nameLength,
+        out int childFd,
+        out NativeDirectory? childFallback,
+        out int errno)
+    {
+        if (parentFallback == null)
+        {
+            fixed (byte* pName = &_nameArena[nameOffset])
+            {
+                errno = NativeIo.OpenRawDirectoryFdRelative(parentFd, pName, out childFd);
+            }
+
+            childFallback = null;
+            return;
+        }
+
+        childFallback = NativeDirectory.OpenRelative(parentFd, _nameArena.AsSpan(nameOffset, nameLength + 1), out errno);
+        childFd = childFallback?.Fd ?? -1;
+    }
+
+    private ReadOnlySpan<byte> CurrentPathSpan => _pathStack.AsSpan(0, _pathLen);
+
+    private void SetExactPath(ReadOnlySpan<byte> path)
+    {
+        if (path.Length > _pathStack.Length)
+            GrowByteArray(ref _pathStack, path.Length);
+
+        path.CopyTo(_pathStack);
+        _pathLen = path.Length;
+    }
+
+    private void SetNormalizedRootPath(ReadOnlySpan<byte> raw)
+    {
+        if (raw.IsEmpty)
+        {
+            _pathLen = 0;
+            return;
+        }
+
+        bool hadTrailingSlash = raw[^1] == (byte)'/';
+        int end = raw.Length;
+        while (end > 0 && raw[end - 1] == (byte)'/')
+            end--;
+
+        if (end == 0)
+        {
+            _pathStack[0] = (byte)'/';
+            _pathLen = 1;
+            return;
+        }
+
+        int targetLen = hadTrailingSlash ? end + 1 : raw.Length;
+        if (targetLen > _pathStack.Length)
+            GrowByteArray(ref _pathStack, targetLen);
+
+        if (hadTrailingSlash)
+        {
+            raw[..end].CopyTo(_pathStack);
+            _pathStack[end] = (byte)'/';
+        }
+        else
+        {
+            raw.CopyTo(_pathStack);
+        }
+
+        _pathLen = targetLen;
+    }
+
+    private int PushPathSegment(int nameOffset, int nameLength)
+    {
+        int saved = _pathLen;
+        bool needsSlash = _pathLen > 0 && _pathStack[_pathLen - 1] != (byte)'/';
+        int newLen = _pathLen + (needsSlash ? 1 : 0) + nameLength;
+        if (newLen > _pathStack.Length)
+            GrowByteArray(ref _pathStack, newLen);
+
+        int pos = _pathLen;
+        if (needsSlash)
+            _pathStack[pos++] = (byte)'/';
+
+        _nameArena.AsSpan(nameOffset, nameLength).CopyTo(_pathStack.AsSpan(pos));
+        _pathLen = newLen;
+        return saved;
+    }
+
+    private static void GrowByteArray(ref byte[] buffer, int minLength)
+    {
+        int newSize = buffer.Length * 2;
+        if (newSize < minLength)
+            newSize = minLength;
+        Array.Resize(ref buffer, newSize);
     }
 
     private ulong ComputeEntryBytes(in NativeStat stat)
@@ -249,17 +508,18 @@ public sealed class SequentialWalker
 
     private void EmitLine(ulong bytes, ReadOnlySpan<byte> pathBytes)
     {
-        string formatted = HumanFormat.Format(bytes, _options.BlockSizeSpec);
-        int sizeLen = Encoding.ASCII.GetByteCount(formatted);
-        int totalLen = sizeLen + 1 + pathBytes.Length + 1;
+        Span<byte> sizeBuf = stackalloc byte[64];
+        if (!HumanFormat.TryFormatBytes(bytes, _options.BlockSizeSpec, sizeBuf, out int sizeLen))
+            return;
 
+        int totalLen = sizeLen + 1 + pathBytes.Length + 1;
         if (totalLen > _outBuffer.Length)
         {
             FlushOutput();
             byte[] rented = ArrayPool<byte>.Shared.Rent(totalLen);
             try
             {
-                int pos = WriteFormattedLine(rented, formatted, pathBytes);
+                int pos = WriteFormattedLine(rented, sizeBuf[..sizeLen], pathBytes);
                 _stdout.Write(rented, 0, pos);
             }
             finally
@@ -273,14 +533,15 @@ public sealed class SequentialWalker
         if (_outPos + totalLen > _outBuffer.Length)
             FlushOutput();
 
-        _outPos += WriteFormattedLine(_outBuffer.AsSpan(_outPos), formatted, pathBytes);
+        _outPos += WriteFormattedLine(_outBuffer.AsSpan(_outPos), sizeBuf[..sizeLen], pathBytes);
     }
 
-    private int WriteFormattedLine(Span<byte> dest, string formattedSize, ReadOnlySpan<byte> pathBytes)
+    private int WriteFormattedLine(Span<byte> dest, ReadOnlySpan<byte> sizeBytes, ReadOnlySpan<byte> pathBytes)
     {
-        int pos = Encoding.ASCII.GetBytes(formattedSize, dest);
+        sizeBytes.CopyTo(dest);
+        int pos = sizeBytes.Length;
         dest[pos++] = (byte)'\t';
-        pathBytes.CopyTo(dest.Slice(pos));
+        pathBytes.CopyTo(dest[pos..]);
         pos += pathBytes.Length;
         dest[pos++] = _lineTerminator;
         return pos;
@@ -314,31 +575,8 @@ public sealed class SequentialWalker
             return raw.ToArray();
 
         byte[] normalized = new byte[end + 1];
-        raw.Slice(0, end).CopyTo(normalized);
+        raw[..end].CopyTo(normalized);
         normalized[end] = (byte)'/';
         return normalized;
-    }
-
-    private static byte[] JoinPath(ReadOnlySpan<byte> parent, ReadOnlySpan<byte> child)
-    {
-        if (parent.IsEmpty)
-            return child.ToArray();
-
-        bool needsSlash = parent[^1] != (byte)'/';
-        byte[] joined = new byte[parent.Length + (needsSlash ? 1 : 0) + child.Length];
-        parent.CopyTo(joined);
-        int offset = parent.Length;
-        if (needsSlash)
-            joined[offset++] = (byte)'/';
-        child.CopyTo(joined.AsSpan(offset));
-        return joined;
-    }
-
-    private static byte[] NullTerminate(ReadOnlySpan<byte> bytes)
-    {
-        byte[] buffer = new byte[bytes.Length + 1];
-        bytes.CopyTo(buffer);
-        buffer[bytes.Length] = 0;
-        return buffer;
     }
 }

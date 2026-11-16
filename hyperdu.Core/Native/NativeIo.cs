@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace hyperdu.Core.Native;
@@ -81,11 +82,37 @@ internal static unsafe class NativeIo
     }
 
     private static readonly Platform s_platform = DetectPlatform();
+    private static readonly Lazy<bool> s_usesGetdents64 = new(ProbeGetdents64);
     private static readonly Lazy<bool> s_supported = new(Probe);
 
     public static bool IsSupported => s_supported.Value;
 
     public static bool IsMacOS => s_platform is Platform.MacOS or Platform.MacOSInode64;
+
+    internal static bool UsesGetdents64 => s_usesGetdents64.Value;
+
+    internal static int GetLastErrno() =>
+        OperatingSystem.IsMacOS() ? GetMacOSErrno() : GetLinuxErrno();
+
+    internal static void ClearErrno()
+    {
+        if (OperatingSystem.IsMacOS())
+            ClearMacOSErrno();
+        else
+            ClearLinuxErrno();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int GetLinuxErrno() => *Libc.errno_location_linux();
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int GetMacOSErrno() => *Libc.errno_location_macos();
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ClearLinuxErrno() => *Libc.errno_location_linux() = 0;
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ClearMacOSErrno() => *Libc.errno_location_macos() = 0;
 
     // Linux dirent: d_ino u64, d_off i64, d_reclen u16, d_type u8, d_name.
     // macOS dirent (64-bit inode): d_ino u64, d_seekoff u64, d_reclen u16, d_namlen u16, d_type u8, d_name.
@@ -108,36 +135,51 @@ internal static unsafe class NativeIo
         return Platform.Unsupported;
     }
 
-    /// <summary>Opens a directory stream. Returns 0 on success, otherwise the errno.</summary>
+    /// <summary>Opens a directory file descriptor on Linux when getdents64 is active, or a DIR* stream otherwise.</summary>
     internal static int OpenDirectory(byte* path, out nint dir, out int fd)
     {
         fd = Libc.open(path, OpenDirectoryFlags);
         return WrapOpenDirectoryFd(fd, out dir);
     }
 
-    /// <summary>Opens a directory stream relative to <paramref name="dirFd"/>. Returns 0 on success, otherwise the errno.</summary>
+    /// <summary>Opens a directory relative to <paramref name="dirFd"/>. Returns 0 on success, otherwise the errno.</summary>
     internal static int OpenDirectoryRelative(int dirFd, byte* name, out nint dir, out int fd)
     {
         fd = Libc.openat(dirFd, name, OpenDirectoryFlags);
         return WrapOpenDirectoryFd(fd, out dir);
     }
 
+    internal static int OpenRawDirectoryFd(byte* path, out int fd)
+    {
+        fd = Libc.open(path, OpenDirectoryFlags);
+        return fd >= 0 ? 0 : GetLastErrno();
+    }
+
+    internal static int OpenRawDirectoryFdRelative(int dirFd, byte* name, out int fd)
+    {
+        fd = Libc.openat(dirFd, name, OpenDirectoryFlags);
+        return fd >= 0 ? 0 : GetLastErrno();
+    }
+
     private static int WrapOpenDirectoryFd(int fd, out nint dir)
     {
         dir = 0;
-        if (fd < 0) return Marshal.GetLastPInvokeError();
+        if (fd < 0) return GetLastErrno();
+
+        if (UsesGetdents64)
+            return 0;
 
         dir = s_platform == Platform.MacOSInode64 ? Libc.fdopendir_inode64(fd) : Libc.fdopendir(fd);
         if (dir != 0) return 0;
 
-        int error = Marshal.GetLastPInvokeError();
+        int error = GetLastErrno();
         _ = Libc.close(fd);
         return error;
     }
 
     internal static byte* ReadEntry(nint dir)
     {
-        Marshal.SetLastPInvokeError(0);
+        ClearErrno();
         return s_platform == Platform.MacOSInode64 ? Libc.readdir_inode64(dir) : Libc.readdir(dir);
     }
 
@@ -164,7 +206,7 @@ internal static unsafe class NativeIo
                         Libc.STATX_INO | Libc.STATX_SIZE | Libc.STATX_BLOCKS | Libc.STATX_MTIME;
             if (Libc.statx(dirFd, path, flags, mask, buffer) != 0)
             {
-                errno = Marshal.GetLastPInvokeError();
+                errno = GetLastErrno();
                 stat = default;
                 return false;
             }
@@ -192,7 +234,7 @@ internal static unsafe class NativeIo
             : Libc.fstatat(dirFd, path, buffer, atFlags);
         if (result != 0)
         {
-            errno = Marshal.GetLastPInvokeError();
+            errno = GetLastErrno();
             stat = default;
             return false;
         }
@@ -262,6 +304,47 @@ internal static unsafe class NativeIo
 
         ulong fsType = *(ulong*)buf;
         return fsType is not (Libc.TMPFS_MAGIC or Libc.RAMFS_MAGIC or Libc.NFS_SUPER_MAGIC);
+    }
+
+    private static bool ProbeGetdents64()
+    {
+        if (s_platform != Platform.Linux)
+            return false;
+
+        int fd = -1;
+        try
+        {
+            ReadOnlySpan<byte> root = "/\0"u8;
+            fixed (byte* pRoot = root)
+            {
+                fd = Libc.open(pRoot, OpenDirectoryFlags);
+            }
+
+            if (fd < 0)
+                return false;
+
+            byte* buf = stackalloc byte[512];
+            nint bytesRead = Libc.getdents64(fd, buf, 512);
+            if (bytesRead <= 0)
+                return false;
+
+            ushort reclen = *(ushort*)(buf + 16);
+            int nameLen = MemoryMarshal.CreateReadOnlySpanFromNullTerminated(buf + 19).Length;
+            return nameLen > 0 && reclen >= 19 + nameLen + 1 && reclen <= bytesRead;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+        catch (DllNotFoundException)
+        {
+            return false;
+        }
+        finally
+        {
+            if (fd >= 0)
+                _ = Libc.close(fd);
+        }
     }
 
     /// <summary>

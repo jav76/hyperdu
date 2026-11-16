@@ -312,6 +312,25 @@ public sealed partial class DuPhase1Tests
         }
     }
 
+    [UnixFact]
+    public void SequentialWalker_GrowsEntryStackAndArenaPastInitialCapacity()
+    {
+        using TempTree tree = new();
+        string wide = tree.Dir("wide");
+        for (int i = 0; i < 4200; i++)
+            File.WriteAllBytes(Path.Combine(wide, $"entry_item_{i:D4}_payload_padding.dat"), [1, 2, 3]);
+
+        WithEnv(new() { ["LC_ALL"] = "C", ["POSIXLY_CORRECT"] = null }, () =>
+        {
+            (int rc, string stdout, string stderr) = RunWalker(["-b", "-a", wide]);
+            Assert.Equal(0, rc);
+            Assert.Empty(stderr);
+            string[] lines = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            Assert.Equal(4201, lines.Length);
+            Assert.Equal($"12600\t{wide}", lines[^1]);
+        });
+    }
+
     private static (int ExitCode, string Stdout, string Stderr) RunWalker(string[] args)
     {
         using MemoryStream stdout = new();

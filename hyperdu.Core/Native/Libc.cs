@@ -56,16 +56,19 @@ internal static unsafe partial class Libc
     internal const ulong NFS_SUPER_MAGIC = 0x6969;
 
     // open(2) and openat(2) are variadic; declaring only the fixed arguments is ABI-safe because O_CREAT is never passed.
-    [LibraryImport(Lib, SetLastError = true)]
+    [LibraryImport(Lib)]
     internal static partial int open(byte* path, int flags);
 
-    [LibraryImport(Lib, SetLastError = true)]
+    [LibraryImport(Lib)]
     internal static partial int openat(int dirFd, byte* path, int flags);
 
     [LibraryImport(Lib)]
     internal static partial int close(int fd);
 
-    [LibraryImport(Lib, SetLastError = true)]
+    [LibraryImport(Lib)]
+    internal static partial nint getdents64(int fd, byte* dirp, nuint count);
+
+    [LibraryImport(Lib)]
     internal static partial int fstatfs(int fd, byte* buf);
 
     [LibraryImport(Lib)]
@@ -74,25 +77,33 @@ internal static unsafe partial class Libc
     [LibraryImport(Lib)]
     internal static partial int closedir(nint dir);
 
-    [LibraryImport(Lib, SetLastError = true)]
+    [LibraryImport(Lib)]
     internal static partial nint fdopendir(int fd);
 
-    [LibraryImport(Lib, SetLastError = true)]
+    [LibraryImport(Lib)]
     internal static partial byte* readdir(nint dir);
 
-    [LibraryImport(Lib, SetLastError = true)]
+    [LibraryImport(Lib)]
     internal static partial int statx(int dirFd, byte* path, int flags, uint mask, byte* statxBuffer);
 
-    [LibraryImport(Lib, SetLastError = true)]
+    [LibraryImport(Lib)]
     internal static partial int fstatat(int dirFd, byte* path, byte* statBuffer, int flags);
 
+    [LibraryImport(Lib, EntryPoint = "__errno_location")]
+    [SuppressGCTransition]
+    internal static partial int* errno_location_linux();
+
+    [LibraryImport(Lib, EntryPoint = "__error")]
+    [SuppressGCTransition]
+    internal static partial int* errno_location_macos();
+
     // On Intel macOS the plain symbols use the legacy 32-bit inode layout; these are the 64-bit inode variants.
-    [LibraryImport(Lib, EntryPoint = "fdopendir$INODE64", SetLastError = true)]
+    [LibraryImport(Lib, EntryPoint = "fdopendir$INODE64")]
     internal static partial nint fdopendir_inode64(int fd);
 
-    [LibraryImport(Lib, EntryPoint = "readdir$INODE64", SetLastError = true)]
+    [LibraryImport(Lib, EntryPoint = "readdir$INODE64")]
     internal static partial byte* readdir_inode64(nint dir);
 
-    [LibraryImport(Lib, EntryPoint = "fstatat$INODE64", SetLastError = true)]
+    [LibraryImport(Lib, EntryPoint = "fstatat$INODE64")]
     internal static partial int fstatat_inode64(int dirFd, byte* path, byte* statBuffer, int flags);
 }

@@ -13,16 +13,31 @@ public static class HumanFormat
 
     public static string Format(ulong bytes, BlockSizeSpec spec)
     {
+        Span<byte> buffer = stackalloc byte[128];
+        if (!TryFormatBytes(bytes, spec, buffer, out int written))
+            return string.Empty;
+
+        return Encoding.ASCII.GetString(buffer[..written]);
+    }
+
+    internal static bool TryFormatBytes(ulong bytes, BlockSizeSpec spec, Span<byte> destination, out int bytesWritten)
+    {
         bool group = spec.Grouping && Messages.ShouldGroupThousands();
         return spec.Mode switch
         {
-            HumanMode.Binary => FormatHuman(bytes, 1024, BinarySuffixes, group),
-            HumanMode.Si => FormatHuman(bytes, 1000, SiSuffixes, group),
-            _ => FormatFixedScale(bytes, spec.Scale, spec.Suffix, group)
+            HumanMode.Binary => TryFormatHuman(bytes, 1024, BinarySuffixes, group, destination, out bytesWritten),
+            HumanMode.Si => TryFormatHuman(bytes, 1000, SiSuffixes, group, destination, out bytesWritten),
+            _ => TryFormatFixedScale(bytes, spec.Scale, spec.Suffix, group, destination, out bytesWritten)
         };
     }
 
-    private static string FormatFixedScale(ulong bytes, ulong scale, string? suffix, bool group)
+    private static bool TryFormatFixedScale(
+        ulong bytes,
+        ulong scale,
+        string? suffix,
+        bool group,
+        Span<byte> destination,
+        out int bytesWritten)
     {
         ulong blocks;
         if (bytes == 0 || scale <= 1)
@@ -34,14 +49,38 @@ public static class HumanFormat
             blocks = (ulong)(((UInt128)bytes + scale - 1) / scale);
         }
 
-        string formatted = FormatUnsignedInteger(blocks, group);
-        return string.IsNullOrEmpty(suffix) ? formatted : string.Concat(formatted, suffix);
+        if (!TryFormatUInt64(blocks, group, destination, out int pos))
+        {
+            bytesWritten = 0;
+            return false;
+        }
+
+        if (!string.IsNullOrEmpty(suffix))
+        {
+            if (pos + suffix.Length > destination.Length)
+            {
+                bytesWritten = 0;
+                return false;
+            }
+
+            Encoding.ASCII.GetBytes(suffix, destination[pos..]);
+            pos += suffix.Length;
+        }
+
+        bytesWritten = pos;
+        return true;
     }
 
-    private static string FormatHuman(ulong bytes, uint unitBase, string[] suffixes, bool group)
+    private static bool TryFormatHuman(
+        ulong bytes,
+        uint unitBase,
+        string[] suffixes,
+        bool group,
+        Span<byte> destination,
+        out int bytesWritten)
     {
         if (bytes < unitBase)
-            return FormatUnsignedInteger(bytes, group);
+            return TryFormatUInt64(bytes, group, destination, out bytesWritten);
 
         UInt128 value = bytes;
         UInt128 divisor = unitBase;
@@ -55,11 +94,7 @@ public static class HumanFormat
 
         UInt128 tenths = (value * 10 + divisor - 1) / divisor;
         if (tenths < 100)
-        {
-            ulong integerPart = (ulong)(tenths / 10);
-            ulong decimalPart = (ulong)(tenths % 10);
-            return string.Create(CultureInfo.InvariantCulture, $"{integerPart}.{decimalPart}{suffixes[unitIndex]}");
-        }
+            return TryWriteTenths(tenths, suffixes[unitIndex], destination, out bytesWritten);
 
         UInt128 whole = (value + divisor - 1) / divisor;
         if (whole >= unitBase && unitIndex + 1 < suffixes.Length)
@@ -67,45 +102,126 @@ public static class HumanFormat
             unitIndex++;
             divisor *= unitBase;
             tenths = (value * 10 + divisor - 1) / divisor;
-            ulong integerPart = (ulong)(tenths / 10);
-            ulong decimalPart = (ulong)(tenths % 10);
-            return string.Create(CultureInfo.InvariantCulture, $"{integerPart}.{decimalPart}{suffixes[unitIndex]}");
+            return TryWriteTenths(tenths, suffixes[unitIndex], destination, out bytesWritten);
         }
 
-        string wholeText = FormatUInt128(whole, group);
-        return string.Concat(wholeText, suffixes[unitIndex]);
+        if (!TryFormatUInt128(whole, group, destination, out int pos))
+        {
+            bytesWritten = 0;
+            return false;
+        }
+
+        string suffix = suffixes[unitIndex];
+        if (!string.IsNullOrEmpty(suffix))
+        {
+            if (pos + suffix.Length > destination.Length)
+            {
+                bytesWritten = 0;
+                return false;
+            }
+
+            Encoding.ASCII.GetBytes(suffix, destination[pos..]);
+            pos += suffix.Length;
+        }
+
+        bytesWritten = pos;
+        return true;
     }
 
-    private static string FormatUnsignedInteger(ulong value, bool group)
+    private static bool TryWriteTenths(UInt128 tenths, string suffix, Span<byte> destination, out int bytesWritten)
     {
-        string digits = value.ToString(CultureInfo.InvariantCulture);
-        return group ? InsertThousandsCommas(digits) : digits;
+        ulong integerPart = (ulong)(tenths / 10);
+        ulong decimalPart = (ulong)(tenths % 10);
+
+        if (!integerPart.TryFormat(destination, out int pos, provider: CultureInfo.InvariantCulture))
+        {
+            bytesWritten = 0;
+            return false;
+        }
+
+        if (pos + 2 + suffix.Length > destination.Length)
+        {
+            bytesWritten = 0;
+            return false;
+        }
+
+        destination[pos++] = (byte)'.';
+        destination[pos++] = (byte)('0' + (int)decimalPart);
+        Encoding.ASCII.GetBytes(suffix, destination[pos..]);
+        pos += suffix.Length;
+        bytesWritten = pos;
+        return true;
     }
 
-    private static string FormatUInt128(UInt128 value, bool group)
+    private static bool TryFormatUInt64(ulong value, bool group, Span<byte> destination, out int bytesWritten)
     {
-        string digits = value.ToString(CultureInfo.InvariantCulture);
-        return group ? InsertThousandsCommas(digits) : digits;
+        if (!group)
+            return value.TryFormat(destination, out bytesWritten, provider: CultureInfo.InvariantCulture);
+
+        Span<byte> raw = stackalloc byte[32];
+        if (!value.TryFormat(raw, out int digitLen, provider: CultureInfo.InvariantCulture))
+        {
+            bytesWritten = 0;
+            return false;
+        }
+
+        return TryInsertThousandsCommas(raw[..digitLen], destination, out bytesWritten);
     }
 
-    private static string InsertThousandsCommas(string digits)
+    private static bool TryFormatUInt128(UInt128 value, bool group, Span<byte> destination, out int bytesWritten)
+    {
+        if (!group)
+            return value.TryFormat(destination, out bytesWritten, provider: CultureInfo.InvariantCulture);
+
+        Span<byte> raw = stackalloc byte[64];
+        if (!value.TryFormat(raw, out int digitLen, provider: CultureInfo.InvariantCulture))
+        {
+            bytesWritten = 0;
+            return false;
+        }
+
+        return TryInsertThousandsCommas(raw[..digitLen], destination, out bytesWritten);
+    }
+
+    private static bool TryInsertThousandsCommas(ReadOnlySpan<byte> digits, Span<byte> destination, out int bytesWritten)
     {
         if (digits.Length <= 3)
-            return digits;
+        {
+            if (digits.Length > destination.Length)
+            {
+                bytesWritten = 0;
+                return false;
+            }
+
+            digits.CopyTo(destination);
+            bytesWritten = digits.Length;
+            return true;
+        }
 
         int commaCount = (digits.Length - 1) / 3;
-        StringBuilder sb = new(digits.Length + commaCount);
+        int total = digits.Length + commaCount;
+        if (total > destination.Length)
+        {
+            bytesWritten = 0;
+            return false;
+        }
+
         int firstGroupLen = digits.Length % 3;
         if (firstGroupLen == 0)
             firstGroupLen = 3;
 
-        sb.Append(digits, 0, firstGroupLen);
+        int dstPos = 0;
+        digits[..firstGroupLen].CopyTo(destination);
+        dstPos += firstGroupLen;
+
         for (int i = firstGroupLen; i < digits.Length; i += 3)
         {
-            sb.Append(',');
-            sb.Append(digits, i, 3);
+            destination[dstPos++] = (byte)',';
+            digits.Slice(i, 3).CopyTo(destination[dstPos..]);
+            dstPos += 3;
         }
 
-        return sb.ToString();
+        bytesWritten = dstPos;
+        return true;
     }
 }
