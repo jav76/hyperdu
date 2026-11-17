@@ -88,13 +88,17 @@ internal readonly struct NativeStat
         _ => NativeEntryKind.Other
     };
 
-    public bool HasNoDumpFlag => (Flags & Libc.UF_NODUMP) != 0;
-    public bool HasHiddenFlag => (Flags & Libc.UF_HIDDEN) != 0;
+    public bool HasNoDumpFlag => !OperatingSystem.IsWindows() && (Flags & Libc.UF_NODUMP) != 0;
+    public bool HasHiddenFlag => OperatingSystem.IsWindows()
+        ? (Flags & (Win32.FILE_ATTRIBUTE_HIDDEN | Win32.FILE_ATTRIBUTE_SYSTEM)) != 0
+        : (Flags & Libc.UF_HIDDEN) != 0;
+    internal bool HasValidFileId => Inode != 0 && Inode != ulong.MaxValue;
 }
 
 /// <summary>
-/// Byte-exact, directory-relative filesystem access for Linux and macOS (x64 and arm64).
-/// Everything else, and any platform where the startup probe fails, uses the managed enumerator.
+/// Byte-exact, directory-relative filesystem access for Linux, macOS, and Windows
+/// (x64, arm64, and x86 on Windows via NtQueryDirectoryFile).
+/// Any platform where the startup probe fails falls back to the managed enumerator.
 /// </summary>
 internal static unsafe class NativeIo
 {
@@ -105,7 +109,8 @@ internal static unsafe class NativeIo
         Unsupported,
         Linux,
         MacOS,
-        MacOSInode64
+        MacOSInode64,
+        Windows
     }
 
     private static readonly Platform s_platform = DetectPlatform();
@@ -114,9 +119,15 @@ internal static unsafe class NativeIo
 
     public static bool IsSupported => s_supported.Value;
 
+    public static bool IsWindows => s_platform == Platform.Windows;
+
+    public static bool IsPosix => s_platform is Platform.Linux or Platform.MacOS or Platform.MacOSInode64;
+
     public static bool IsMacOS => s_platform is Platform.MacOS or Platform.MacOSInode64;
 
     internal static bool UsesGetdents64 => s_usesGetdents64.Value;
+
+    internal static bool UsesWindowsNtQuery => IsWindows && IsSupported;
 
     internal static int GetLastErrno() =>
         OperatingSystem.IsMacOS() ? GetMacOSErrno() : GetLinuxErrno();
@@ -145,7 +156,9 @@ internal static unsafe class NativeIo
     // macOS dirent (64-bit inode): d_ino u64, d_seekoff u64, d_reclen u16, d_namlen u16, d_type u8, d_name.
     internal static int DirentTypeOffset => IsMacOS ? 20 : 18;
     internal static int DirentNameOffset => IsMacOS ? 21 : 19;
-    internal static int EloopErrno => IsMacOS ? 62 : 40;
+    internal static int EloopErrno => IsWindows ? Win32.ERROR_CANT_RESOLVE_FILENAME : (IsMacOS ? 62 : 40);
+    internal static bool IsNotFoundError(int error) =>
+        IsWindows ? WindowsIo.IsNotFoundError(error) : error == Libc.ENOENT;
     internal const int MacDirentNameLengthOffset = 18;
 
     private static int OpenDirectoryFlags => IsMacOS
@@ -157,6 +170,11 @@ internal static unsafe class NativeIo
     private static Platform DetectPlatform()
     {
         Architecture arch = RuntimeInformation.ProcessArchitecture;
+        if (OperatingSystem.IsWindows())
+            return arch is Architecture.X64 or Architecture.Arm64 or Architecture.X86
+                ? Platform.Windows
+                : Platform.Unsupported;
+
         if (arch is not (Architecture.X64 or Architecture.Arm64)) return Platform.Unsupported;
         if (OperatingSystem.IsLinux()) return Platform.Linux;
         if (OperatingSystem.IsMacOS()) return arch == Architecture.X64 ? Platform.MacOSInode64 : Platform.MacOS;
@@ -191,6 +209,13 @@ internal static unsafe class NativeIo
 
     internal static bool TryOpenReadOnly(string path, out int fd, out int errno)
     {
+        if (!IsPosix)
+        {
+            fd = -1;
+            errno = 0;
+            return false;
+        }
+
         int maxBytes = System.Text.Encoding.UTF8.GetMaxByteCount(path.Length) + 1;
         byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(maxBytes);
         try
@@ -220,6 +245,13 @@ internal static unsafe class NativeIo
 
     internal static bool TryReadFd(int fd, Span<byte> buffer, out int bytesRead, out int errno)
     {
+        if (!IsPosix)
+        {
+            bytesRead = 0;
+            errno = 0;
+            return false;
+        }
+
         fixed (byte* pBuf = buffer)
         {
             nint n = Libc.read(fd, pBuf, (nuint)buffer.Length);
@@ -238,7 +270,7 @@ internal static unsafe class NativeIo
 
     internal static void CloseFd(int fd)
     {
-        if (fd >= 0)
+        if (IsPosix && fd >= 0)
             _ = Libc.close(fd);
     }
 
@@ -350,6 +382,10 @@ internal static unsafe class NativeIo
     {
         if (nullTerminatedPath.IsEmpty || nullTerminatedPath[^1] != 0)
             throw new ArgumentException("Path must be null-terminated.", nameof(nullTerminatedPath));
+
+        if (IsWindows)
+            return WindowsIo.TryStatPath(nullTerminatedPath[..^1], followSymlinks, out stat, out errno);
+
         if (buffer.Length < StatBufferSize)
             throw new ArgumentException("Buffer is smaller than StatBufferSize.", nameof(buffer));
 
@@ -360,28 +396,30 @@ internal static unsafe class NativeIo
         }
     }
 
-    /// <summary>Maps an errno to the same messages the managed scanner reports.</summary>
-    internal static string DescribeError(int errno) => errno switch
-    {
-        Libc.EACCES or Libc.EPERM => "Access Denied",
-        Libc.ENOENT or Libc.ENOTDIR => "Directory Not Found",
-        _ => Marshal.GetPInvokeErrorMessage(errno)
-    };
+    /// <summary>Maps an OS error code to the same messages the managed scanner reports.</summary>
+    internal static string DescribeError(int errno) => IsWindows
+        ? WindowsIo.DescribeError(errno)
+        : errno switch
+        {
+            Libc.EACCES or Libc.EPERM => "Access Denied",
+            Libc.ENOENT or Libc.ENOTDIR => "Directory Not Found",
+            _ => Marshal.GetPInvokeErrorMessage(errno)
+        };
 
-    /// <summary>Returns the exact POSIX strerror message matching libc/GNU tools.</summary>
+    /// <summary>Returns the exact POSIX strerror / Win32 message matching OS error codes.</summary>
     internal static string DescribePosixError(int errno) => Marshal.GetPInvokeErrorMessage(errno);
 
     /// <summary>Restores default SIGPIPE termination so downstream pipe closes yield exit code 141 without .NET exceptions.</summary>
     internal static void RestoreDefaultSigpipe()
     {
-        if (s_platform != Platform.Unsupported)
+        if (IsPosix)
             _ = Libc.signal(Libc.SIGPIPE, 0);
     }
 
     /// <summary>Restores default SIGPIPE and raises SIGPIPE on EPIPE so POSIX callers (including pipefail) observe signal 13 (141).</summary>
     internal static void RestoreDefaultSigpipeAndReraise()
     {
-        if (s_platform == Platform.Unsupported)
+        if (!IsPosix)
             return;
 
         RestoreDefaultSigpipe();
@@ -398,7 +436,7 @@ internal static unsafe class NativeIo
         thousandsSep = [];
         grouping = [];
 
-        if (!IsSupported || string.IsNullOrEmpty(localeName))
+        if (!IsPosix || string.IsNullOrEmpty(localeName))
             return false;
 
         int mask = IsMacOS ? Libc.LC_ALL_MASK_MACOS : Libc.LC_NUMERIC_MASK_LINUX;
@@ -443,7 +481,7 @@ internal static unsafe class NativeIo
 
     internal static bool IsPosixCtypeLocaleAvailable(string? localeName)
     {
-        if (!IsSupported || string.IsNullOrEmpty(localeName))
+        if (!IsPosix || string.IsNullOrEmpty(localeName))
             return false;
 
         int mask = IsMacOS ? Libc.LC_CTYPE_MASK_MACOS : Libc.LC_CTYPE_MASK_LINUX;
@@ -457,7 +495,7 @@ internal static unsafe class NativeIo
 
     internal static nint CreateTimeLocaleHandle(string? localeName)
     {
-        if (!IsSupported || string.IsNullOrEmpty(localeName))
+        if (!IsPosix || string.IsNullOrEmpty(localeName))
             return 0;
 
         int mask = IsMacOS ? Libc.LC_ALL_MASK_MACOS : Libc.LC_TIME_MASK_LINUX;
@@ -466,13 +504,13 @@ internal static unsafe class NativeIo
 
     internal static void FreeLocaleHandle(nint loc)
     {
-        if (IsSupported && loc != 0)
+        if (IsPosix && loc != 0)
             Libc.freelocale(loc);
     }
 
     internal static void SyncTimezone(string? tzValue)
     {
-        if (!IsSupported)
+        if (!IsPosix)
             return;
 
         ReadOnlySpan<byte> tzName = "TZ\0"u8;
@@ -524,7 +562,7 @@ internal static unsafe class NativeIo
         bytesWritten = 0;
         outOfRange = false;
 
-        if (!IsSupported || destination.IsEmpty)
+        if (!IsPosix || destination.IsEmpty)
             return false;
 
         byte* tmBuf = stackalloc byte[128];
@@ -746,23 +784,13 @@ internal static unsafe class NativeIo
         {
             int len = System.Text.Encoding.UTF8.GetBytes(path, rented);
             rented[len] = 0;
-            if (!TryOpenDirectoryFdPathSafe(rented.AsSpan(0, len + 1), out int fd, out _))
+            using NativeDirectory? dir = NativeDirectory.OpenPathSafe(rented.AsSpan(0, len + 1), out _, followSymlinks: true);
+            if (dir == null)
                 return false;
 
-            try
-            {
-                byte* statBuf = stackalloc byte[StatBufferSize];
-                ReadOnlySpan<byte> dot = ".\0"u8;
-                fixed (byte* pDot = dot)
-                {
-                    return TryStatAt(fd, pDot, followSymlinks: false, statBuf, out NativeStat stat) &&
-                           stat.Kind == NativeEntryKind.Directory;
-                }
-            }
-            finally
-            {
-                CloseFd(fd);
-            }
+            Span<byte> statBuf = stackalloc byte[StatBufferSize];
+            return dir.TryStatSelf(statBuf, out NativeStat stat) &&
+                   stat.Kind == NativeEntryKind.Directory;
         }
         finally
         {
@@ -961,6 +989,7 @@ internal static unsafe class NativeIo
     private static bool Probe()
     {
         if (s_platform == Platform.Unsupported) return false;
+        if (s_platform == Platform.Windows) return WindowsIo.Probe();
 
         try
         {

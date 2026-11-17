@@ -20,7 +20,10 @@ public sealed class ExcludeMatcher
         if (string.IsNullOrEmpty(pattern))
             return;
 
-        _patterns.Add(Encoding.UTF8.GetBytes(pattern));
+        byte[] bytes = Encoding.UTF8.GetBytes(pattern);
+        if (OperatingSystem.IsWindows())
+            bytes.AsSpan().Replace((byte)'\\', (byte)'/');
+        _patterns.Add(bytes);
     }
 
     public void AddPatternBytes(ReadOnlySpan<byte> pattern)
@@ -28,7 +31,10 @@ public sealed class ExcludeMatcher
         if (pattern.IsEmpty)
             return;
 
-        _patterns.Add(pattern.ToArray());
+        byte[] copy = pattern.ToArray();
+        if (OperatingSystem.IsWindows())
+            copy.AsSpan().Replace((byte)'\\', (byte)'/');
+        _patterns.Add(copy);
     }
 
     internal void CopyFrom(ExcludeMatcher source)
@@ -109,7 +115,7 @@ public sealed class ExcludeMatcher
             return true;
         }
 
-        if (NativeIo.IsSupported)
+        if (NativeIo.IsPosix)
         {
             if (!NativeIo.TryOpenReadOnly(filePath, out int fd, out errno))
             {
@@ -159,7 +165,7 @@ public sealed class ExcludeMatcher
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            errno = ExtractPosixErrno(ex);
+            errno = ExtractSystemErrorCode(ex);
             data = [];
             return false;
         }
@@ -173,6 +179,31 @@ public sealed class ExcludeMatcher
         if (MatchBasenameOnly)
             return IsExcludedChildBasename(DuAccounting.ExtractBasename(path));
 
+        if (OperatingSystem.IsWindows() && path.IndexOf((byte)'\\') >= 0)
+        {
+            byte[]? rented = null;
+            Span<byte> normalized = path.Length <= 1024
+                ? stackalloc byte[1024]
+                : (rented = ArrayPool<byte>.Shared.Rent(path.Length));
+            try
+            {
+                Span<byte> slice = normalized[..path.Length];
+                path.CopyTo(slice);
+                slice.Replace((byte)'\\', (byte)'/');
+                return MatchesAnyPattern(slice);
+            }
+            finally
+            {
+                if (rented != null)
+                    ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+
+        return MatchesAnyPattern(path);
+    }
+
+    private bool MatchesAnyPattern(ReadOnlySpan<byte> path)
+    {
         foreach (byte[] pattern in _patterns)
         {
             if (MatchesPathOrSuffix(pattern, path))
@@ -345,8 +376,27 @@ public sealed class ExcludeMatcher
         return false;
     }
 
-    internal static int ExtractPosixErrno(Exception ex)
+    internal static int ExtractSystemErrorCode(Exception ex)
     {
+        if (OperatingSystem.IsWindows())
+        {
+            const int facilityWin32 = unchecked((int)0x80070000);
+            if ((ex.HResult & unchecked((int)0xFFFF0000)) == facilityWin32)
+            {
+                int win32 = ex.HResult & 0xFFFF;
+                if (win32 > 0)
+                    return win32;
+            }
+
+            return ex switch
+            {
+                FileNotFoundException => Win32.ERROR_FILE_NOT_FOUND,
+                DirectoryNotFoundException => Win32.ERROR_PATH_NOT_FOUND,
+                UnauthorizedAccessException => Win32.ERROR_ACCESS_DENIED,
+                _ => Win32.ERROR_ACCESS_DENIED
+            };
+        }
+
         if (ex.HResult is > 0 and < 4096)
             return ex.HResult;
 

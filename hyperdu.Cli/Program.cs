@@ -366,7 +366,7 @@ public static class Program
         string formattedTotal = parsed.HasExplicitHumanUnit
             ? HumanFormat.Format(totalUnsigned, options.DisplayBlockSize)
             : rootNode.TotalSize.ToString(CultureInfo.InvariantCulture);
-        Console.WriteLine($"{formattedTotal}\t{targetPath}");
+        Console.Write($"{formattedTotal}\t{targetPath}\n");
         return 0;
     }
 
@@ -377,8 +377,11 @@ public static class Program
         if (baseName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
             baseName = baseName[..^4];
 
-        if (string.Equals(baseName, "du", StringComparison.Ordinal) ||
-            string.Equals(baseName, "gdu", StringComparison.Ordinal))
+        StringComparison personaCmp = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        if (string.Equals(baseName, "du", personaCmp) ||
+            string.Equals(baseName, "gdu", personaCmp))
         {
             string programName = string.IsNullOrEmpty(rawArgv0) ? baseName : rawArgv0;
             exitCode = DuCommand.Run(args, programName, GetDisplayVersion());

@@ -193,7 +193,7 @@ internal static class TimeFormat
                 _sentinelFormatBuf[_rawFormatUtf8.Length + 1] = 0;
             }
 
-            if (NativeIo.IsSupported)
+            if (NativeIo.IsPosix)
             {
                 NativeIo.SyncTimezone(Environment.GetEnvironmentVariable("TZ"));
                 string? timeLocale = Messages.GetEffectiveCategoryLocale("LC_TIME");
@@ -203,7 +203,7 @@ internal static class TimeFormat
 
         public ReadOnlySpan<byte> Format(in FileTimestamp ts)
         {
-            if (!NativeIo.IsSupported)
+            if (!NativeIo.IsPosix)
                 return FormatManagedFallback(in ts);
 
             ReadOnlySpan<byte> fmt = _hasNanoSpec ? BuildExpandedFormat(ts.Nanoseconds) : _sentinelFormatBuf;

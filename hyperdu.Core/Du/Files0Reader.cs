@@ -18,7 +18,7 @@ internal static class Files0Reader
         OperandCallback onOperand)
     {
         bool isStdin = sourcePath == "-";
-        bool useNativeFd = !isStdin && NativeIo.IsSupported;
+        bool useNativeFd = !isStdin && NativeIo.IsPosix;
         int nativeFd = -1;
         Stream? openedFile = null;
 
@@ -40,7 +40,7 @@ internal static class Files0Reader
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    int errno = ExcludeMatcher.ExtractPosixErrno(ex);
+                    int errno = ExcludeMatcher.ExtractSystemErrorCode(ex);
                     Messages.WriteError(stderr, programName, $"cannot open {Messages.QuoteAscii(sourcePath)} for reading: {NativeIo.DescribePosixError(errno)}");
                     return false;
                 }
@@ -74,7 +74,7 @@ internal static class Files0Reader
                     }
                     catch (IOException ex)
                     {
-                        int errno = ExcludeMatcher.ExtractPosixErrno(ex);
+                        int errno = ExcludeMatcher.ExtractSystemErrorCode(ex);
                         Messages.WriteError(stderr, programName, $"{sourcePath}: read error: {NativeIo.DescribePosixError(errno)}");
                         return false;
                     }

@@ -41,7 +41,7 @@ public static class Messages
         if (!looksUtf8)
             return false;
 
-        return !NativeIo.IsSupported || NativeIo.IsPosixCtypeLocaleAvailable(locale);
+        return !NativeIo.IsPosix || NativeIo.IsPosixCtypeLocaleAvailable(locale);
     }
 
     internal static bool ShouldGroupThousands() => GetNumericLocaleFormat().HasGrouping;
@@ -57,7 +57,7 @@ public static class Messages
             return cached.Format;
 
         NumericLocaleFormat resolved;
-        if (!NativeIo.IsSupported)
+        if (!NativeIo.IsPosix)
         {
             resolved = NumericLocaleFormat.FallbackGrouped;
         }

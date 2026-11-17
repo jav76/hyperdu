@@ -62,9 +62,20 @@ internal static unsafe class DuAccounting
         return stat.Kind == NativeEntryKind.Directory && NativeIo.IsMacOsDevFdDirectory(nullTermPath, entryName);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool IsSeparator(byte ch) =>
+        ch == (byte)'/' || (NativeIo.IsWindows && ch == (byte)'\\');
+
+    internal static byte DefaultSeparator =>
+        NativeIo.IsWindows ? (byte)'\\' : (byte)'/';
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static int LastSeparatorIndex(ReadOnlySpan<byte> path) =>
+        NativeIo.IsWindows ? path.LastIndexOfAny((byte)'/', (byte)'\\') : path.LastIndexOf((byte)'/');
+
     internal static ReadOnlySpan<byte> ExtractBasename(ReadOnlySpan<byte> path)
     {
-        int slash = path.LastIndexOf((byte)'/');
+        int slash = LastSeparatorIndex(path);
         // Mirrors FreeBSD fts_load: keeps "/" as "/", strips prefix when '/' has trailing text or is non-leading.
         return slash >= 0 && (slash > 0 || slash + 1 < path.Length)
             ? path[(slash + 1)..]
@@ -73,8 +84,9 @@ internal static unsafe class DuAccounting
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static bool ShouldTrackOperandIdentity(in NativeStat stat, DuOptions options) =>
-        options.Dialect == DuDialect.Gnu
-        || (stat.Kind != NativeEntryKind.Directory && stat.HardLinks > 1);
+        stat.HasValidFileId &&
+        (options.Dialect == DuDialect.Gnu ||
+         (stat.Kind != NativeEntryKind.Directory && stat.HardLinks != 1));
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static bool ShouldTrackChildIdentity(
@@ -82,12 +94,13 @@ internal static unsafe class DuAccounting
         DuOptions options,
         bool followChild,
         bool trackSingleLinkFiles) =>
-        options.Dialect == DuDialect.Bsd
-            ? (stat.Kind != NativeEntryKind.Directory && stat.HardLinks > 1)
+        stat.HasValidFileId &&
+        (options.Dialect == DuDialect.Bsd
+            ? (stat.Kind != NativeEntryKind.Directory && stat.HardLinks != 1)
             : (stat.Kind == NativeEntryKind.Directory ||
-               stat.HardLinks > 1 ||
+               stat.HardLinks != 1 ||
                followChild ||
-               trackSingleLinkFiles);
+               trackSingleLinkFiles));
 
     internal static bool ShouldExcludeChild(
         DuOptions options,
@@ -166,22 +179,11 @@ internal static unsafe class DuAccounting
 
     internal static int NormalizeDanglingSymlinkErrno(ReadOnlySpan<byte> nullTermPath, int statErrno, byte* statBuffer)
     {
-        if (statErrno == Libc.ENOENT)
+        if (NativeIo.IsNotFoundError(statErrno) &&
+            NativeIo.TryStatPath(nullTermPath, followSymlinks: false, new Span<byte>(statBuffer, NativeIo.StatBufferSize), out NativeStat lstatStat, out _) &&
+            lstatStat.Kind == NativeEntryKind.Symlink)
         {
-            fixed (byte* pPath = nullTermPath)
-            {
-                if (NativeIo.TryStatAt(
-                        NativeIo.IsMacOS ? Libc.AT_FDCWD_MACOS : Libc.AT_FDCWD_LINUX,
-                        pPath,
-                        followSymlinks: false,
-                        statBuffer,
-                        out NativeStat lstatStat,
-                        out _) &&
-                    lstatStat.Kind == NativeEntryKind.Symlink)
-                {
-                    return 0;
-                }
-            }
+            return 0;
         }
 
         return statErrno;
@@ -267,7 +269,8 @@ internal static unsafe class DuAccounting
         ReadOnlySpan<byte> nullTermPath,
         out int dirFd,
         out NativeDirectory? fallbackDir,
-        out int errno)
+        out int errno,
+        bool followSymlinks = true)
     {
         if (NativeIo.UsesGetdents64)
         {
@@ -280,36 +283,36 @@ internal static unsafe class DuAccounting
             return;
         }
 
-        fallbackDir = NativeDirectory.Open(nullTermPath, out errno);
+        fallbackDir = NativeDirectory.Open(nullTermPath, out errno, followSymlinks);
         dirFd = fallbackDir?.Fd ?? -1;
     }
 
     /// <summary>
     /// Opens a directory whose null-terminated full path may exceed PATH_MAX by stepping
-    /// through openat(fd, relativeSegmentChunk) and closing intermediate file descriptors.
+    /// through openat / NtOpenFile on relative segments and closing intermediate handles.
     /// </summary>
     internal static void OpenDirectoryPathSafe(
         ReadOnlySpan<byte> nullTermPath,
         out int dirFd,
         out NativeDirectory? fallbackDir,
-        out int errno)
+        out int errno,
+        bool followSymlinks = true)
     {
-        if (!NativeIo.TryOpenDirectoryFdPathSafe(nullTermPath, out int fd, out errno))
-        {
-            dirFd = -1;
-            fallbackDir = null;
-            return;
-        }
-
         if (NativeIo.UsesGetdents64)
         {
+            if (!NativeIo.TryOpenDirectoryFdPathSafe(nullTermPath, out int fd, out errno))
+            {
+                dirFd = -1;
+                fallbackDir = null;
+                return;
+            }
+
             dirFd = fd;
             fallbackDir = null;
             return;
         }
 
-        // WrapFd closes fd when fdopendir fails.
-        fallbackDir = NativeDirectory.WrapFd(fd, out errno);
+        fallbackDir = NativeDirectory.OpenPathSafe(nullTermPath, out errno, followSymlinks);
         dirFd = fallbackDir?.Fd ?? -1;
     }
 
@@ -321,7 +324,8 @@ internal static unsafe class DuAccounting
         int nameLength,
         out int childFd,
         out NativeDirectory? childFallback,
-        out int errno)
+        out int errno,
+        bool followSymlinks = false)
     {
         if (parentFallback == null)
         {
@@ -334,41 +338,74 @@ internal static unsafe class DuAccounting
             return;
         }
 
-        childFallback = NativeDirectory.OpenRelative(parentFd, nameArena.AsSpan(nameOffset, nameLength + 1), out errno);
+        childFallback = parentFallback.OpenRelative(nameArena.AsSpan(nameOffset, nameLength + 1), out errno, followSymlinks);
         childFd = childFallback?.Fd ?? -1;
+    }
+
+    internal static int ComputeNormalizedRootSpec(
+        ReadOnlySpan<byte> raw,
+        out int copyLen,
+        out bool appendSep,
+        out byte sepByte)
+    {
+        if (raw.IsEmpty)
+        {
+            copyLen = 0;
+            appendSep = false;
+            sepByte = 0;
+            return 0;
+        }
+
+        bool hadTrailing = IsSeparator(raw[^1]);
+        int end = raw.Length;
+        while (end > 0 && IsSeparator(raw[end - 1]))
+            end--;
+
+        if (end == 0)
+        {
+            copyLen = 0;
+            appendSep = true;
+            sepByte = raw[0];
+            return 1;
+        }
+
+        if (!hadTrailing)
+        {
+            copyLen = raw.Length;
+            appendSep = false;
+            sepByte = 0;
+            return raw.Length;
+        }
+
+        copyLen = end;
+        appendSep = true;
+        sepByte = raw[end];
+        return end + 1;
     }
 
     internal static byte[] NormalizeDisplayPath(ReadOnlySpan<byte> raw)
     {
-        if (raw.IsEmpty)
+        int totalLen = ComputeNormalizedRootSpec(raw, out int copyLen, out bool appendSep, out byte sepByte);
+        if (totalLen == 0)
             return [];
 
-        bool hadTrailingSlash = raw[^1] == (byte)'/';
-        int end = raw.Length;
-        while (end > 0 && raw[end - 1] == (byte)'/')
-            end--;
-
-        if (end == 0)
-            return [(byte)'/'];
-
-        if (!hadTrailingSlash)
-            return raw.ToArray();
-
-        byte[] normalized = new byte[end + 1];
-        raw[..end].CopyTo(normalized);
-        normalized[end] = (byte)'/';
+        byte[] normalized = new byte[totalLen];
+        if (copyLen > 0)
+            raw[..copyLen].CopyTo(normalized);
+        if (appendSep)
+            normalized[copyLen] = sepByte;
         return normalized;
     }
 
     internal static byte[] BuildNullTerminatedChildPath(ReadOnlySpan<byte> parentPath, ReadOnlySpan<byte> childName)
     {
-        bool needsSlash = parentPath.Length > 0 && parentPath[^1] != (byte)'/';
+        bool needsSlash = parentPath.Length > 0 && !IsSeparator(parentPath[^1]);
         int len = parentPath.Length + (needsSlash ? 1 : 0) + childName.Length;
         byte[] result = new byte[len + 1];
         parentPath.CopyTo(result);
         int pos = parentPath.Length;
         if (needsSlash)
-            result[pos++] = (byte)'/';
+            result[pos++] = DefaultSeparator;
         childName.CopyTo(result.AsSpan(pos));
         result[len] = 0;
         return result;
@@ -380,7 +417,7 @@ internal static unsafe class DuAccounting
         ref byte[] scratchBuffer,
         bool appendNul = false)
     {
-        bool needsSlash = parentPath.Length > 0 && parentPath[^1] != (byte)'/';
+        bool needsSlash = parentPath.Length > 0 && !IsSeparator(parentPath[^1]);
         int displayLen = parentPath.Length + (needsSlash ? 1 : 0) + childName.Length;
         int totalLen = displayLen + (appendNul ? 1 : 0);
         if (totalLen > scratchBuffer.Length)
@@ -389,7 +426,7 @@ internal static unsafe class DuAccounting
         parentPath.CopyTo(scratchBuffer);
         int pos = parentPath.Length;
         if (needsSlash)
-            scratchBuffer[pos++] = (byte)'/';
+            scratchBuffer[pos++] = DefaultSeparator;
         childName.CopyTo(scratchBuffer.AsSpan(pos));
         if (appendNul)
             scratchBuffer[displayLen] = 0;
@@ -402,7 +439,7 @@ internal static unsafe class DuAccounting
         ref byte[] pooledScratch,
         bool appendNul = false)
     {
-        bool needsSlash = parentPath.Length > 0 && parentPath[^1] != (byte)'/';
+        bool needsSlash = parentPath.Length > 0 && !IsSeparator(parentPath[^1]);
         int displayLen = parentPath.Length + (needsSlash ? 1 : 0) + childName.Length;
         int totalLen = displayLen + (appendNul ? 1 : 0);
         if (totalLen > pooledScratch.Length)
@@ -415,7 +452,7 @@ internal static unsafe class DuAccounting
         parentPath.CopyTo(pooledScratch);
         int pos = parentPath.Length;
         if (needsSlash)
-            pooledScratch[pos++] = (byte)'/';
+            pooledScratch[pos++] = DefaultSeparator;
         childName.CopyTo(pooledScratch.AsSpan(pos));
         if (appendNul)
             pooledScratch[displayLen] = 0;
@@ -606,15 +643,19 @@ internal sealed class DuIdentityTracker
 
         if (_bsdRemaining != null && _bsdRemaining.TryGetValue(identity, out ulong remaining))
         {
-            if (remaining <= 1)
-                _bsdRemaining.Remove(identity);
-            else
-                _bsdRemaining[identity] = remaining - 1;
+            if (remaining != ulong.MaxValue)
+            {
+                if (remaining <= 1)
+                    _bsdRemaining.Remove(identity);
+                else
+                    _bsdRemaining[identity] = remaining - 1;
+            }
+
             return false;
         }
 
-        if (hardLinks > 1)
-            (_bsdRemaining ??= [])[identity] = hardLinks - 1;
+        if (hardLinks != 1)
+            (_bsdRemaining ??= [])[identity] = hardLinks == 0 ? ulong.MaxValue : hardLinks - 1;
         return true;
     }
 }
