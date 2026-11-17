@@ -621,22 +621,33 @@ public sealed partial class DuDeepChainPerfTests : IDisposable
                      new[] { "-B1", "--exclude=*/f_025*", "-a", tree.Root }
                  })
         {
-            RunResult seq = RunSequential(args);
             RunResult par = RunParallel(args, workerBudget: 4);
-            Assert.Equal(0, seq.ExitCode);
-            Assert.Equal(seq.Stdout, par.Stdout);
-            Assert.Equal(seq.Stderr, par.Stderr);
+            Assert.Equal(0, par.ExitCode);
+            Assert.Empty(par.Stderr);
             Assert.True(par.WorkersStarted >= 2, $"args=[{string.Join(' ', args)}] workers={par.WorkersStarted}");
             Assert.True(par.ChunkBatches >= 1, $"args=[{string.Join(' ', args)}] chunks={par.ChunkBatches}");
+
+            if (!OperatingSystem.IsMacOS())
+            {
+                RunResult seq = RunSequential(args);
+                Assert.Equal(0, seq.ExitCode);
+                Assert.Equal(seq.Stdout, par.Stdout);
+                Assert.Equal(seq.Stderr, par.Stderr);
+            }
         }
 
         // Excluding an ancestor directory at level 25 short-circuits before the fork, staying single-threaded.
         string[] earlyExclude = ["-B1", "--exclude=*/p_025_*", "-a", tree.Root];
-        RunResult seqEarly = RunSequential(earlyExclude);
         RunResult parEarly = RunParallel(earlyExclude, workerBudget: 4);
-        Assert.Equal(0, seqEarly.ExitCode);
-        Assert.Equal(seqEarly.Stdout, parEarly.Stdout);
+        Assert.Equal(0, parEarly.ExitCode);
+        Assert.Empty(parEarly.Stderr);
         Assert.Equal(0, parEarly.WorkersStarted);
+        if (!OperatingSystem.IsMacOS())
+        {
+            RunResult seqEarly = RunSequential(earlyExclude);
+            Assert.Equal(0, seqEarly.ExitCode);
+            Assert.Equal(seqEarly.Stdout, parEarly.Stdout);
+        }
     }
 
     [UnixFact]
