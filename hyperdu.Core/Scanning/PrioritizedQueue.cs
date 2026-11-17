@@ -26,20 +26,30 @@ public class PrioritizedQueue
     {
         lock (_lock)
         {
-            _highQueue.Clear();
-            _mediumQueue.Clear();
-            _lowQueue.Clear();
+            DrainAndDispose(_highQueue);
+            DrainAndDispose(_mediumQueue);
+            DrainAndDispose(_lowQueue);
             _inQueue.Clear();
             _isCompleted = false;
             while (_semaphore.CurrentCount > 0) _semaphore.Wait(0);
         }
     }
 
+    private static void DrainAndDispose(Queue<DirectoryNode> queue)
+    {
+        while (queue.Count > 0)
+            queue.Dequeue().DisposePreopenedDirectory();
+    }
+
     public void Enqueue(DirectoryNode node)
     {
         lock (_lock)
         {
-            if (_isCompleted) return;
+            if (_isCompleted)
+            {
+                node.DisposePreopenedDirectory();
+                return;
+            }
             if (!_inQueue.Add(node)) return;
 
             int priority = _priorityEvaluator?.Invoke(node) ?? 0;

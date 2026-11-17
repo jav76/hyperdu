@@ -200,6 +200,13 @@ internal sealed unsafe class NativeDirectory : IDisposable
             return OpenRelative(_winUtf8NameBuf.AsSpan(0, _nameLength + 1), out error, followSymlinks);
         }
 
+        if ((_backend == Backend.UnixGetdents64 && _buf == null) ||
+            (_backend == Backend.UnixDirent && _entry == null))
+        {
+            error = Libc.ENOENT;
+            return null;
+        }
+
         nint dir;
         int fd;
         if (_backend == Backend.UnixGetdents64)
@@ -216,6 +223,9 @@ internal sealed unsafe class NativeDirectory : IDisposable
 
         return error == 0 ? new NativeDirectory(dir, fd, dir == 0) : null;
     }
+
+    internal static bool IsTooManyOpenFilesError(int error) =>
+        NativeIo.IsWindows ? error == 4 : error is 23 or 24;
 
     /// <summary>Advances to the next entry, skipping "." and "..".</summary>
     public bool MoveNext()

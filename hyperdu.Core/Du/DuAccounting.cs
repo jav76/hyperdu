@@ -397,6 +397,18 @@ internal static unsafe class DuAccounting
         return normalized;
     }
 
+    internal static byte[] NormalizeNullTerminatedDisplayPath(ReadOnlySpan<byte> raw)
+    {
+        int totalLen = ComputeNormalizedRootSpec(raw, out int copyLen, out bool appendSep, out byte sepByte);
+        byte[] normalized = new byte[totalLen + 1];
+        if (copyLen > 0)
+            raw[..copyLen].CopyTo(normalized);
+        if (appendSep)
+            normalized[copyLen] = sepByte;
+        normalized[totalLen] = 0;
+        return normalized;
+    }
+
     internal static byte[] BuildNullTerminatedChildPath(ReadOnlySpan<byte> parentPath, ReadOnlySpan<byte> childName)
     {
         bool needsSlash = parentPath.Length > 0 && !IsSeparator(parentPath[^1]);
@@ -471,6 +483,7 @@ internal static unsafe class DuAccounting
 internal sealed class DuOutputWriter : IDisposable
 {
     private const int OutputBufferSize = 65536;
+    private const int InitialOutputBufferSize = 4096;
     private const int InitialFlushThreshold = 4096;
     private const int InitialFlushWarmupBytes = 16384;
 
@@ -478,7 +491,7 @@ internal sealed class DuOutputWriter : IDisposable
     private readonly string _programName;
     private readonly Stream _stdout;
     private readonly Stream _stderr;
-    private readonly byte[] _outBuffer = new byte[OutputBufferSize];
+    private byte[] _outBuffer = new byte[InitialOutputBufferSize];
     private readonly byte _lineTerminator;
     private readonly NumericLocaleFormat _numericLocale;
     private TimeFormat.Formatter? _timeFormatter;
@@ -528,7 +541,7 @@ internal sealed class DuOutputWriter : IDisposable
         ReadOnlySpan<byte> timeBytes = _timeFormatter != null ? _timeFormatter.Format(in time) : [];
         bool includeTime = _timeFormatter != null;
         int totalLen = sizeLen + 1 + (includeTime ? timeBytes.Length + 1 : 0) + pathBytes.Length + 1;
-        if (totalLen > _outBuffer.Length)
+        if (totalLen > OutputBufferSize)
         {
             Flush();
             byte[] rented = ArrayPool<byte>.Shared.Rent(totalLen);
@@ -545,7 +558,16 @@ internal sealed class DuOutputWriter : IDisposable
             return;
         }
 
-        int activeLimit = _totalFlushedBytes < InitialFlushWarmupBytes ? InitialFlushThreshold : _outBuffer.Length;
+        if (_outBuffer.Length < OutputBufferSize &&
+            (_totalFlushedBytes >= InitialFlushWarmupBytes || totalLen > _outBuffer.Length))
+        {
+            Flush();
+            _outBuffer = new byte[OutputBufferSize];
+        }
+
+        int activeLimit = _outBuffer.Length < OutputBufferSize
+            ? _outBuffer.Length
+            : (_totalFlushedBytes < InitialFlushWarmupBytes ? InitialFlushThreshold : OutputBufferSize);
         if (_outPos + totalLen > activeLimit)
             Flush();
 

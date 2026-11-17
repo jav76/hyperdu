@@ -360,8 +360,14 @@ public static class Program
         }
 
         targetPath = Path.GetFullPath(targetPath);
-        (ScanOptions options, _, _) = BuildScanContext(parsed, targetPath);
-        ConfigureThreadPool(options.WorkerCount);
+        int initialWorkers = parsed.CustomThreads.HasValue
+            ? Math.Max(1, parsed.CustomThreads.Value)
+            : Environment.ProcessorCount;
+        ScanOptions options = parsed.CreateScanOptions(
+            initialWorkers,
+            Environment.GetEnvironmentVariable("HYPERDU_NATIVE_IO") != "0");
+        options.AutoDetectWorkerCount = !parsed.CustomThreads.HasValue;
+        options.Headless = true;
 
         ParallelScanner scanner = new ParallelScanner(options);
         var rootNode = await scanner.ScanAsync(targetPath, null, CancellationToken.None);
