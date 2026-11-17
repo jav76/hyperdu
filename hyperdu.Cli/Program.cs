@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Text;
 using hyperdu.Cli.UI;
 using hyperdu.Core.Du;
+using hyperdu.Core.Native;
 using hyperdu.Core.Scanning;
 using Spectre.Console;
 
@@ -384,9 +385,11 @@ public static class Program
             return true;
         }
 
-        if (args.Length > 0 && string.Equals(args[0], "du", StringComparison.Ordinal))
+        if (args.Length > 0 &&
+            (string.Equals(args[0], "du", StringComparison.Ordinal) ||
+             string.Equals(args[0], "gdu", StringComparison.Ordinal)))
         {
-            exitCode = DuCommand.Run(args[1..], "du", GetDisplayVersion());
+            exitCode = DuCommand.Run(args[1..], args[0], GetDisplayVersion());
             return true;
         }
 
@@ -396,6 +399,13 @@ public static class Program
 
     private static string ReadRawArgv0()
     {
+        if (OperatingSystem.IsMacOS())
+        {
+            string? macArgv0 = NativeIo.TryGetMacOsRawArgv0();
+            if (!string.IsNullOrEmpty(macArgv0))
+                return macArgv0;
+        }
+
         if (OperatingSystem.IsLinux())
         {
             try

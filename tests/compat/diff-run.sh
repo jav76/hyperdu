@@ -22,10 +22,11 @@ pinned_version = sys.argv[2]
 argv = sys.argv[3:]
 
 parser = argparse.ArgumentParser(description="Differential du compatibility harness")
+parser.add_argument("--dialect", choices=["gnu", "bsd", "auto"], default="gnu", help="du dialect under test (gnu, bsd, or auto by OS)")
 parser.add_argument("--fixtures", help="Existing fixture root directory")
 parser.add_argument("--with-mounts", action="store_true", help="Pass --with-mounts when creating temp fixtures")
-parser.add_argument("--ref-du", help="Path to reference GNU du binary")
-parser.add_argument("--candidate-du", help="Path to candidate du binary (invoked as du)")
+parser.add_argument("--ref-du", help="Path to reference du binary")
+parser.add_argument("--candidate-du", help="Path to candidate du/gdu binary")
 parser.add_argument("--hyperdu", help="Path to hyperdu binary (symlinked as du in a scratch dir)")
 parser.add_argument("--random", type=int, default=20, help="Number of seeded random option vectors")
 parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -39,9 +40,21 @@ parser.add_argument("--min-score", type=float, default=100.0, help="Minimum pass
 parser.add_argument("--threads-matrix", help="Comma-separated HYPERDU_THREADS modes to verify (e.g. 1,4,auto)")
 args = parser.parse_args(argv)
 
+active_dialect = args.dialect
+if active_dialect == "auto":
+    active_dialect = "bsd" if sys.platform == "darwin" else "gnu"
+
 def find_ref_du(override: str | None) -> str:
     if override:
         return override
+    if active_dialect == "bsd":
+        if os.path.exists("/usr/bin/du"):
+            return "/usr/bin/du"
+        fallback = shutil.which("du")
+        if not fallback:
+            raise RuntimeError("Reference BSD 'du' binary not found.")
+        return fallback
+
     for name in ("gnudu", "gdu", "du"):
         found = shutil.which(name)
         if not found:
@@ -58,6 +71,8 @@ def find_ref_du(override: str | None) -> str:
     return fallback
 
 def parse_du_version(du_path: str) -> str:
+    if active_dialect == "bsd":
+        return f"BSD du ({du_path})"
     try:
         res = subprocess.run([du_path, "--version"], capture_output=True, text=True, timeout=2)
         first = (res.stdout or res.stderr).splitlines()[0].strip() if (res.stdout or res.stderr) else "unknown"
@@ -198,6 +213,84 @@ try:
             combo.extend(flag)
         operands = rng.choice(operand_sets)
         vectors.append((f"rand-{idx:02d}", "random", {}, combo + operands, None))
+
+    if active_dialect == "bsd":
+        vectors = [
+            ("bsd-default-512", "bsd", {}, ["d"], None),
+            ("bsd-default-cwd", "bsd", {}, [], None),
+            ("bsd-file-operand", "bsd", {}, ["bsd_extra/tenk.bin"], None),
+            ("bsd-all-files", "bsd", {}, ["-a", "bsd_extra"], None),
+            ("bsd-summarize-s", "bsd", {}, ["-s", "d"], None),
+            ("bsd-depth-0", "bsd", {}, ["-d", "0", "d"], None),
+            ("bsd-depth-1", "bsd", {}, ["-d", "1", "d"], None),
+            ("bsd-depth-2", "bsd", {}, ["-d", "2", "d"], None),
+            ("bsd-apparent-A", "bsd", {}, ["-A", "sparse"], None),
+            ("bsd-apparent-A-k", "bsd", {}, ["-A", "-k", "bsd_extra"], None),
+            ("bsd-apparent-A-B1", "bsd", {}, ["-A", "-B", "1", "bsd_extra"], None),
+            ("bsd-apparent-A-h", "bsd", {}, ["-A", "-a", "-h", "bsd_extra"], None),
+            ("bsd-blocksize-B-1024", "bsd", {}, ["-B", "1024", "d"], None),
+            ("bsd-blocksize-B-roundup", "bsd", {}, ["-B", "1", "d"], None),
+            ("bsd-gib-g", "bsd", {}, ["-g", "d"], None),
+            ("bsd-apparent-g", "bsd", {}, ["-A", "-g", "sparse"], None),
+            ("bsd-kib-k", "bsd", {}, ["-k", "d"], None),
+            ("bsd-mib-m", "bsd", {}, ["-m", "d"], None),
+            ("bsd-human-h", "bsd", {}, ["-a", "-h", "bsd_extra"], None),
+            ("bsd-human-si", "bsd", {}, ["-a", "--si", "bsd_extra"], None),
+            ("bsd-total-c-h", "bsd", {}, ["-c", "-h", "d/a", "d/c", "bsd_extra"], None),
+            ("bsd-ignore-I-ext", "bsd", {}, ["-I", "*.tmp", "-a", "bsd_extra"], None),
+            ("bsd-ignore-I-dir", "bsd", {}, ["-I", "sub_*", "bsd_extra"], None),
+            ("bsd-ignore-I-multi", "bsd", {}, ["-I", "*.tmp", "-I", "*.log", "-a", "bsd_extra"], None),
+            ("bsd-nodump-n-all", "bsd", {}, ["-n", "-a", "bsd_extra"], None),
+            ("bsd-nodump-n-sum", "bsd", {}, ["-n", "-s", "bsd_extra"], None),
+            ("bsd-count-links-l", "bsd", {}, ["-l", "-s", "d"], None),
+            ("bsd-dup-operands-dir", "bsd", {}, ["d", "d"], None),
+            ("bsd-dup-operands-hl", "bsd", {}, ["bsd_extra/fourk.bin", "bsd_extra/fourk_hl.bin"], None),
+            ("bsd-symlinks-H", "bsd", {}, ["-H", "-s", "d/sl"], None),
+            ("bsd-symlinks-H-broken", "bsd", {}, ["-H", "bsd_extra/broken_sl"], None),
+            ("bsd-symlinks-L", "bsd", {}, ["-L", "-a", "bsd_extra"], None),
+            ("bsd-symlinks-P", "bsd", {}, ["-P", "-a", "d"], None),
+            ("bsd-r-compat", "bsd", {}, ["-r", "err1"], None),
+            ("bsd-xdev", "bsd", {}, ["-x", "-s", "mnt"], None),
+            ("bsd-threshold-pos", "bsd", {}, ["-t", "1k", "bsd_extra"], None),
+            ("bsd-threshold-A", "bsd", {}, ["-A", "-t", "5k", "bsd_extra"], None),
+            ("bsd-env-blocksize-1k", "bsd", {"BLOCKSIZE": "1K"}, ["-s", "d"], None),
+            ("bsd-env-blocksize-1m", "bsd", {"BLOCKSIZE": "1M"}, ["-s", "d"], None),
+            ("bsd-env-blocksize-k-override", "bsd", {"BLOCKSIZE": "1M"}, ["-k", "-s", "d"], None),
+            ("bsd-env-blocksize-min-clamp", "bsd", {"BLOCKSIZE": "256"}, ["-s", "d"], None),
+            ("bsd-env-blocksize-bad", "bsd", {"BLOCKSIZE": "invalid"}, ["-s", "d"], None),
+            ("bsd-getopt-stop-nonopt", "bsd", {}, ["d", "-s"], None),
+            ("bsd-unreadable-err", "bsd", {}, ["err1"], None),
+            ("bsd-missing-file", "bsd", {}, ["missing_file"], None),
+            ("bsd-err-unknown-opt", "bsd", {}, ["-Z"], None),
+            ("bsd-err-unknown-opt-posix", "bsd", {"POSIXLY_CORRECT": "1"}, ["-Z"], None),
+            ("bsd-err-missing-arg", "bsd", {}, ["-d"], None),
+            ("bsd-err-bad-depth", "bsd", {}, ["-d", "-1", "d"], None),
+            ("bsd-err-bad-B", "bsd", {}, ["-B", "0", "d"], None),
+            ("bsd-err-bad-thresh", "bsd", {}, ["-t", "0", "d"], None),
+            ("bsd-err-conflict-sa", "bsd", {}, ["-s", "-a", "d"], None),
+            ("bsd-err-conflict-sd0", "bsd", {}, ["-s", "-d", "0", "d"], None),
+            ("bsd-err-conflict-ad1", "bsd", {}, ["-a", "-d", "1", "d"], None),
+            ("bsd-err-long-version", "bsd", {}, ["--version"], None),
+            ("bsd-err-long-help", "bsd", {}, ["--help"], None),
+            ("bsd-large-dir-10k", "bsd", {}, ["-a", "large-dir"], None),
+            ("bsd-deep", "bsd", {}, ["-s", "deep"], None),
+        ]
+
+        bsd_rng = random.Random(args.seed + 1000)
+        bsd_scope = [[], ["-a"], ["-s"], ["-d", "0"], ["-d", "1"]]
+        bsd_unit = [[], ["-h"], ["--si"], ["-k"], ["-m"], ["-g"], ["-A"], ["-A", "-h"], ["-B", "1024"]]
+        bsd_link = [[], ["-P"], ["-H"], ["-L"]]
+        bsd_extra = [[], ["-c"], ["-l"], ["-n"], ["-r"], ["-x"], ["-I", "*.tmp"]]
+        bsd_ops = [["d"], ["d", "d"], ["bsd_extra"], ["sparse"], ["err1"]]
+        for idx in range(args.random):
+            combo: list[str] = []
+            combo.extend(bsd_rng.choice(bsd_scope))
+            combo.extend(bsd_rng.choice(bsd_unit))
+            combo.extend(bsd_rng.choice(bsd_link))
+            for flag in bsd_rng.sample(bsd_extra, k=2):
+                combo.extend(flag)
+            operands = bsd_rng.choice(bsd_ops)
+            vectors.append((f"bsd-rand-{idx:02d}", "random", {}, combo + operands, None))
 
     def normalize_stderr(raw: bytes, exe_path: str) -> bytes:
         exe_bytes = exe_path.encode("utf-8", errors="surrogateescape")

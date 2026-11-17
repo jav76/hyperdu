@@ -78,24 +78,45 @@ if [[ "$du_target" != "hyperdu" || "$gdu_target" != "hyperdu" ]]; then
 fi
 
 hyper_ver="$("$EXTRACT_DIR/hyperdu" --version)"
-du_ver="$("$EXTRACT_DIR/du" --version)"
 gdu_ver="$("$EXTRACT_DIR/gdu" --version)"
 
 echo "hyperdu --version: $hyper_ver"
-echo "du --version:      $du_ver"
 echo "gdu --version:     $gdu_ver"
 
 if [[ "$hyper_ver" != hyperdu\ * ]]; then
   echo "Error: unexpected hyperdu --version output: $hyper_ver" >&2
   exit 1
 fi
-if ! printf '%s\n' "$du_ver" | grep -E '^du \(hyperdu\) ' >/dev/null; then
-  echo "Error: unexpected du --version output: $du_ver" >&2
-  exit 1
-fi
 if ! printf '%s\n' "$gdu_ver" | grep -E '^du \(hyperdu\) ' >/dev/null; then
   echo "Error: unexpected gdu --version output: $gdu_ver" >&2
   exit 1
+fi
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  du_gnu_ver="$(HYPERDU_DU_DIALECT=gnu "$EXTRACT_DIR/du" --version)"
+  echo "du (gnu env) --version: $du_gnu_ver"
+  if ! printf '%s\n' "$du_gnu_ver" | grep -E '^du \(hyperdu\) ' >/dev/null; then
+    echo "Error: unexpected HYPERDU_DU_DIALECT=gnu du --version output: $du_gnu_ver" >&2
+    exit 1
+  fi
+
+  set +e
+  bsd_ver_err="$("$EXTRACT_DIR/du" --version 2>&1)"
+  bsd_ver_rc=$?
+  set -e
+  if [[ $bsd_ver_rc -ne 64 ]] || ! printf '%s\n' "$bsd_ver_err" | grep -F "usage: du" >/dev/null; then
+    echo "Error: expected macOS du symlink to use BSD dialect (rc=64), got rc=$bsd_ver_rc: $bsd_ver_err" >&2
+    exit 1
+  fi
+
+  "$EXTRACT_DIR/du" -Ah -d 0 "$EXTRACT_DIR/README.md" | grep -E '^[[:space:]]*[0-9]+(\.[0-9]+)?[BKMGTP][[:space:]]+.*README\.md$' >/dev/null
+else
+  du_ver="$("$EXTRACT_DIR/du" --version)"
+  echo "du --version:      $du_ver"
+  if ! printf '%s\n' "$du_ver" | grep -E '^du \(hyperdu\) ' >/dev/null; then
+    echo "Error: unexpected du --version output: $du_ver" >&2
+    exit 1
+  fi
 fi
 
 # Verify PATH lookup precedence with extracted binaries

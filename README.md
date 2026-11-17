@@ -57,7 +57,11 @@ tar -xzf hyperdu-linux-x64.tar.gz
 
 ## Use as `du`
 
-When invoked as `du` or `gdu` (via symlink on a Native AOT binary), or via `hyperdu du [OPTIONS] [FILE]...`, `hyperdu` runs in GNU-compatible `du` mode with identical output format and no TUI banner (`du --version` prints `du (hyperdu) <version>` rather than claiming to be GNU coreutils). Running `hyperdu` without the `du` subcommand still launches the interactive explorer.
+When invoked as `du` or `gdu` (via symlink on a Native AOT binary), or via `hyperdu du` / `hyperdu gdu`, `hyperdu` runs in non-interactive `du` mode with identical output format and no TUI banner. Running `hyperdu` without a `du`/`gdu` subcommand still launches the interactive explorer.
+
+* **Linux (and `gdu` on all platforms):** runs the **GNU `du` dialect** (1024-byte default blocks, `--apparent-size`, `-b`, `--block-size`, `--exclude`, `--files0-from`, `--inodes`, `--time`, `--max-depth`, and `du (hyperdu) <version>` for `--version`).
+* **macOS (`du` symlink / `hyperdu du` on Darwin):** runs the **BSD / macOS `/usr/bin/du` dialect** (512-byte default blocks, `BLOCKSIZE` env var, `-A` apparent blocks, `-B` blocksize, `-g` 1 GiB blocks, `-h` BSD `humanize_number` formatting, `-I` basename ignore mask repeatable, `-n` `UF_NODUMP` filter, `-r`, `-d depth`, `--si`, `-t threshold`, and BSD `usage:` errors). Use `gdu` (or `HYPERDU_DU_DIALECT=gnu`) on macOS when GNU `du` behavior is required.
+* **Dialect override (`HYPERDU_DU_DIALECT`):** set `HYPERDU_DU_DIALECT=bsd` or `HYPERDU_DU_DIALECT=gnu` to force a dialect in scripts regardless of symlink name or OS.
 
 ### Option A: System-wide install (`/usr/local/bin`, works with `sudo` and scripts)
 
@@ -85,7 +89,7 @@ Add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup file (`~/.profi
 * **Never overwrite `/usr/bin/du`.** `/usr/bin` is owned by your OS package manager (`apt`, `dnf`, `pacman`) or macOS SIP; OS updates will overwrite it or fail integrity checks. Putting `hyperdu`, `du`, and `gdu` in `/usr/local/bin` or `~/.local/bin` ahead of `/usr/bin` overrides `du` cleanly and is easy to remove (`rm -f /usr/local/bin/du /usr/local/bin/gdu /usr/local/bin/hyperdu`).
 * **`sudo` uses `secure_path`.** `sudo` resets `PATH` (typically omitting `~/.local/bin`). If `sudo du` or root/cron scripts must resolve to `hyperdu`, install into `/usr/local/bin`.
 * **Shell aliases do not affect scripts.** `alias du='hyperdu du'` only applies in interactive shells; scripts, `cron`, `make`, `xargs`, and `find -exec` bypass aliases. Use symlinks on `PATH` instead.
-* **Thread control (`HYPERDU_THREADS`).** `du` mode accepts only GNU `du` flags, so override worker count with `HYPERDU_THREADS=<N>` when needed (by default it keeps tiny scans inline, limits rotational Linux HDDs to 1 worker, and scales up on SSDs and network mounts).
+* **Thread control (`HYPERDU_THREADS`).** `du` mode preserves native `du` flags, so override worker count with `HYPERDU_THREADS=<N>` when needed (by default it keeps tiny scans inline, limits rotational Linux HDDs to 1 worker, and scales up on SSDs and network mounts).
 
 ### `.NET tool` limitations and wrapper script
 

@@ -26,12 +26,16 @@ internal static class GetoptLong
         string programName,
         Stream stderr,
         out List<ParsedOption> options,
-        out List<string> operands)
+        out List<string> operands,
+        bool bsdMode = false)
     {
         options = [];
         operands = [];
 
-        bool posixlyCorrect = Environment.GetEnvironmentVariable("POSIXLY_CORRECT") != null;
+        bool envPosixlyCorrect = Environment.GetEnvironmentVariable("POSIXLY_CORRECT") != null;
+        bool stopAtNonOption = bsdMode || envPosixlyCorrect || shortOpts.StartsWith('+');
+        string normalizedShortOpts = shortOpts.StartsWith('+') ? shortOpts[1..] : shortOpts;
+        string diagName = bsdMode ? Messages.BsdProgramName(programName) : programName;
         int i = 0;
 
         while (i < args.Length)
@@ -50,7 +54,7 @@ internal static class GetoptLong
             {
                 operands.Add(arg);
                 i++;
-                if (posixlyCorrect)
+                if (stopAtNonOption)
                 {
                     while (i < args.Length)
                         operands.Add(args[i++]);
@@ -62,14 +66,14 @@ internal static class GetoptLong
 
             if (arg.StartsWith("--", StringComparison.Ordinal))
             {
-                if (!ParseLongOption(args, ref i, arg, longOpts, programName, stderr, out ParsedOption? parsed))
+                if (!ParseLongOption(args, ref i, arg, longOpts, diagName, stderr, bsdMode, out ParsedOption? parsed))
                     return false;
 
                 options.Add(parsed!);
                 continue;
             }
 
-            if (!ParseShortCluster(args, ref i, arg, shortOpts, programName, stderr, options))
+            if (!ParseShortCluster(args, ref i, arg, normalizedShortOpts, diagName, stderr, bsdMode, envPosixlyCorrect, options))
                 return false;
         }
 
@@ -83,6 +87,7 @@ internal static class GetoptLong
         IReadOnlyList<LongOption> longOpts,
         string programName,
         Stream stderr,
+        bool bsdMode,
         out ParsedOption? parsed)
     {
         parsed = null;
@@ -144,7 +149,10 @@ internal static class GetoptLong
         }
         else
         {
-            Messages.WriteError(stderr, programName, $"unrecognized option '--{namePart}'");
+            string msg = bsdMode
+                ? $"unrecognized option `--{namePart}'"
+                : $"unrecognized option '--{namePart}'";
+            Messages.WriteError(stderr, programName, msg);
             return false;
         }
 
@@ -154,7 +162,10 @@ internal static class GetoptLong
             case ArgumentRequirement.NoArgument:
                 if (inlineArg != null)
                 {
-                    Messages.WriteError(stderr, programName, $"option '--{selected.Name}' doesn't allow an argument");
+                    string msg = bsdMode
+                        ? $"option `--{selected.Name}' doesn't allow an argument"
+                        : $"option '--{selected.Name}' doesn't allow an argument";
+                    Messages.WriteError(stderr, programName, msg);
                     return false;
                 }
 
@@ -174,7 +185,10 @@ internal static class GetoptLong
 
                 if (index >= args.Length)
                 {
-                    Messages.WriteError(stderr, programName, $"option '--{selected.Name}' requires an argument");
+                    string msg = bsdMode
+                        ? $"option `--{selected.Name}' requires an argument"
+                        : $"option '--{selected.Name}' requires an argument";
+                    Messages.WriteError(stderr, programName, msg);
                     return false;
                 }
 
@@ -193,6 +207,8 @@ internal static class GetoptLong
         string shortOpts,
         string programName,
         Stream stderr,
+        bool bsdMode,
+        bool envPosixlyCorrect,
         List<ParsedOption> options)
     {
         index++;
@@ -201,7 +217,10 @@ internal static class GetoptLong
             char c = arg[cIndex];
             if (!TryLookupShortOption(shortOpts, c, out ArgumentRequirement req))
             {
-                Messages.WriteError(stderr, programName, $"invalid option -- '{c}'");
+                string msg = bsdMode
+                    ? (envPosixlyCorrect ? $"illegal option -- {c}" : $"invalid option -- {c}")
+                    : $"invalid option -- '{c}'";
+                Messages.WriteError(stderr, programName, msg);
                 return false;
             }
 
@@ -228,7 +247,10 @@ internal static class GetoptLong
 
                     if (index >= args.Length)
                     {
-                        Messages.WriteError(stderr, programName, $"option requires an argument -- '{c}'");
+                        string msg = bsdMode
+                            ? $"option requires an argument -- {c}"
+                            : $"option requires an argument -- '{c}'";
+                        Messages.WriteError(stderr, programName, msg);
                         return false;
                     }
 

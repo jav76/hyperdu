@@ -44,6 +44,9 @@ internal static class DuCommand
             if (outcome == DuParseOutcome.ExitSuccess)
                 return 0;
 
+            if (outcome == DuParseOutcome.ExitUsage)
+                return 64;
+
             if (outcome != DuParseOutcome.Run || options == null)
                 return 1;
 

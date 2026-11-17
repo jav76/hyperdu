@@ -13,6 +13,7 @@ public sealed class ExcludeMatcher
     private readonly List<byte[]> _patterns = [];
 
     public bool IsEmpty => _patterns.Count == 0;
+    public bool MatchBasenameOnly { get; set; }
 
     public void AddPattern(string pattern)
     {
@@ -32,6 +33,7 @@ public sealed class ExcludeMatcher
 
     internal void CopyFrom(ExcludeMatcher source)
     {
+        MatchBasenameOnly = source.MatchBasenameOnly;
         foreach (byte[] pattern in source._patterns)
             _patterns.Add((byte[])pattern.Clone());
     }
@@ -168,9 +170,26 @@ public sealed class ExcludeMatcher
         if (_patterns.Count == 0 || path.IsEmpty)
             return false;
 
+        if (MatchBasenameOnly)
+            return IsExcludedChildBasename(DuAccounting.ExtractBasename(path));
+
         foreach (byte[] pattern in _patterns)
         {
             if (MatchesPathOrSuffix(pattern, path))
+                return true;
+        }
+
+        return false;
+    }
+
+    public bool IsExcludedChildBasename(ReadOnlySpan<byte> childBasename)
+    {
+        if (_patterns.Count == 0)
+            return false;
+
+        foreach (byte[] pattern in _patterns)
+        {
+            if (Fnmatch(pattern, childBasename))
                 return true;
         }
 

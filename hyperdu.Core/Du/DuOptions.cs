@@ -2,11 +2,18 @@ using System.Globalization;
 
 namespace hyperdu.Core.Du;
 
+public enum DuDialect
+{
+    Gnu,
+    Bsd
+}
+
 public enum DuParseOutcome
 {
     Run,
     ExitSuccess,
-    ExitFailure
+    ExitFailure,
+    ExitUsage
 }
 
 public enum SymlinkPolicy
@@ -17,7 +24,7 @@ public enum SymlinkPolicy
 }
 
 /// <summary>
-/// Full GNU du option table parser across Phases 1 through 3.
+/// Full GNU and BSD/macOS du option parser supporting HYPERDU_DU_DIALECT and platform persona rules.
 /// </summary>
 public sealed class DuOptions
 {
@@ -32,6 +39,7 @@ public sealed class DuOptions
     private const int OptVersion = 264;
 
     private const string ShortOptions = "0aB:bcDd:HhklLmPsSt:X:x";
+    private const string BsdShortOptions = "+AB:HI:LPasd:cghklmnrt:x";
 
     // Preserves GNU du.c long_options ordering so ambiguous prefixes match GNU du output.
     private static readonly LongOption[] LongOptions =
@@ -63,6 +71,17 @@ public sealed class DuOptions
         new("version", ArgumentRequirement.NoArgument, OptVersion)
     ];
 
+    private static readonly LongOption[] BsdLongOptions =
+    [
+        new("si", ArgumentRequirement.NoArgument, OptSi)
+    ];
+
+    public DuDialect Dialect { get; private set; } = DuDialect.Gnu;
+    public bool IgnoreNoDump { get; private set; }
+    internal ulong BsdCountDivisor { get; private set; } = 1;
+    internal ulong BsdCountBytesPerUnit { get; private set; } = 512;
+    internal ulong BsdDisplayDenominator { get; private set; } = 1;
+
     public bool NullTerminator { get; private set; }
     public bool All { get; private set; }
     public bool ApparentSize { get; private set; }
@@ -84,6 +103,33 @@ public sealed class DuOptions
     public BlockSizeSpec BlockSizeSpec { get; private set; }
     public IReadOnlyList<string> Operands { get; private set; } = [];
 
+    public static DuDialect ResolveDialect(string programName)
+    {
+        string? envDialect = Environment.GetEnvironmentVariable("HYPERDU_DU_DIALECT");
+        if (string.Equals(envDialect, "bsd", StringComparison.OrdinalIgnoreCase))
+            return DuDialect.Bsd;
+        if (string.Equals(envDialect, "gnu", StringComparison.OrdinalIgnoreCase))
+            return DuDialect.Gnu;
+
+        string baseName = Messages.BsdProgramName(programName);
+        if (string.Equals(baseName, "gdu", StringComparison.Ordinal))
+            return DuDialect.Gnu;
+        if (string.Equals(baseName, "du", StringComparison.Ordinal))
+            return OperatingSystem.IsMacOS() ? DuDialect.Bsd : DuDialect.Gnu;
+
+        return DuDialect.Gnu;
+    }
+
+    internal ulong ComputeBsdDisplayBlocks(ulong countedUnits)
+    {
+        if (countedUnits == 0)
+            return 0UL;
+
+        UInt128 scaled = (UInt128)countedUnits * BsdCountDivisor;
+        ulong denom = BsdDisplayDenominator;
+        return denom <= 1UL ? (ulong)scaled : (ulong)((scaled + denom - 1) / denom);
+    }
+
     public static DuParseOutcome Parse(
         string[] args,
         string programName,
@@ -103,6 +149,9 @@ public sealed class DuOptions
         out DuOptions? parsedOptions)
     {
         parsedOptions = null;
+
+        if (ResolveDialect(programName) == DuDialect.Bsd)
+            return ParseBsd(args, programName, stderr, out parsedOptions);
 
         if (!GetoptLong.TryParse(args, ShortOptions, LongOptions, programName, stderr, out List<ParsedOption> opts, out List<string> operands))
         {
@@ -338,6 +387,221 @@ public sealed class DuOptions
         parsedOptions = result;
         return DuParseOutcome.Run;
     }
+
+    private static DuParseOutcome ParseBsd(
+        string[] args,
+        string programName,
+        Stream stderr,
+        out DuOptions? parsedOptions)
+    {
+        parsedOptions = null;
+        string diagName = Messages.BsdProgramName(programName);
+
+        if (!GetoptLong.TryParse(args, BsdShortOptions, BsdLongOptions, programName, stderr, out List<ParsedOption> opts, out List<string> operands, bsdMode: true))
+        {
+            Messages.WriteUtf8(stderr, BsdUsageText);
+            return DuParseOutcome.ExitUsage;
+        }
+
+        DuOptions result = new()
+        {
+            Dialect = DuDialect.Bsd
+        };
+
+        bool aFlag = false;
+        bool sFlag = false;
+        bool dFlag = false;
+        ulong? rawDisplayBlockSize = null;
+        HumanMode humanMode = HumanMode.None;
+        ulong countBlockSize = 512UL;
+        bool hasThreshold = false;
+        ulong rawThresholdBytes = 0;
+        bool thresholdNegative = false;
+
+        foreach (ParsedOption opt in opts)
+        {
+            switch (opt.Value)
+            {
+                case 'A':
+                    result.ApparentSize = true;
+                    break;
+
+                case 'B':
+                {
+                    string rawArg = opt.Argument ?? string.Empty;
+                    if (!BlockSize.TryParseBsdAtoi(rawArg, out int bVal, out _) || bVal <= 0)
+                    {
+                        Messages.WriteError(stderr, diagName, $"invalid argument to option B: {rawArg}");
+                        Messages.WriteUtf8(stderr, BsdUsageText);
+                        return DuParseOutcome.ExitUsage;
+                    }
+
+                    countBlockSize = (ulong)bVal;
+                    break;
+                }
+
+                case 'H':
+                    result.SymlinkPolicy = SymlinkPolicy.DereferenceArgs;
+                    break;
+
+                case 'I':
+                    result.Excludes.MatchBasenameOnly = true;
+                    result.Excludes.AddPattern(opt.Argument ?? string.Empty);
+                    break;
+
+                case 'L':
+                    result.SymlinkPolicy = SymlinkPolicy.DereferenceAll;
+                    break;
+
+                case 'P':
+                    result.SymlinkPolicy = SymlinkPolicy.NoDereference;
+                    break;
+
+                case 'a':
+                    aFlag = true;
+                    result.All = true;
+                    break;
+
+                case 's':
+                    sFlag = true;
+                    result.Summarize = true;
+                    break;
+
+                case 'd':
+                {
+                    dFlag = true;
+                    string rawDepth = opt.Argument ?? string.Empty;
+                    if (!BlockSize.TryParseBsdAtoi(rawDepth, out int parsedDepth, out _) || parsedDepth < 0)
+                    {
+                        Messages.WriteError(stderr, diagName, $"invalid argument to option d: {rawDepth}");
+                        Messages.WriteUtf8(stderr, BsdUsageText);
+                        return DuParseOutcome.ExitUsage;
+                    }
+
+                    result.MaxDepth = (ulong)parsedDepth;
+                    break;
+                }
+
+                case 'c':
+                    result.Total = true;
+                    break;
+
+                case 'g':
+                    humanMode = HumanMode.None;
+                    rawDisplayBlockSize = 1073741824UL;
+                    break;
+
+                case 'h':
+                    humanMode = HumanMode.BsdBinary;
+                    break;
+
+                case 'k':
+                    humanMode = HumanMode.None;
+                    rawDisplayBlockSize = 1024UL;
+                    break;
+
+                case 'l':
+                    result.CountLinks = true;
+                    break;
+
+                case 'm':
+                    humanMode = HumanMode.None;
+                    rawDisplayBlockSize = 1048576UL;
+                    break;
+
+                case 'n':
+                    result.IgnoreNoDump = true;
+                    break;
+
+                case 'r':
+                    break;
+
+                case 't':
+                {
+                    string rawThresh = opt.Argument ?? string.Empty;
+                    if (!BlockSize.TryParseBsdExpandNumber(rawThresh, out long parsedThresh) || parsedThresh == 0)
+                    {
+                        Messages.WriteError(stderr, diagName, $"invalid threshold: {rawThresh}");
+                        Messages.WriteUtf8(stderr, BsdUsageText);
+                        return DuParseOutcome.ExitUsage;
+                    }
+
+                    hasThreshold = true;
+                    if (parsedThresh < 0)
+                    {
+                        thresholdNegative = true;
+                        rawThresholdBytes = parsedThresh == long.MinValue
+                            ? 0x8000000000000000UL
+                            : (ulong)(-parsedThresh);
+                    }
+                    else
+                    {
+                        thresholdNegative = false;
+                        rawThresholdBytes = (ulong)parsedThresh;
+                    }
+                    break;
+                }
+
+                case 'x':
+                    result.OneFileSystem = true;
+                    break;
+
+                case OptSi:
+                    humanMode = HumanMode.BsdSi;
+                    break;
+            }
+        }
+
+        if ((aFlag ? 1 : 0) + (dFlag ? 1 : 0) + (sFlag ? 1 : 0) > 1)
+        {
+            Messages.WriteUtf8(stderr, BsdUsageText);
+            return DuParseOutcome.ExitUsage;
+        }
+
+        if (sFlag)
+            result.MaxDepth = 0;
+
+        if (!result.ApparentSize && (countBlockSize % 512UL) != 0)
+            countBlockSize = ((countBlockSize + 511UL) / 512UL) * 512UL;
+
+        ulong resolvedBlockSize = rawDisplayBlockSize ?? BlockSize.ResolveBsdBlockSize(diagName, stderr);
+        if (!result.ApparentSize)
+        {
+            result.BsdCountDivisor = Math.Max(1UL, countBlockSize / 512UL);
+            result.BsdCountBytesPerUnit = result.BsdCountDivisor * 512UL;
+            result.BsdDisplayDenominator = Math.Max(1UL, resolvedBlockSize / 512UL);
+        }
+        else
+        {
+            result.BsdCountDivisor = countBlockSize;
+            result.BsdCountBytesPerUnit = countBlockSize;
+            result.BsdDisplayDenominator = resolvedBlockSize;
+        }
+
+        if (hasThreshold)
+        {
+            // Mirrors Apple du.c: howmany((threshold / DEV_BSIZE) * cblocksize, blocksize)
+            UInt128 scaledNum = (UInt128)(rawThresholdBytes / 512UL) * result.BsdCountDivisor;
+            ulong scaledThresh = result.BsdDisplayDenominator <= 1UL
+                ? (ulong)scaledNum
+                : (ulong)((scaledNum + result.BsdDisplayDenominator - 1) / result.BsdDisplayDenominator);
+            result.Threshold = new ThresholdSpec(thresholdNegative, scaledThresh);
+        }
+
+        result.BlockSizeSpec = humanMode switch
+        {
+            HumanMode.BsdBinary => BlockSizeSpec.BsdHumanBinary,
+            HumanMode.BsdSi => BlockSizeSpec.BsdHumanSi,
+            _ => new BlockSizeSpec(resolvedBlockSize, HumanMode.None, null, false)
+        };
+
+        result.Operands = operands.Count > 0 ? operands : ["."];
+        parsedOptions = result;
+        return DuParseOutcome.Run;
+    }
+
+    internal const string BsdUsageText =
+        "usage: du [-Aclnx] [-H | -L | -P] [-g | -h | -k | -m] [-a | -s | -d depth] [-B blocksize] [-I mask] [-t threshold] [file ...]\n";
 
     private static bool TryParseDepth(string raw, out ulong depth)
     {
