@@ -17,7 +17,6 @@ internal static unsafe class DuAccounting
 {
     internal const int DirentReadBufferSize = 65536;
     internal const int InodeSortThreshold = 10000;
-    private static readonly int SegmentPathLimit = OperatingSystem.IsMacOS() ? 900 : 3800;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static ulong ComputeEntryValue(in NativeStat stat, DuOptions options)
@@ -25,10 +24,7 @@ internal static unsafe class DuAccounting
         if (options.Inodes)
             return 1UL;
 
-        if (options.ApparentSize)
-            return stat.Kind == NativeEntryKind.Directory || stat.Size <= 0 ? 0UL : (ulong)stat.Size;
-
-        return stat.Blocks > 0 ? (ulong)stat.Blocks * 512UL : 0UL;
+        return (ulong)NativeIo.ComputeEntryByteSize(in stat, options.ApparentSize);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -130,126 +126,27 @@ internal static unsafe class DuAccounting
     /// </summary>
     internal static void OpenDirectoryPathSafe(
         ReadOnlySpan<byte> nullTermPath,
-        bool followSymlinks,
         out int dirFd,
         out NativeDirectory? fallbackDir,
         out int errno)
     {
-        int pathLen = nullTermPath.Length > 0 && nullTermPath[^1] == 0
-            ? nullTermPath.Length - 1
-            : nullTermPath.Length;
-
-        if (followSymlinks || pathLen < SegmentPathLimit)
+        if (!NativeIo.TryOpenDirectoryFdPathSafe(nullTermPath, out int fd, out errno))
         {
-            OpenRootDirectory(nullTermPath, out dirFd, out fallbackDir, out errno);
+            dirFd = -1;
+            fallbackDir = null;
             return;
         }
 
-        OpenDirectoryBeyondPathMax(nullTermPath[..pathLen], out dirFd, out fallbackDir, out errno);
-    }
-
-    private static void OpenDirectoryBeyondPathMax(
-        ReadOnlySpan<byte> path,
-        out int dirFd,
-        out NativeDirectory? fallbackDir,
-        out int errno)
-    {
-        byte[] segBuf = ArrayPool<byte>.Shared.Rent(SegmentPathLimit + 256);
-        int curFd = -1;
-        try
+        if (NativeIo.UsesGetdents64)
         {
-            int pos = 0;
-            bool first = true;
-            while (pos < path.Length)
-            {
-                if (!first)
-                {
-                    while (pos < path.Length && path[pos] == (byte)'/')
-                        pos++;
-                    if (pos >= path.Length)
-                        break;
-                }
-
-                int maxEnd = Math.Min(path.Length, pos + SegmentPathLimit);
-                int chunkEnd = maxEnd;
-                if (maxEnd < path.Length)
-                {
-                    int slash = path[pos..maxEnd].LastIndexOf((byte)'/');
-                    if (slash > 0)
-                        chunkEnd = pos + slash;
-                    else
-                    {
-                        int nextSlash = path[pos..].IndexOf((byte)'/');
-                        chunkEnd = nextSlash >= 0 ? pos + nextSlash : path.Length;
-                    }
-                }
-
-                int chunkLen = chunkEnd - pos;
-                if (chunkLen == 0)
-                    break;
-
-                if (chunkLen + 1 > segBuf.Length)
-                {
-                    byte[] grown = ArrayPool<byte>.Shared.Rent(chunkLen + 1);
-                    ArrayPool<byte>.Shared.Return(segBuf);
-                    segBuf = grown;
-                }
-
-                path.Slice(pos, chunkLen).CopyTo(segBuf);
-                segBuf[chunkLen] = 0;
-
-                int nextFd;
-                fixed (byte* pSeg = segBuf)
-                {
-                    errno = first
-                        ? NativeIo.OpenRawDirectoryFd(pSeg, out nextFd)
-                        : NativeIo.OpenRawDirectoryFdRelative(curFd, pSeg, out nextFd);
-                }
-
-                if (curFd >= 0)
-                    _ = Libc.close(curFd);
-
-                if (errno != 0)
-                {
-                    dirFd = -1;
-                    fallbackDir = null;
-                    return;
-                }
-
-                curFd = nextFd;
-                pos = chunkEnd;
-                first = false;
-            }
-
-            if (curFd < 0)
-            {
-                OpenRootDirectory("/\0"u8, out dirFd, out fallbackDir, out errno);
-                return;
-            }
-
-            if (NativeIo.UsesGetdents64)
-            {
-                dirFd = curFd;
-                fallbackDir = null;
-                errno = 0;
-                return;
-            }
-
-            fallbackDir = NativeDirectory.WrapFd(curFd, out errno);
-            if (errno != 0)
-            {
-                _ = Libc.close(curFd);
-                dirFd = -1;
-                fallbackDir = null;
-                return;
-            }
-
-            dirFd = fallbackDir?.Fd ?? -1;
+            dirFd = fd;
+            fallbackDir = null;
+            return;
         }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(segBuf);
-        }
+
+        // WrapFd closes fd when fdopendir fails.
+        fallbackDir = NativeDirectory.WrapFd(fd, out errno);
+        dirFd = fallbackDir?.Fd ?? -1;
     }
 
     internal static void OpenChildDirectory(

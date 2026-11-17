@@ -247,7 +247,10 @@ public class InteractiveNavigator
         List<(string Name, long Size)> files = new List<(string Name, long Size)>();
         try
         {
-            files = DirectoryListing.ListFiles(dir, _scanner?.Options.UseNativeIo ?? true);
+            files = DirectoryListing.ListFiles(
+                dir,
+                _scanner?.Options.UseNativeIo ?? true,
+                _scanner?.Options.ApparentSize ?? false);
             files.Sort((a, b) => b.Size.CompareTo(a.Size));
         }
         catch

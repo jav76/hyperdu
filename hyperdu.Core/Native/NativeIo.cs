@@ -579,6 +579,253 @@ internal static unsafe class NativeIo
         }
     }
 
+    private static readonly int SegmentPathLimit = IsMacOS ? 900 : 3800;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static long ComputeEntryByteSize(in NativeStat stat, bool apparentSize)
+    {
+        if (apparentSize)
+            return stat.Kind == NativeEntryKind.Directory || stat.Size <= 0 ? 0L : stat.Size;
+
+        return stat.Blocks > 0 ? stat.Blocks * 512L : 0L;
+    }
+
+    /// <summary>
+    /// Opens a directory file descriptor for a null-terminated path even when its total length
+    /// exceeds PATH_MAX by stepping relative chunks through openat().
+    /// </summary>
+    internal static bool TryOpenDirectoryFdPathSafe(ReadOnlySpan<byte> nullTermPath, out int dirFd, out int errno)
+    {
+        int pathLen = nullTermPath.Length > 0 && nullTermPath[^1] == 0
+            ? nullTermPath.Length - 1
+            : nullTermPath.Length;
+
+        if (pathLen == 0)
+        {
+            dirFd = -1;
+            errno = Libc.ENOENT;
+            return false;
+        }
+
+        if (pathLen < SegmentPathLimit)
+        {
+            fixed (byte* pPath = nullTermPath)
+            {
+                errno = OpenRawDirectoryFd(pPath, out dirFd);
+            }
+
+            if (errno == 0 && dirFd >= 0)
+                return true;
+
+            dirFd = -1;
+            return false;
+        }
+
+        return OpenDirectoryFdBeyondPathMax(nullTermPath[..pathLen], out dirFd, out errno);
+    }
+
+    private static bool OpenDirectoryFdBeyondPathMax(ReadOnlySpan<byte> path, out int dirFd, out int errno)
+    {
+        byte[] segBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(SegmentPathLimit + 256);
+        int curFd = -1;
+        errno = 0;
+        try
+        {
+            int pos = 0;
+            bool first = true;
+            while (pos < path.Length)
+            {
+                if (!first)
+                {
+                    while (pos < path.Length && path[pos] == (byte)'/')
+                        pos++;
+                    if (pos >= path.Length)
+                        break;
+                }
+
+                int maxEnd = Math.Min(path.Length, pos + SegmentPathLimit);
+                int chunkEnd = maxEnd;
+                if (maxEnd < path.Length)
+                {
+                    int searchStart = first && path[pos] == (byte)'/' ? pos + 1 : pos;
+                    int slash = path[searchStart..maxEnd].LastIndexOf((byte)'/');
+                    if (slash >= 0)
+                    {
+                        chunkEnd = searchStart + slash;
+                    }
+                    else
+                    {
+                        int nextSlash = path[searchStart..].IndexOf((byte)'/');
+                        chunkEnd = nextSlash >= 0 ? searchStart + nextSlash : path.Length;
+                    }
+                }
+
+                int chunkLen = chunkEnd - pos;
+                if (chunkLen == 0)
+                    break;
+
+                if (chunkLen + 1 > segBuf.Length)
+                {
+                    byte[] grown = System.Buffers.ArrayPool<byte>.Shared.Rent(chunkLen + 1);
+                    System.Buffers.ArrayPool<byte>.Shared.Return(segBuf);
+                    segBuf = grown;
+                }
+
+                path.Slice(pos, chunkLen).CopyTo(segBuf);
+                segBuf[chunkLen] = 0;
+
+                int nextFd;
+                fixed (byte* pSeg = segBuf)
+                {
+                    errno = first
+                        ? OpenRawDirectoryFd(pSeg, out nextFd)
+                        : OpenRawDirectoryFdRelative(curFd, pSeg, out nextFd);
+                }
+
+                CloseFd(curFd);
+
+                if (errno != 0 || nextFd < 0)
+                {
+                    dirFd = -1;
+                    return false;
+                }
+
+                curFd = nextFd;
+                pos = chunkEnd;
+                first = false;
+            }
+
+            if (curFd < 0)
+            {
+                if (!path.SequenceEqual("/"u8))
+                {
+                    dirFd = -1;
+                    errno = Libc.ENOENT;
+                    return false;
+                }
+
+                ReadOnlySpan<byte> root = "/\0"u8;
+                fixed (byte* pRoot = root)
+                {
+                    errno = OpenRawDirectoryFd(pRoot, out curFd);
+                }
+            }
+
+            if (errno != 0 || curFd < 0)
+            {
+                dirFd = -1;
+                return false;
+            }
+
+            dirFd = curFd;
+            errno = 0;
+            return true;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(segBuf);
+        }
+    }
+
+    internal static bool DirectoryExistsPathSafe(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return false;
+
+        if (Directory.Exists(path))
+            return true;
+
+        if (!IsSupported)
+            return false;
+
+        int maxBytes = System.Text.Encoding.UTF8.GetMaxByteCount(path.Length) + 1;
+        byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(maxBytes);
+        try
+        {
+            int len = System.Text.Encoding.UTF8.GetBytes(path, rented);
+            rented[len] = 0;
+            if (!TryOpenDirectoryFdPathSafe(rented.AsSpan(0, len + 1), out int fd, out _))
+                return false;
+
+            try
+            {
+                byte* statBuf = stackalloc byte[StatBufferSize];
+                ReadOnlySpan<byte> dot = ".\0"u8;
+                fixed (byte* pDot = dot)
+                {
+                    return TryStatAt(fd, pDot, followSymlinks: false, statBuf, out NativeStat stat) &&
+                           stat.Kind == NativeEntryKind.Directory;
+                }
+            }
+            finally
+            {
+                CloseFd(fd);
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    internal static bool TryGetMacOsMountInfo(string path, out string fsTypeName, out string mountFromName)
+    {
+        fsTypeName = string.Empty;
+        mountFromName = string.Empty;
+
+        if (!IsMacOS || string.IsNullOrEmpty(path))
+            return false;
+
+        try
+        {
+            int maxBytes = System.Text.Encoding.UTF8.GetMaxByteCount(path.Length) + 1;
+            byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(maxBytes);
+            try
+            {
+                int len = System.Text.Encoding.UTF8.GetBytes(path, rented);
+                rented[len] = 0;
+
+                byte* buf = stackalloc byte[2200];
+                new Span<byte>(buf, 2200).Clear();
+
+                int rc;
+                fixed (byte* pPath = rented)
+                {
+                    rc = s_platform == Platform.MacOSInode64
+                        ? Libc.statfs_inode64(pPath, buf)
+                        : Libc.statfs(pPath, buf);
+                }
+
+                if (rc != 0)
+                    return false;
+
+                // XNU __DARWIN_STRUCT_STATFS64: f_fstypename[16] at offset 72, f_mntfromname[1024] at offset 1112.
+                ReadOnlySpan<byte> fsTypeSpan = MemoryMarshal.CreateReadOnlySpanFromNullTerminated(buf + 72);
+                if (fsTypeSpan.Length > 16)
+                    fsTypeSpan = fsTypeSpan[..16];
+                fsTypeName = System.Text.Encoding.UTF8.GetString(fsTypeSpan);
+
+                ReadOnlySpan<byte> mntFromSpan = MemoryMarshal.CreateReadOnlySpanFromNullTerminated(buf + 1112);
+                if (mntFromSpan.Length > 1024)
+                    mntFromSpan = mntFromSpan[..1024];
+                mountFromName = System.Text.Encoding.UTF8.GetString(mntFromSpan);
+                return true;
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+        catch (DllNotFoundException)
+        {
+            return false;
+        }
+    }
+
     /// <summary>
     /// Matches gnulib fts_build inode-sort filesystem check: on Linux local block filesystems
     /// (everything except tmpfs, ramfs, and NFS), sorting large directories by d_ino avoids random disk seeks

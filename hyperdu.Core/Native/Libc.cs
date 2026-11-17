@@ -123,6 +123,12 @@ internal static unsafe partial class Libc
     [LibraryImport(Lib, EntryPoint = "fstatat$INODE64")]
     internal static partial int fstatat_inode64(int dirFd, byte* path, byte* statBuffer, int flags);
 
+    [LibraryImport(Lib, EntryPoint = "statfs")]
+    internal static partial int statfs(byte* path, byte* buf);
+
+    [LibraryImport(Lib, EntryPoint = "statfs$INODE64")]
+    internal static partial int statfs_inode64(byte* path, byte* buf);
+
     [LibraryImport(Lib)]
     internal static partial void tzset();
 

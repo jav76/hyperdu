@@ -5,6 +5,9 @@ public class ScanOptions
     public int WorkerCount { get; set; } = Environment.ProcessorCount;
     public bool FollowSymlinks { get; set; } = false;
     public bool SkipHidden { get; set; } = false;
+    public bool ApparentSize { get; set; } = false;
+    public bool CountLinks { get; set; } = false;
+    public bool OneFileSystem { get; set; } = false;
     public List<string> ExcludedPaths { get; set; } = new();
 
     /// <summary>
