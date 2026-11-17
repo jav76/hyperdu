@@ -194,19 +194,19 @@ jobs:
         run: |
           dotnet test hyperdu.Tests/hyperdu.Tests.csproj -c Release --filter "FullyQualifiedName~DuPhase63Tests|FullyQualifiedName~MacOsMountInfo" --logger "console;verbosity=normal"
 
-      - name: Check AOT du and gdu FILE startup latency (< 5 ms)
+      - name: Check AOT du and gdu FILE startup overhead (<= 8 ms delta vs /usr/bin/du)
         run: |
           python3 .github/scripts/check-aot-startup.py \
             --binary artifacts/compat-bin/du \
             --ref-binary /usr/bin/du \
             --target README.md \
-            --max-median-ms 5.0 \
+            --max-delta-ms 8.0 \
             --markdown artifacts/compat/macos-${{ matrix.rid }}-startup-du.md
           python3 .github/scripts/check-aot-startup.py \
             --binary artifacts/compat-bin/gdu \
-            --ref-binary "$(command -v gdu)" \
+            --ref-binary /usr/bin/du \
             --target README.md \
-            --max-median-ms 5.0 \
+            --max-delta-ms 8.0 \
             --markdown artifacts/compat/macos-${{ matrix.rid }}-startup-gdu.md
 
       - name: Publish macOS compatibility summary

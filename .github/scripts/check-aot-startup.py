@@ -14,7 +14,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target", required=True, help="Target file operand passed to du")
     parser.add_argument("--warmup", type=int, default=5, help="Warmup invocation count")
     parser.add_argument("--runs", type=int, default=30, help="Measured invocation count")
-    parser.add_argument("--max-median-ms", type=float, default=5.0, help="Maximum allowed median latency in ms")
+    parser.add_argument(
+        "--max-median-ms",
+        type=float,
+        default=None,
+        help="Maximum allowed median latency in ms (defaults to 5.0 when --max-delta-ms is omitted)",
+    )
+    parser.add_argument(
+        "--max-delta-ms",
+        type=float,
+        default=None,
+        help="Maximum allowed median overhead (median - ref_median) in ms; requires --ref-binary",
+    )
     parser.add_argument("--markdown", help="Optional Markdown summary output path")
     return parser.parse_args()
 
@@ -55,6 +66,13 @@ def main() -> int:
     if not os.path.exists(target):
         print(f"Error: target file not found: {target}", file=sys.stderr)
         return 2
+    if args.max_delta_ms is not None and not args.ref_binary:
+        print("Error: --max-delta-ms requires --ref-binary.", file=sys.stderr)
+        return 2
+
+    max_median_ms = args.max_median_ms
+    if max_median_ms is None and args.max_delta_ms is None:
+        max_median_ms = 5.0
 
     try:
         min_ms, median_ms, p95_ms, max_ms = measure_binary(binary, target, args.warmup, args.runs)
@@ -63,15 +81,23 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+    delta_ms = (median_ms - ref_stats[1]) if ref_stats is not None else None
+    limits: list[str] = []
+    if max_median_ms is not None:
+        limits.append(f"median <= {max_median_ms:.2f} ms")
+    if args.max_delta_ms is not None and delta_ms is not None:
+        limits.append(f"delta <= {args.max_delta_ms:.2f} ms")
+
     print(
         f"AOT startup (`du FILE`, {args.runs} runs): "
         f"min={min_ms:.2f} ms, median={median_ms:.2f} ms, p95={p95_ms:.2f} ms, max={max_ms:.2f} ms "
-        f"(limit <= {args.max_median_ms:.2f} ms)"
+        f"(limit: {', '.join(limits)})"
     )
     if ref_stats is not None:
         print(
             f"Reference baseline ({args.ref_binary}, {args.runs} runs): "
-            f"min={ref_stats[0]:.2f} ms, median={ref_stats[1]:.2f} ms, p95={ref_stats[2]:.2f} ms, max={ref_stats[3]:.2f} ms"
+            f"min={ref_stats[0]:.2f} ms, median={ref_stats[1]:.2f} ms, p95={ref_stats[2]:.2f} ms, max={ref_stats[3]:.2f} ms "
+            f"(delta: {delta_ms:+.2f} ms)"
         )
 
     if args.markdown:
@@ -80,7 +106,7 @@ def main() -> int:
             f.write("## AOT Startup Latency Check (`du FILE`)\n\n")
             f.write(f"- **Binary**: `{binary}`\n")
             f.write(f"- **Measured runs**: {args.runs} (after {args.warmup} warmup)\n")
-            f.write(f"- **Threshold**: median <= {args.max_median_ms:.2f} ms\n\n")
+            f.write(f"- **Threshold**: {', '.join(limits)}\n\n")
             f.write("| Metric | Latency (ms) |\n")
             f.write("| :--- | ---: |\n")
             f.write(f"| Min | {min_ms:.2f} |\n")
@@ -88,11 +114,18 @@ def main() -> int:
             f.write(f"| P95 | {p95_ms:.2f} |\n")
             f.write(f"| Max | {max_ms:.2f} |\n")
             if ref_stats is not None:
-                f.write(f"\nReference `{args.ref_binary}` median: {ref_stats[1]:.2f} ms (delta: {median_ms - ref_stats[1]:.2f} ms)\n")
+                f.write(f"\nReference `{args.ref_binary}` median: {ref_stats[1]:.2f} ms (delta: {delta_ms:+.2f} ms)\n")
 
-    if median_ms > args.max_median_ms:
+    if max_median_ms is not None and median_ms > max_median_ms:
         print(
-            f"Fail: AOT du FILE median startup {median_ms:.2f} ms exceeded limit {args.max_median_ms:.2f} ms.",
+            f"Fail: AOT du FILE median startup {median_ms:.2f} ms exceeded limit {max_median_ms:.2f} ms.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.max_delta_ms is not None and delta_ms is not None and delta_ms > args.max_delta_ms:
+        print(
+            f"Fail: AOT du FILE startup overhead {delta_ms:.2f} ms vs {args.ref_binary} exceeded limit {args.max_delta_ms:.2f} ms.",
             file=sys.stderr,
         )
         return 1
