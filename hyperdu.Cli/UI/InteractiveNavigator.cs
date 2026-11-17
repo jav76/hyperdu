@@ -1,3 +1,4 @@
+using hyperdu.Core.Du;
 using hyperdu.Core.Models;
 using hyperdu.Core.Scanning;
 using Spectre.Console;
@@ -123,7 +124,13 @@ public class InteractiveNavigator
             else
             {
                 _selectedIndex = Math.Clamp(_selectedIndex, 0, Math.Max(0, items.Count - 1));
+                KeepSelectionInView();
             }
+        }
+        else if (items.Count == 0)
+        {
+            _selectedIndex = 0;
+            _scrollOffset = 0;
         }
     }
 
@@ -142,14 +149,15 @@ public class InteractiveNavigator
     private IRenderable CreateCombinedLayout(ExplorerRenderer renderer, List<NavigatorItem> items)
     {
         ParallelScanner? activeScanner = _activeRescanScanner ?? _scanner;
-        Table explorerTable = renderer.Render(_current, items, _selectedIndex, _scrollOffset, PageSize, activeScanner);
+        BlockSizeSpec displayBlockSize = _scanner?.Options.DisplayBlockSize ?? BlockSizeSpec.HumanBinary;
+        Table explorerTable = renderer.Render(_current, items, _selectedIndex, _scrollOffset, PageSize, activeScanner, displayBlockSize);
         if (activeScanner == null || !activeScanner.IsScanning) return explorerTable;
 
-        Panel progressPanel = CreateProgressPanel(activeScanner);
+        Panel progressPanel = CreateProgressPanel(activeScanner, displayBlockSize);
         return new Rows(progressPanel, explorerTable);
     }
 
-    private static Panel CreateProgressPanel(ParallelScanner scanner)
+    private static Panel CreateProgressPanel(ParallelScanner scanner, BlockSizeSpec displayBlockSize)
     {
         Table table = new Table().NoBorder().HideHeaders();
         table.AddColumn("Col1");
@@ -175,7 +183,7 @@ public class InteractiveNavigator
             new Markup($"[bold grey]Status:[/] {statusText}")
         );
         table.AddRow(
-            new Markup($"[bold grey]Size:[/] [bold green]{ExplorerRenderer.FormatSize(scanner.TotalBytesFound)}[/]"),
+            new Markup($"[bold grey]Size:[/] [bold green]{ExplorerRenderer.FormatSize(scanner.TotalBytesFound, displayBlockSize)}[/]"),
             new Markup($"[bold grey]Threads:[/] [bold yellow]{scanner.ActiveWorkers}[/]"),
             new Markup("")
         );
@@ -215,24 +223,35 @@ public class InteractiveNavigator
                 .ToList();
         }
 
+        ThresholdSpec? threshold = _scanner?.Options.Threshold;
         foreach (DirectoryNode dir in sortedDirs)
+        {
+            if (threshold is ThresholdSpec dt && !dt.Matches((ulong)Math.Max(0L, dir.TotalSize)))
+                continue;
+
             list.Add(new NavigatorItem
             {
                 Name = dir.Name,
                 DirNode = dir,
                 Size = dir.TotalSize
             });
+        }
 
-        if (_current.IsScanned)
+        if (_current.IsScanned && (_current != _root || _scanner?.LastScanExcludedRoot != true))
         {
             List<(string Name, long Size)> files = GetCachedFiles(_current);
             foreach ((string name, long size) in files)
+            {
+                if (threshold is ThresholdSpec ft && !ft.Matches((ulong)Math.Max(0L, size)))
+                    continue;
+
                 list.Add(new NavigatorItem
                 {
                     Name = name,
                     IsFile = true,
                     Size = size
                 });
+            }
         }
 
         return list;
@@ -247,10 +266,7 @@ public class InteractiveNavigator
         List<(string Name, long Size)> files = new List<(string Name, long Size)>();
         try
         {
-            files = DirectoryListing.ListFiles(
-                dir,
-                _scanner?.Options.UseNativeIo ?? true,
-                _scanner?.Options.ApparentSize ?? false);
+            files = DirectoryListing.ListFiles(dir, _scanner?.Options);
             files.Sort((a, b) => b.Size.CompareTo(a.Size));
         }
         catch
@@ -274,7 +290,9 @@ public class InteractiveNavigator
                 return MoveSelectionDown(items.Count);
 
             case ConsoleKey.Enter:
-                return ExecuteSelection(items[_selectedIndex]);
+                return _selectedIndex >= 0 &&
+                       _selectedIndex < items.Count &&
+                       ExecuteSelection(items[_selectedIndex]);
 
             case ConsoleKey.Backspace:
             case ConsoleKey.LeftArrow:
@@ -619,11 +637,16 @@ public class ExplorerRenderer
         int SelectedIndex,
         int PageSize,
         ParallelScanner? Scanner,
-        string Spinner
+        string Spinner,
+        BlockSizeSpec DisplayBlockSize
     );
 
     public Table Render(DirectoryNode current, List<NavigatorItem> items, int selectedIndex, int scrollOffset,
-        int pageSize, ParallelScanner? scanner)
+        int pageSize, ParallelScanner? scanner) =>
+        Render(current, items, selectedIndex, scrollOffset, pageSize, scanner, BlockSizeSpec.HumanBinary);
+
+    internal Table Render(DirectoryNode current, List<NavigatorItem> items, int selectedIndex, int scrollOffset,
+        int pageSize, ParallelScanner? scanner, BlockSizeSpec displayBlockSize)
     {
         int spinnerIndex = (int)(DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond / 100 % SpinnerFrames.Length);
         string spinner = SpinnerFrames[spinnerIndex];
@@ -658,8 +681,8 @@ public class ExplorerRenderer
             : $"{_lastFiles}";
 
         string sizeStr = _heldAddSize > 0
-            ? $"{FormatSize(_lastSize)} +{FormatSize(_heldAddSize)}"
-            : $"{FormatSize(_lastSize)}";
+            ? $"{FormatSize(_lastSize, displayBlockSize)} +{FormatSize(_heldAddSize, displayBlockSize)}"
+            : $"{FormatSize(_lastSize, displayBlockSize)}";
 
         string statsColor = scanner != null && scanner.IsScanning && InteractiveNavigator.IsScanningRecursive(current)
             ? "grey"
@@ -676,7 +699,7 @@ public class ExplorerRenderer
         table.AddColumn("[bold]Visual Usage[/]");
 
         long parentTotalSize = current.TotalSize > 0 ? current.TotalSize : 1;
-        TableRenderContext context = new TableRenderContext(scrollOffset, selectedIndex, pageSize, scanner, spinner);
+        TableRenderContext context = new TableRenderContext(scrollOffset, selectedIndex, pageSize, scanner, spinner, displayBlockSize);
         AddTableRows(table, items, parentTotalSize, context);
 
         if (items.Count > pageSize)
@@ -830,7 +853,7 @@ public class ExplorerRenderer
             table.AddRow(
                 new Markup(selectMarker),
                 new Markup(displayName),
-                new Markup(FormatSize(item.Size)),
+                new Markup(FormatSize(item.Size, ctx.DisplayBlockSize)),
                 new Markup(percentStr),
                 new Markup(bar)
             );
@@ -899,14 +922,32 @@ public class ExplorerRenderer
         return $"[{barColor}]{filled}[/][grey]{empty}[/]";
     }
 
-    public static string FormatSize(long bytes)
+    public static string FormatSize(long bytes) =>
+        FormatSize((ulong)Math.Max(0L, bytes), BlockSizeSpec.HumanBinary);
+
+    internal static string FormatSize(long bytes, BlockSizeSpec blockSize) =>
+        FormatSize((ulong)Math.Max(0L, bytes), blockSize);
+
+    internal static string FormatSize(ulong bytes, BlockSizeSpec blockSize)
     {
-        string[] suffixes = { "B", "KB", "MB", "GB", "TB", "PB" };
+        if (blockSize.Mode == HumanMode.None)
+        {
+            if (blockSize.Scale <= 1)
+                return $"{bytes:n0} B";
+
+            return HumanFormat.Format(bytes, blockSize);
+        }
+
+        decimal unitBase = blockSize.Mode == HumanMode.Si ? 1000m : 1024m;
+        string[] suffixes = blockSize.Mode == HumanMode.Si
+            ? ["B", "kB", "MB", "GB", "TB", "PB", "EB"]
+            : ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
+
         int counter = 0;
         decimal number = bytes;
-        while (Math.Round(number / 1024) >= 1)
+        while (counter + 1 < suffixes.Length && Math.Round(number / unitBase) >= 1)
         {
-            number /= 1024;
+            number /= unitBase;
             counter++;
         }
 

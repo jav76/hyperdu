@@ -40,7 +40,10 @@ public readonly record struct BlockSizeSpec
 /// <summary>
 /// Parsed --threshold (-t) specification.
 /// </summary>
-public readonly record struct ThresholdSpec(bool IsNegative, ulong Value);
+public readonly record struct ThresholdSpec(bool IsNegative, ulong Value)
+{
+    public bool Matches(ulong value) => IsNegative ? value <= Value : value >= Value;
+}
 
 internal enum BlockSizeParseStatus
 {

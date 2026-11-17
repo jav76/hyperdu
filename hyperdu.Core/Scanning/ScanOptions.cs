@@ -1,3 +1,5 @@
+using hyperdu.Core.Du;
+
 namespace hyperdu.Core.Scanning;
 
 public class ScanOptions
@@ -9,6 +11,9 @@ public class ScanOptions
     public bool CountLinks { get; set; } = false;
     public bool OneFileSystem { get; set; } = false;
     public List<string> ExcludedPaths { get; set; } = new();
+    public ExcludeMatcher ExcludeMatcher { get; } = new();
+    public ThresholdSpec? Threshold { get; set; }
+    public BlockSizeSpec DisplayBlockSize { get; set; } = BlockSizeSpec.HumanBinary;
 
     /// <summary>
     /// Use direct libc calls on Linux and macOS. Falls back to the managed enumerator when unsupported.

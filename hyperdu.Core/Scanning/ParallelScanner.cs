@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Unicode;
@@ -17,6 +18,7 @@ public class ParallelScanner
 
     private long _directoriesScanned;
     private long _filesScanned;
+    private bool _hasExcludes;
     private HashSet<string> _normalizedExcludedPaths = new();
     private List<string> _normalizedExcludedPrefixes = new();
     private long _totalBytesFound;
@@ -25,6 +27,9 @@ public class ParallelScanner
     private ulong _rootDevice;
     private Lock[]? _seenLocks;
     private HashSet<FileIdentity>[]? _seenSets;
+
+    /// <summary>True when the most recent scan's root directory matched an exclusion rule.</summary>
+    internal bool LastScanExcludedRoot { get; private set; }
 
     public ParallelScanner(ScanOptions? options = null)
     {
@@ -164,20 +169,22 @@ public class ParallelScanner
             _pendingCount = 1;
             _activeWorkers = 0;
 
-            StringComparer pathComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
-            _normalizedExcludedPaths = new HashSet<string>(pathComparer);
-            _normalizedExcludedPrefixes = new List<string>();
+            PrepareLegacyExcludes(
+                _options.ExcludedPaths,
+                out HashSet<string>? exactExcludes,
+                out List<string>? prefixExcludes);
+            _normalizedExcludedPaths = exactExcludes ?? [];
+            _normalizedExcludedPrefixes = prefixExcludes ?? [];
 
-            foreach (string excluded in _options.ExcludedPaths)
+            _hasExcludes = _normalizedExcludedPaths.Count > 0 || !_options.ExcludeMatcher.IsEmpty;
+            LastScanExcludedRoot = false;
+            if (_hasExcludes && IsRootExcluded(rootNode))
             {
-                if (string.IsNullOrEmpty(excluded)) continue;
-                string norm = NormalizePath(excluded);
-                _normalizedExcludedPaths.Add(norm);
-
-                string prefix = norm;
-                if (!norm.EndsWith(Path.DirectorySeparatorChar) && !norm.EndsWith(Path.AltDirectorySeparatorChar))
-                    prefix = norm + Path.DirectorySeparatorChar;
-                _normalizedExcludedPrefixes.Add(prefix);
+                LastScanExcludedRoot = true;
+                rootNode.SelfSize = 0;
+                rootNode.TotalSize = 0;
+                rootNode.IsScanned = true;
+                return rootNode;
             }
 
             Queue.Enqueue(rootNode);
@@ -398,7 +405,9 @@ public class ParallelScanner
         ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates,
         EnumerationOptions enumerationOptions, CancellationToken cancellationToken)
     {
-        using var enumerator = new LightweightFileSystemEnumerator(node.Path, enumerationOptions);
+        LightweightFileSystemEnumerator.EntryExcludePredicate? excludePredicate =
+            _hasExcludes ? IsExcludedManagedSpan : null;
+        using var enumerator = new LightweightFileSystemEnumerator(node.Path, enumerationOptions, excludePredicate);
         while (enumerator.MoveNext())
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -429,80 +438,95 @@ public class ParallelScanner
         Span<byte> statBuffer = stackalloc byte[NativeIo.StatBufferSize];
         bool checkHiddenFlag = _options.SkipHidden && NativeIo.IsMacOS;
 
-        NativeDirectory? directory = NativeDirectory.OpenPathSafe(node.GetNativePath(), out int openError);
-        if (directory == null) return NativeIo.DescribeError(openError);
+        byte[]? parentNativePath = _hasExcludes ? node.GetNativePath(nullTerminated: false) : null;
+        byte[]? excludeScratch = _hasExcludes && !_options.ExcludeMatcher.IsEmpty
+            ? ArrayPool<byte>.Shared.Rent(Math.Max(1024, parentNativePath!.Length + 256))
+            : null;
 
-        using (directory)
+        try
         {
-            if (node.Parent == null)
+            NativeDirectory? directory = NativeDirectory.OpenPathSafe(node.GetNativePath(), out int openError);
+            if (directory == null) return NativeIo.DescribeError(openError);
+
+            using (directory)
             {
-                ReadOnlySpan<byte> dot = ".\0"u8;
-                unsafe
+                if (node.Parent == null)
                 {
-                    fixed (byte* pDot = dot)
-                    fixed (byte* pStat = statBuffer)
+                    ReadOnlySpan<byte> dot = ".\0"u8;
+                    unsafe
                     {
-                        if (NativeIo.TryStatAt(directory.Fd, pDot, false, pStat, out NativeStat rootStat))
+                        fixed (byte* pDot = dot)
+                        fixed (byte* pStat = statBuffer)
                         {
-                            _rootDevice = rootStat.Device;
-                            node.Identity = new FileIdentity(rootStat.Device, rootStat.Inode);
-                            _ = TryMarkSeen(in rootStat);
-                            localSelfSize += NativeIo.ComputeEntryByteSize(in rootStat, _options.ApparentSize);
+                            if (NativeIo.TryStatAt(directory.Fd, pDot, false, pStat, out NativeStat rootStat))
+                            {
+                                _rootDevice = rootStat.Device;
+                                node.Identity = new FileIdentity(rootStat.Device, rootStat.Inode);
+                                _ = TryMarkSeen(in rootStat);
+                                localSelfSize += NativeIo.ComputeEntryByteSize(in rootStat, _options.ApparentSize);
+                            }
                         }
                     }
                 }
-            }
 
-            while (directory.MoveNext())
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                _pauseEvent.Wait(cancellationToken);
-
-                ReadOnlySpan<byte> name = directory.CurrentName;
-                if (_options.SkipHidden && name[0] == (byte)'.') continue;
-                if (!directory.TryStatCurrent(false, statBuffer, out NativeStat linkStat)) continue;
-                if (checkHiddenFlag && linkStat.HasHiddenFlag) continue;
-
-                switch (linkStat.Kind)
+                while (directory.MoveNext())
                 {
-                    case NativeEntryKind.Directory:
-                        TryAddNativeDirectory(node, name, in linkStat, ref subdirsToQueue, localUpdates);
-                        break;
+                    cancellationToken.ThrowIfCancellationRequested();
+                    _pauseEvent.Wait(cancellationToken);
 
-                    case NativeEntryKind.Symlink:
-                        if (_options.FollowSymlinks)
-                        {
-                            if (directory.TryStatCurrent(true, statBuffer, out NativeStat targetStat))
+                    ReadOnlySpan<byte> name = directory.CurrentName;
+                    if (_options.SkipHidden && name[0] == (byte)'.') continue;
+                    if (_hasExcludes && IsExcludedNativeEntry(parentNativePath!, node.Path, name, ref excludeScratch))
+                        continue;
+                    if (!directory.TryStatCurrent(false, statBuffer, out NativeStat linkStat)) continue;
+                    if (checkHiddenFlag && linkStat.HasHiddenFlag) continue;
+
+                    switch (linkStat.Kind)
+                    {
+                        case NativeEntryKind.Directory:
+                            TryAddNativeDirectory(node, name, in linkStat, ref subdirsToQueue, localUpdates);
+                            break;
+
+                        case NativeEntryKind.Symlink:
+                            if (_options.FollowSymlinks)
                             {
-                                if (targetStat.Kind == NativeEntryKind.Directory)
-                                    TryAddNativeDirectory(node, name, in targetStat, ref subdirsToQueue, localUpdates);
+                                if (directory.TryStatCurrent(true, statBuffer, out NativeStat targetStat))
+                                {
+                                    if (targetStat.Kind == NativeEntryKind.Directory)
+                                        TryAddNativeDirectory(node, name, in targetStat, ref subdirsToQueue, localUpdates);
+                                    else
+                                        TryRecordNativeFile(in targetStat, ref localSelfSize, ref localFilesCount);
+                                }
                                 else
-                                    TryRecordNativeFile(in targetStat, ref localSelfSize, ref localFilesCount);
+                                {
+                                    // Dangling symlink when following: fall back to link's own size.
+                                    TryRecordNativeFile(in linkStat, ref localSelfSize, ref localFilesCount);
+                                }
                             }
-                            else
+                            else if (directory.TryStatCurrent(true, statBuffer, out NativeStat targetStat) &&
+                                     targetStat.Kind == NativeEntryKind.Directory)
                             {
-                                // Dangling symlink when following: fall back to link's own size.
-                                TryRecordNativeFile(in linkStat, ref localSelfSize, ref localFilesCount);
+                                long linkOwnBytes = TryMarkSeen(in linkStat)
+                                    ? NativeIo.ComputeEntryByteSize(in linkStat, _options.ApparentSize)
+                                    : 0;
+                                ProcessUnfollowedDirectorySymlink(name, node, linkOwnBytes, localUpdates);
                             }
-                        }
-                        else if (directory.TryStatCurrent(true, statBuffer, out NativeStat targetStat) &&
-                                 targetStat.Kind == NativeEntryKind.Directory)
-                        {
-                            long linkOwnBytes = TryMarkSeen(in linkStat)
-                                ? NativeIo.ComputeEntryByteSize(in linkStat, _options.ApparentSize)
-                                : 0;
-                            ProcessUnfollowedDirectorySymlink(name, node, linkOwnBytes, localUpdates);
-                        }
 
-                        break;
+                            break;
 
-                    default:
-                        TryRecordNativeFile(in linkStat, ref localSelfSize, ref localFilesCount);
-                        break;
+                        default:
+                            TryRecordNativeFile(in linkStat, ref localSelfSize, ref localFilesCount);
+                            break;
+                    }
                 }
-            }
 
-            return directory.Error == 0 ? null : NativeIo.DescribeError(directory.Error);
+                return directory.Error == 0 ? null : NativeIo.DescribeError(directory.Error);
+            }
+        }
+        finally
+        {
+            if (excludeScratch != null)
+                ArrayPool<byte>.Shared.Return(excludeScratch);
         }
     }
 
@@ -593,7 +617,6 @@ public class ParallelScanner
     {
         string subPath = Path.Combine(node.Path, name);
         if (IsVirtualOrSystemPath(subPath)) return null;
-        if (IsExcludedPath(subPath)) return null;
         return new DirectoryNode(subPath, node, nativeName, null);
     }
 
@@ -774,16 +797,103 @@ public class ParallelScanner
         return total;
     }
 
-    private bool IsExcludedPath(string path)
+    private bool IsRootExcluded(DirectoryNode rootNode)
     {
-        if (_normalizedExcludedPaths.Count == 0) return false;
+        if (_normalizedExcludedPaths.Count > 0 && IsExcludedPath(rootNode.Path))
+            return true;
+
+        if (_options.ExcludeMatcher.IsEmpty)
+            return false;
+
+        if (_useNativeIo)
+            return _options.ExcludeMatcher.IsExcluded(rootNode.GetNativePath(nullTerminated: false));
+
+        return _options.ExcludeMatcher.IsExcludedManagedPath(rootNode.Path);
+    }
+
+    private bool IsExcludedNativeEntry(byte[] parentNativePath, string parentPath, ReadOnlySpan<byte> name, ref byte[]? scratch)
+    {
+        if (!_options.ExcludeMatcher.IsEmpty && scratch != null)
+        {
+            int len = DuAccounting.WriteChildPathIntoPooled(parentNativePath, name, ref scratch);
+            if (_options.ExcludeMatcher.IsExcluded(scratch.AsSpan(0, len)))
+                return true;
+        }
+
+        if (_normalizedExcludedPaths.Count > 0)
+        {
+            string subPath = Path.Combine(parentPath, Encoding.UTF8.GetString(name));
+            if (IsExcludedPath(subPath))
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool IsExcludedManagedSpan(ReadOnlySpan<char> directory, ReadOnlySpan<char> fileName)
+    {
+        if (!_options.ExcludeMatcher.IsEmpty && _options.ExcludeMatcher.IsExcludedManagedParts(directory, fileName))
+            return true;
+
+        if (_normalizedExcludedPaths.Count > 0)
+        {
+            string fullPath = Path.Join(directory, fileName);
+            if (IsExcludedPath(fullPath))
+                return true;
+        }
+
+        return false;
+    }
+
+    internal static void PrepareLegacyExcludes(
+        IReadOnlyList<string>? excludedPaths,
+        out HashSet<string>? normalizedExact,
+        out List<string>? normalizedPrefixes)
+    {
+        if (excludedPaths == null || excludedPaths.Count == 0)
+        {
+            normalizedExact = null;
+            normalizedPrefixes = null;
+            return;
+        }
+
+        StringComparer pathComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        normalizedExact = new HashSet<string>(pathComparer);
+        normalizedPrefixes = new List<string>(excludedPaths.Count);
+
+        foreach (string excluded in excludedPaths)
+        {
+            if (string.IsNullOrEmpty(excluded)) continue;
+            string norm = NormalizePath(excluded);
+            normalizedExact.Add(norm);
+
+            string prefix = norm;
+            if (!norm.EndsWith(Path.DirectorySeparatorChar) && !norm.EndsWith(Path.AltDirectorySeparatorChar))
+                prefix = norm + Path.DirectorySeparatorChar;
+            normalizedPrefixes.Add(prefix);
+        }
+    }
+
+    internal static bool MatchesLegacyExcludedPaths(
+        string path,
+        HashSet<string>? normalizedExact,
+        List<string>? normalizedPrefixes)
+    {
+        if (normalizedExact == null || normalizedExact.Count == 0)
+            return false;
+
+        if (normalizedExact.Contains(path))
+            return true;
+
+        if (normalizedPrefixes == null || normalizedPrefixes.Count == 0)
+            return false;
 
         StringComparison comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-
-        if (_normalizedExcludedPaths.Contains(path)) return true;
-
-        return _normalizedExcludedPrefixes.Any(prefix => path.StartsWith(prefix, comparison));
+        return normalizedPrefixes.Any(prefix => path.StartsWith(prefix, comparison));
     }
+
+    private bool IsExcludedPath(string path) =>
+        MatchesLegacyExcludedPaths(path, _normalizedExcludedPaths, _normalizedExcludedPrefixes);
 
     private struct NodeDelta
     {

@@ -330,7 +330,7 @@ internal static class ComparatorRegistry
     {
         string excludedDir = Path.Combine(fixture.RootPath, "node_modules");
         List<CommandInvocation> invocations = new();
-        AddHyperduNoUiInvocations(tools, fixture.RootPath, invocations, ["-e", excludedDir]);
+        AddHyperduNoUiInvocations(tools, fixture.RootPath, invocations, ["--exclude=node_modules"]);
 
         string[] refArgs = tools.ReferenceDuIsGnu
             ? ["--exclude=node_modules", "-s", fixture.RootPath]
@@ -431,7 +431,7 @@ internal static class ComparatorRegistry
             invocations.Add(new CommandInvocation(tools.HyperduNoUi, [.. prefix, targetPath], tools.HyperduNoUi.BaseEnvironment));
 
         if (tools.HyperduNoUiSingleThread != null)
-            invocations.Add(new CommandInvocation(tools.HyperduNoUiSingleThread, ["-t", "1", .. prefix, targetPath], tools.HyperduNoUiSingleThread.BaseEnvironment));
+            invocations.Add(new CommandInvocation(tools.HyperduNoUiSingleThread, ["-j", "1", .. prefix, targetPath], tools.HyperduNoUiSingleThread.BaseEnvironment));
 
         if (tools.HyperduNoUiManaged != null)
             invocations.Add(new CommandInvocation(tools.HyperduNoUiManaged, [.. prefix, targetPath], tools.HyperduNoUiManaged.BaseEnvironment));

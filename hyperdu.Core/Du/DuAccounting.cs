@@ -28,13 +28,8 @@ internal static unsafe class DuAccounting
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static bool ShouldEmitForThreshold(ulong value, DuOptions options)
-    {
-        if (options.Threshold is not ThresholdSpec t)
-            return true;
-
-        return t.IsNegative ? value <= t.Value : value >= t.Value;
-    }
+    internal static bool ShouldEmitForThreshold(ulong value, DuOptions options) =>
+        options.Threshold is not ThresholdSpec t || t.Matches(value);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static FileTimestamp ExtractTimestamp(in NativeStat stat, DuOptions options)
@@ -229,6 +224,32 @@ internal static unsafe class DuAccounting
         childName.CopyTo(scratchBuffer.AsSpan(pos));
         if (appendNul)
             scratchBuffer[displayLen] = 0;
+        return displayLen;
+    }
+
+    internal static int WriteChildPathIntoPooled(
+        ReadOnlySpan<byte> parentPath,
+        ReadOnlySpan<byte> childName,
+        ref byte[] pooledScratch,
+        bool appendNul = false)
+    {
+        bool needsSlash = parentPath.Length > 0 && parentPath[^1] != (byte)'/';
+        int displayLen = parentPath.Length + (needsSlash ? 1 : 0) + childName.Length;
+        int totalLen = displayLen + (appendNul ? 1 : 0);
+        if (totalLen > pooledScratch.Length)
+        {
+            byte[] grown = ArrayPool<byte>.Shared.Rent(totalLen);
+            ArrayPool<byte>.Shared.Return(pooledScratch);
+            pooledScratch = grown;
+        }
+
+        parentPath.CopyTo(pooledScratch);
+        int pos = parentPath.Length;
+        if (needsSlash)
+            pooledScratch[pos++] = (byte)'/';
+        childName.CopyTo(pooledScratch.AsSpan(pos));
+        if (appendNul)
+            pooledScratch[displayLen] = 0;
         return displayLen;
     }
 
