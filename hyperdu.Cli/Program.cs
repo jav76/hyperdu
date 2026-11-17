@@ -431,13 +431,18 @@ public static class Program
         return cmdArgs.Length > 0 ? cmdArgs[0] : "hyperdu";
     }
 
-    public static async Task<int> Main(string[] args)
+    public static int Main(string[] args)
     {
         if (TryDispatchDuPersona(args, out int duExitCode))
         {
             return duExitCode;
         }
 
+        return RunTuiMainAsync(args).GetAwaiter().GetResult();
+    }
+
+    private static async Task<int> RunTuiMainAsync(string[] args)
+    {
         Console.OutputEncoding = Encoding.UTF8;
         const string programName = "hyperdu";
         string version = GetDisplayVersion();
