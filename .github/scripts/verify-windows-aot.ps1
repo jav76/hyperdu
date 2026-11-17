@@ -138,8 +138,9 @@ try {
     $vHyperdu = Invoke-Checked $hyperdu @('du', '--version')
     $vDu = Invoke-Checked $du @('--version')
     $vGdu = Invoke-Checked $gdu @('--version')
-    if (-not $vDu.StartsWith('du ')) { throw "Unexpected du.exe --version: $vDu" }
-    if (-not $vGdu.StartsWith('gdu ')) { throw "Unexpected gdu.exe --version: $vGdu" }
+    if (-not $vHyperdu.StartsWith('du (hyperdu) ')) { throw "Unexpected hyperdu du --version: $vHyperdu" }
+    if (-not $vDu.StartsWith('du (hyperdu) ')) { throw "Unexpected du.exe --version: $vDu" }
+    if (-not $vGdu.StartsWith('du (hyperdu) ')) { throw "Unexpected gdu.exe --version: $vGdu" }
 
     # 2. Sparse file (NtQueryDirectoryFile AllocationSize vs EndOfFile)
     $sparseDir = Join-Path $root 'sparse'

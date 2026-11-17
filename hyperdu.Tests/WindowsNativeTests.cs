@@ -490,8 +490,8 @@ public sealed partial class WindowsNativeTests
         psi.ArgumentList.Add("/c");
         psi.ArgumentList.Add("mklink");
         psi.ArgumentList.Add("/J");
-        psi.ArgumentList.Add(linkPath);
-        psi.ArgumentList.Add(targetPath);
+        psi.ArgumentList.Add(Path.GetFullPath(linkPath));
+        psi.ArgumentList.Add(Path.GetFullPath(targetPath));
 
         using Process? proc = Process.Start(psi);
         Assert.NotNull(proc);
