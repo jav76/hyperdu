@@ -165,7 +165,7 @@ public sealed class TuiCliPhase62Tests
         string excludeFile = Path.Combine(tree.Root, ".patterns");
         File.WriteAllText(excludeFile, "*.tmp\nnode_modules\n.patterns\n");
 
-        foreach (bool useNative in OperatingSystem.IsWindows() ? new[] { false } : new[] { true, false })
+        foreach (bool useNative in new[] { true, false })
         {
             ScanOptions scanOpts = new()
             {
@@ -188,37 +188,34 @@ public sealed class TuiCliPhase62Tests
             Assert.Equal(new List<(string Name, long Size)> { ("keep.bin", 4_096L) }, listed);
         }
 
-        if (!OperatingSystem.IsWindows())
-        {
-            (int rcDu, string outDu, string errDu) = RunCli(["gdu", "-b", "-s", "--exclude=*.tmp", "--exclude=node_modules", "--exclude=.patterns", tree.Root], headlessTui: false);
-            (int rcTui, string outTui, string errTui) = RunCli(["-b", "--exclude=*.tmp", "--exclude=node_modules", "--exclude=.patterns", tree.Root], headlessTui: true);
-            Assert.Equal(0, rcDu);
-            Assert.Equal(0, rcTui);
-            Assert.Empty(errDu);
-            Assert.Empty(errTui);
-            Assert.Equal(outDu, outTui);
+        (int rcDu, string outDu, string errDu) = RunCli(["gdu", "-b", "-s", "--exclude=*.tmp", "--exclude=node_modules", "--exclude=.patterns", tree.Root], headlessTui: false);
+        (int rcTui, string outTui, string errTui) = RunCli(["-b", "--exclude=*.tmp", "--exclude=node_modules", "--exclude=.patterns", tree.Root], headlessTui: true);
+        Assert.Equal(0, rcDu);
+        Assert.Equal(0, rcTui);
+        Assert.Empty(errDu);
+        Assert.Empty(errTui);
+        Assert.Equal(outDu, outTui);
 
-            (int rcTuiX, string outTuiX, string errTuiX) = RunCli(["-b", "-X", excludeFile, tree.Root], headlessTui: true);
-            Assert.Equal(0, rcTuiX);
-            Assert.Empty(errTuiX);
-            Assert.Equal(outDu, outTuiX);
+        (int rcTuiX, string outTuiX, string errTuiX) = RunCli(["-b", "-X", excludeFile, tree.Root], headlessTui: true);
+        Assert.Equal(0, rcTuiX);
+        Assert.Empty(errTuiX);
+        Assert.Equal(outDu, outTuiX);
 
-            // Excluding the root operand itself (including '.' when invoked inside tree.Root) produces empty output like du.
-            string rootName = Path.GetFileName(tree.Root);
-            (int rcRootExcl, string outRootExcl, _) = RunCli(["--exclude", rootName, tree.Root], headlessTui: true);
-            Assert.Equal(0, rcRootExcl);
-            Assert.Empty(outRootExcl);
+        // Excluding the root operand itself (including '.' when invoked inside tree.Root) produces empty output like du.
+        string rootName = Path.GetFileName(tree.Root);
+        (int rcRootExcl, string outRootExcl, _) = RunCli(["--exclude", rootName, tree.Root], headlessTui: true);
+        Assert.Equal(0, rcRootExcl);
+        Assert.Empty(outRootExcl);
 
-            (int rcDotExcl, string outDotExcl, _) = RunCli(["--exclude=.", "."], headlessTui: true, workingDir: tree.Root);
-            Assert.Equal(0, rcDotExcl);
-            Assert.Empty(outDotExcl);
+        (int rcDotExcl, string outDotExcl, _) = RunCli(["--exclude=.", "."], headlessTui: true, workingDir: tree.Root);
+        Assert.Equal(0, rcDotExcl);
+        Assert.Empty(outDotExcl);
 
-            // Legacy ExcludedPaths on ScanOptions also filters DirectoryListing.ListFiles.
-            ScanOptions legacyPathOpts = new() { UseNativeIo = true, ApparentSize = true, ExcludedPaths = [Path.Combine(tree.Root, "ignore.tmp")] };
-            ParallelScanner legacyScanner = new(legacyPathOpts);
-            DirectoryNode legacyRoot = await legacyScanner.ScanAsync(tree.Root);
-            Assert.DoesNotContain(DirectoryListing.ListFiles(legacyRoot, legacyPathOpts), f => f.Name == "ignore.tmp");
-        }
+        // Legacy ExcludedPaths on ScanOptions also filters DirectoryListing.ListFiles.
+        ScanOptions legacyPathOpts = new() { UseNativeIo = true, ApparentSize = true, ExcludedPaths = [Path.Combine(tree.Root, "ignore.tmp")] };
+        ParallelScanner legacyScanner = new(legacyPathOpts);
+        DirectoryNode legacyRoot = await legacyScanner.ScanAsync(tree.Root);
+        Assert.DoesNotContain(DirectoryListing.ListFiles(legacyRoot, legacyPathOpts), f => f.Name == "ignore.tmp");
     }
 
     [Fact]
@@ -234,7 +231,7 @@ public sealed class TuiCliPhase62Tests
         Assert.False(new ThresholdSpec(true, 1_000).Matches(1_001));
     }
 
-    [UnixFact]
+    [Fact]
     public void HeadlessTui_HumanSiBytesAndThreshold_MatchDuSemantics()
     {
         using TempTree tree = new();

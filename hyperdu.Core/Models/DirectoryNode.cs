@@ -173,7 +173,9 @@ public class DirectoryNode
         }
 
         Parent.AppendNativePath(buffer);
-        if (buffer.Count == 0 || buffer[^1] != (byte)'/') buffer.Add((byte)'/');
+        byte sep = (byte)System.IO.Path.DirectorySeparatorChar;
+        if (buffer.Count == 0 || (buffer[^1] != (byte)'/' && buffer[^1] != (byte)'\\'))
+            buffer.Add(sep);
         buffer.AddRange(NativeName ?? Encoding.UTF8.GetBytes(Name));
     }
 

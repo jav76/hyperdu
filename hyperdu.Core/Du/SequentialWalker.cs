@@ -48,6 +48,7 @@ public sealed unsafe class SequentialWalker
     private byte[] _nameArena = new byte[65536];
     private int _nameArenaPos;
     private DirEntry[] _entryStack = new DirEntry[4096];
+    private NativeStat[]? _inlineStats;
     private int _entryStackPos;
     private byte[] _pathStack = new byte[8192];
     private int _pathLen;
@@ -209,7 +210,7 @@ public sealed unsafe class SequentialWalker
                 return;
             }
 
-            DuAccounting.OpenRootDirectory(nullTermPath, out int dirFd, out NativeDirectory? fallbackDir, out int openErrno);
+            DuAccounting.OpenRootDirectory(nullTermPath, out int dirFd, out NativeDirectory? fallbackDir, out int openErrno, followOperand);
             DirWalkResult walked = WalkDirectory(dirFd, fallbackDir, openErrno, in stat, depth: 0);
             _grandTotal += walked.FullBytes;
             if (_showTime)
@@ -252,7 +253,9 @@ public sealed unsafe class SequentialWalker
         }
 
         FileIdentity dirId = new(dirStat.Device, dirStat.Inode);
-        _activeAncestors.Add(dirId);
+        bool trackAncestor = dirStat.HasValidFileId;
+        if (trackAncestor)
+            _activeAncestors.Add(dirId);
         if (_options.Dialect == DuDialect.Bsd)
             _ancestorStack.Add((dirId, _pathLen));
         _openDirCount++;
@@ -275,6 +278,7 @@ public sealed unsafe class SequentialWalker
                 NativeIo.ShouldSortDirectoryByInode(dirFd, allowOnMacOs: _options.Dialect == DuDialect.Gnu))
                 Array.Sort(_entryStack, entryStart, count, DirEntryInodeComparer.Instance);
 
+            bool hasInlineStats = fallbackDir?.HasInlineStats == true;
             bool followChild = _options.SymlinkPolicy == SymlinkPolicy.DereferenceAll;
             for (int i = entryStart; i < entryEnd; i++)
             {
@@ -282,10 +286,13 @@ public sealed unsafe class SequentialWalker
                     break;
 
                 int savedPath = _pathLen;
+                ref readonly DirEntry childEntry = ref _entryStack[i];
                 ProcessChildEntry(
                     dirFd,
                     fallbackDir,
-                    _entryStack[i],
+                    childEntry,
+                    hasInlineStats,
+                    entryStart + childEntry.Order,
                     followChild,
                     childDepth,
                     deferredSubdirs,
@@ -304,7 +311,8 @@ public sealed unsafe class SequentialWalker
         {
             if (_options.Dialect == DuDialect.Bsd && _ancestorStack.Count > 0)
                 _ancestorStack.RemoveAt(_ancestorStack.Count - 1);
-            _activeAncestors.Remove(dirId);
+            if (trackAncestor)
+                _activeAncestors.Remove(dirId);
             if (fallbackDir != null)
                 fallbackDir.Dispose();
             else if (dirFd >= 0)
@@ -382,7 +390,12 @@ public sealed unsafe class SequentialWalker
             {
                 childPath.CopyTo(buf);
                 buf[childPath.Length] = 0;
-                DuAccounting.OpenRootDirectory(buf[..(childPath.Length + 1)], out int subFd, out NativeDirectory? subFallback, out int subOpenErrno);
+                DuAccounting.OpenRootDirectory(
+                    buf[..(childPath.Length + 1)],
+                    out int subFd,
+                    out NativeDirectory? subFallback,
+                    out int subOpenErrno,
+                    _options.SymlinkPolicy == SymlinkPolicy.DereferenceAll);
                 DirWalkResult sub = WalkDirectory(
                     subFd,
                     subFallback,
@@ -414,6 +427,8 @@ public sealed unsafe class SequentialWalker
         int dirFd,
         NativeDirectory? fallbackDir,
         DirEntry entry,
+        bool hasInlineStats,
+        int inlineStatIndex,
         bool followChild,
         ulong childDepth,
         List<(byte[] ChildPath, NativeStat Stat)>? deferredSubdirs,
@@ -445,7 +460,13 @@ public sealed unsafe class SequentialWalker
 
         NativeStat childStat;
         int statErrno;
-        if (followChild)
+        bool useInline = hasInlineStats &&
+                         (!followChild || _inlineStats![inlineStatIndex].Kind != NativeEntryKind.Symlink);
+        if (useInline)
+        {
+            childStat = _inlineStats![inlineStatIndex];
+        }
+        else if (followChild)
         {
             // gnulib fts uses FTS_NOCHDIR under -L so kernel path resolution enforces ELOOP across symlink chains.
             if (!pathPushed)
@@ -526,7 +547,9 @@ public sealed unsafe class SequentialWalker
         }
 
         FileIdentity childId = new(childStat.Device, childStat.Inode);
-        if (childStat.Kind == NativeEntryKind.Directory && _activeAncestors.Contains(childId))
+        if (childStat.HasValidFileId &&
+            childStat.Kind == NativeEntryKind.Directory &&
+            _activeAncestors.Contains(childId))
         {
             if (_options.Dialect == DuDialect.Bsd)
             {
@@ -565,9 +588,9 @@ public sealed unsafe class SequentialWalker
             NativeDirectory? childFallback;
             int subOpenErrno;
             if (followChild)
-                DuAccounting.OpenRootDirectory(NullTerminatedCurrentPath(), out childFd, out childFallback, out subOpenErrno);
+                DuAccounting.OpenDirectoryPathSafe(NullTerminatedCurrentPath(), out childFd, out childFallback, out subOpenErrno, followSymlinks: true);
             else
-                DuAccounting.OpenChildDirectory(dirFd, fallbackDir, _nameArena, entry.NameOffset, entry.NameLength, out childFd, out childFallback, out subOpenErrno);
+                DuAccounting.OpenChildDirectory(dirFd, fallbackDir, _nameArena, entry.NameOffset, entry.NameLength, out childFd, out childFallback, out subOpenErrno, followSymlinks: false);
 
             DirWalkResult sub = WalkDirectory(
                 childFd,
@@ -607,7 +630,7 @@ public sealed unsafe class SequentialWalker
             return CurrentPathSpan;
 
         int end = _pathLen - childNameLength;
-        if (end > 1 && _pathStack[end - 1] == (byte)'/')
+        if (end > 1 && DuAccounting.IsSeparator(_pathStack[end - 1]))
             end--;
         return _pathStack.AsSpan(0, Math.Max(0, end));
     }
@@ -659,9 +682,19 @@ public sealed unsafe class SequentialWalker
 
     private void ReadEntriesFallback(NativeDirectory dir)
     {
+        bool hasInlineStats = dir.HasInlineStats;
         int order = 0;
         while (dir.MoveNext())
+        {
+            int idx = _entryStackPos;
             PushEntry(dir.CurrentInode, order++, dir.CurrentName);
+            if (hasInlineStats && dir.TryGetInlineStat(out NativeStat inlineStat))
+            {
+                if (_inlineStats == null || idx >= _inlineStats.Length)
+                    Array.Resize(ref _inlineStats, Math.Max(4096, (_inlineStats?.Length ?? 0) * 2));
+                _inlineStats[idx] = inlineStat;
+            }
+        }
 
         if (dir.Error != 0)
             _writer!.WritePosixError("cannot read directory", CurrentPathSpan, dir.Error);
@@ -717,37 +750,20 @@ public sealed unsafe class SequentialWalker
 
     private void SetNormalizedRootPath(ReadOnlySpan<byte> raw)
     {
-        if (raw.IsEmpty)
+        int targetLen = DuAccounting.ComputeNormalizedRootSpec(raw, out int copyLen, out bool appendSep, out byte sepByte);
+        if (targetLen == 0)
         {
             _pathLen = 0;
             return;
         }
 
-        bool hadTrailingSlash = raw[^1] == (byte)'/';
-        int end = raw.Length;
-        while (end > 0 && raw[end - 1] == (byte)'/')
-            end--;
-
-        if (end == 0)
-        {
-            _pathStack[0] = (byte)'/';
-            _pathLen = 1;
-            return;
-        }
-
-        int targetLen = hadTrailingSlash ? end + 1 : raw.Length;
         if (targetLen > _pathStack.Length)
             DuAccounting.GrowByteArray(ref _pathStack, targetLen);
 
-        if (hadTrailingSlash)
-        {
-            raw[..end].CopyTo(_pathStack);
-            _pathStack[end] = (byte)'/';
-        }
-        else
-        {
-            raw.CopyTo(_pathStack);
-        }
+        if (copyLen > 0)
+            raw[..copyLen].CopyTo(_pathStack);
+        if (appendSep)
+            _pathStack[copyLen] = sepByte;
 
         _pathLen = targetLen;
     }
@@ -755,14 +771,14 @@ public sealed unsafe class SequentialWalker
     private int PushPathSegment(int nameOffset, int nameLength)
     {
         int saved = _pathLen;
-        bool needsSlash = _pathLen > 0 && _pathStack[_pathLen - 1] != (byte)'/';
+        bool needsSlash = _pathLen > 0 && !DuAccounting.IsSeparator(_pathStack[_pathLen - 1]);
         int newLen = _pathLen + (needsSlash ? 1 : 0) + nameLength;
         if (newLen > _pathStack.Length)
             DuAccounting.GrowByteArray(ref _pathStack, newLen);
 
         int pos = _pathLen;
         if (needsSlash)
-            _pathStack[pos++] = (byte)'/';
+            _pathStack[pos++] = DuAccounting.DefaultSeparator;
 
         _nameArena.AsSpan(nameOffset, nameLength).CopyTo(_pathStack.AsSpan(pos));
         _pathLen = newLen;

@@ -436,7 +436,8 @@ public class ParallelScanner
         CancellationToken cancellationToken)
     {
         Span<byte> statBuffer = stackalloc byte[NativeIo.StatBufferSize];
-        bool checkHiddenFlag = _options.SkipHidden && NativeIo.IsMacOS;
+        bool checkDotHidden = _options.SkipHidden && !NativeIo.IsWindows;
+        bool checkHiddenFlag = _options.SkipHidden && (NativeIo.IsMacOS || NativeIo.IsWindows);
 
         byte[]? parentNativePath = _hasExcludes ? node.GetNativePath(nullTerminated: false) : null;
         byte[]? excludeScratch = _hasExcludes && !_options.ExcludeMatcher.IsEmpty
@@ -445,28 +446,20 @@ public class ParallelScanner
 
         try
         {
-            NativeDirectory? directory = NativeDirectory.OpenPathSafe(node.GetNativePath(), out int openError);
+            NativeDirectory? directory = NativeDirectory.OpenPathSafe(
+                node.GetNativePath(),
+                out int openError,
+                followSymlinks: node.Parent == null || _options.FollowSymlinks);
             if (directory == null) return NativeIo.DescribeError(openError);
 
             using (directory)
             {
-                if (node.Parent == null)
+                if (node.Parent == null && directory.TryStatSelf(statBuffer, out NativeStat rootStat))
                 {
-                    ReadOnlySpan<byte> dot = ".\0"u8;
-                    unsafe
-                    {
-                        fixed (byte* pDot = dot)
-                        fixed (byte* pStat = statBuffer)
-                        {
-                            if (NativeIo.TryStatAt(directory.Fd, pDot, false, pStat, out NativeStat rootStat))
-                            {
-                                _rootDevice = rootStat.Device;
-                                node.Identity = new FileIdentity(rootStat.Device, rootStat.Inode);
-                                _ = TryMarkSeen(in rootStat);
-                                localSelfSize += NativeIo.ComputeEntryByteSize(in rootStat, _options.ApparentSize);
-                            }
-                        }
-                    }
+                    _rootDevice = rootStat.Device;
+                    node.Identity = new FileIdentity(rootStat.Device, rootStat.Inode);
+                    _ = TryMarkSeen(in rootStat);
+                    localSelfSize += NativeIo.ComputeEntryByteSize(in rootStat, _options.ApparentSize);
                 }
 
                 while (directory.MoveNext())
@@ -475,7 +468,7 @@ public class ParallelScanner
                     _pauseEvent.Wait(cancellationToken);
 
                     ReadOnlySpan<byte> name = directory.CurrentName;
-                    if (_options.SkipHidden && name[0] == (byte)'.') continue;
+                    if (checkDotHidden && name[0] == (byte)'.') continue;
                     if (_hasExcludes && IsExcludedNativeEntry(parentNativePath!, node.Path, name, ref excludeScratch))
                         continue;
                     if (!directory.TryStatCurrent(false, statBuffer, out NativeStat linkStat)) continue;
@@ -558,11 +551,11 @@ public class ParallelScanner
 
     private bool TryMarkSeen(in NativeStat stat)
     {
-        if (_seenSets == null || _seenLocks == null)
+        if (_seenSets == null || _seenLocks == null || !stat.HasValidFileId)
             return true;
 
         bool shouldTrack = stat.Kind == NativeEntryKind.Directory ||
-                           stat.HardLinks > 1 ||
+                           stat.HardLinks != 1 ||
                            _options.FollowSymlinks;
         if (!shouldTrack)
             return true;
@@ -577,7 +570,7 @@ public class ParallelScanner
 
     private static bool HasAncestorIdentity(DirectoryNode? node, FileIdentity id)
     {
-        if (id.Inode == 0)
+        if (id.Inode == 0 || id.Inode == ulong.MaxValue)
             return false;
 
         while (node != null)

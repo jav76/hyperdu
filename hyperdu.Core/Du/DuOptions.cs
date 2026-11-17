@@ -112,9 +112,12 @@ public sealed class DuOptions
             return DuDialect.Gnu;
 
         string baseName = Messages.BsdProgramName(programName);
-        if (string.Equals(baseName, "gdu", StringComparison.Ordinal))
+        StringComparison cmp = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        if (string.Equals(baseName, "gdu", cmp))
             return DuDialect.Gnu;
-        if (string.Equals(baseName, "du", StringComparison.Ordinal))
+        if (string.Equals(baseName, "du", cmp))
             return OperatingSystem.IsMacOS() ? DuDialect.Bsd : DuDialect.Gnu;
 
         return DuDialect.Gnu;

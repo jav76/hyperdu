@@ -228,3 +228,60 @@ jobs:
           name: compat-results-${{ matrix.rid }}
           path: artifacts/compat/
           if-no-files-found: warn
+
+  compat-windows:
+    name: Compat (windows-latest, ${{ matrix.rid }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rid: [win-x64, win-x86]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Publish Native AOT hyperdu (${{ matrix.rid }})
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts/publish-bin, artifacts/compat-bin, artifacts/compat | Out-Null
+          dotnet publish hyperdu.Cli/hyperdu.Cli.csproj -c Release -r ${{ matrix.rid }} -p:PublishAot=true -o artifacts/publish-bin --nologo -v quiet
+          Copy-Item -Path artifacts/publish-bin/hyperdu.exe -Destination artifacts/compat-bin/hyperdu.exe -Force
+          Copy-Item -Path artifacts/publish-bin/hyperdu.exe -Destination artifacts/compat-bin/du.exe -Force
+          Copy-Item -Path artifacts/publish-bin/hyperdu.exe -Destination artifacts/compat-bin/gdu.exe -Force
+
+      - name: Verify Native AOT Windows NtQueryDirectoryFile behavior (${{ matrix.rid }})
+        shell: pwsh
+        run: |
+          & .github/scripts/verify-windows-aot.ps1 -BinDir artifacts/compat-bin -MarkdownPath artifacts/compat/windows-${{ matrix.rid }}.md
+
+      - name: Run Windows native unit and integration tests
+        if: matrix.rid == 'win-x64'
+        shell: pwsh
+        run: |
+          dotnet test hyperdu.Tests/hyperdu.Tests.csproj -c Release --filter "FullyQualifiedName~WindowsNativeTests|FullyQualifiedName~TuiCliPhase62Tests" --logger "console;verbosity=normal"
+
+      - name: Publish Windows compatibility summary
+        if: always()
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path artifacts/compat/*.md -ErrorAction SilentlyContinue | ForEach-Object {
+            Get-Content $_.FullName | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            "" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Upload Windows compatibility artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-results-${{ matrix.rid }}
+          path: artifacts/compat/
+          if-no-files-found: warn

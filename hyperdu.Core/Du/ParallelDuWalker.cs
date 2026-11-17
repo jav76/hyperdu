@@ -205,6 +205,7 @@ public sealed unsafe class ParallelDuWalker
         public readonly List<DirNode> TempSubdirs = new(32);
         public byte[] CompactArena = new byte[65536];
         public int CompactArenaLen;
+        public NativeStat[] TempInlineStats = [];
     }
 
     private struct EmitFrame
@@ -855,11 +856,14 @@ public sealed unsafe class ParallelDuWalker
         }
         else
         {
+            bool followOpen = node.FollowChildSymlinks ||
+                              (node.Parent == null && _options.SymlinkPolicy is SymlinkPolicy.DereferenceArgs or SymlinkPolicy.DereferenceAll);
             DuAccounting.OpenDirectoryPathSafe(
                 node.NullTermPath,
                 out dirFd,
                 out fallbackDir,
-                out openErrno);
+                out openErrno,
+                followOpen);
         }
 
         if (openErrno != 0)
@@ -872,6 +876,7 @@ public sealed unsafe class ParallelDuWalker
         int readErrno;
         int rawCount;
         bool spawnedChunks = false;
+        bool hasInlineStats = fallbackDir?.HasInlineStats == true;
 
         try
         {
@@ -885,6 +890,7 @@ public sealed unsafe class ParallelDuWalker
                 Array.Sort(scratch.TempEntries, 0, rawCount, RawDirEntryInodeComparer.Instance);
 
             if (rawCount >= LargeDirChunkThreshold &&
+                !hasInlineStats &&
                 TryEnableWorkersForLargeDir(node, rawCount))
             {
                 if (node.FollowChildSymlinks)
@@ -908,6 +914,7 @@ public sealed unsafe class ParallelDuWalker
                 node,
                 dirFd,
                 fallbackDir,
+                hasInlineStats,
                 rawCount,
                 readErrno,
                 scratch,
@@ -929,6 +936,7 @@ public sealed unsafe class ParallelDuWalker
         DirNode node,
         int dirFd,
         NativeDirectory? fallbackDir,
+        bool hasInlineStats,
         int rawCount,
         int readErrno,
         WorkerScratch scratch,
@@ -960,21 +968,32 @@ public sealed unsafe class ParallelDuWalker
             int statErrno;
             bool statOk;
             bool isBsdFatalSymlinkLoop;
-            fixed (byte* pName = &scratch.TempNameArena[raw.NameOffset])
-            fixed (byte* pStat = scratch.StatBuffer)
+            if (hasInlineStats &&
+                (!followChild || scratch.TempInlineStats[raw.Order].Kind != NativeEntryKind.Symlink))
             {
-                statOk = DuAccounting.TryStatChildEntry(
-                    dirFd,
-                    node.DisplayPath,
-                    nameSpan,
-                    pName,
-                    followChild,
-                    _options,
-                    pStat,
-                    ref scratch.PathScratch,
-                    out childStat,
-                    out statErrno,
-                    out isBsdFatalSymlinkLoop);
+                childStat = scratch.TempInlineStats[raw.Order];
+                statOk = true;
+                statErrno = 0;
+                isBsdFatalSymlinkLoop = false;
+            }
+            else
+            {
+                fixed (byte* pName = &scratch.TempNameArena[raw.NameOffset])
+                fixed (byte* pStat = scratch.StatBuffer)
+                {
+                    statOk = DuAccounting.TryStatChildEntry(
+                        dirFd,
+                        node.DisplayPath,
+                        nameSpan,
+                        pName,
+                        followChild,
+                        _options,
+                        pStat,
+                        ref scratch.PathScratch,
+                        out childStat,
+                        out statErrno,
+                        out isBsdFatalSymlinkLoop);
+                }
             }
 
             if (!statOk)
@@ -1687,6 +1706,9 @@ public sealed unsafe class ParallelDuWalker
 
     private static DirNode? FindAncestorNode(DirNode current, FileIdentity candidate)
     {
+        if (candidate.Inode == 0 || candidate.Inode == ulong.MaxValue)
+            return null;
+
         DirNode? cursor = current;
         while (cursor != null)
         {
@@ -1701,7 +1723,7 @@ public sealed unsafe class ParallelDuWalker
     private static void OpenPreOpenedChild(int parentFd, DirNode child)
     {
         ReadOnlySpan<byte> full = child.DisplayPath;
-        int lastSlash = full.LastIndexOf((byte)'/');
+        int lastSlash = DuAccounting.LastSeparatorIndex(full);
         ReadOnlySpan<byte> childName = lastSlash >= 0 ? full[(lastSlash + 1)..] : full;
         if (childName.IsEmpty)
             return;
@@ -1811,8 +1833,25 @@ public sealed unsafe class ParallelDuWalker
     {
         int rawCount = 0;
         int order = 0;
+        bool hasInlineStats = dir.HasInlineStats;
         while (dir.MoveNext())
-            PushRawEntry(scratch, ref rawCount, dir.CurrentInode, order++, dir.CurrentName);
+        {
+            int entryOrder = order++;
+            if (hasInlineStats && dir.TryGetInlineStat(out NativeStat inlineStat))
+            {
+                if (scratch.TempInlineStats.Length <= entryOrder)
+                {
+                    int newLen = scratch.TempInlineStats.Length == 0 ? 256 : scratch.TempInlineStats.Length * 2;
+                    while (newLen <= entryOrder)
+                        newLen *= 2;
+                    Array.Resize(ref scratch.TempInlineStats, newLen);
+                }
+
+                scratch.TempInlineStats[entryOrder] = inlineStat;
+            }
+
+            PushRawEntry(scratch, ref rawCount, dir.CurrentInode, entryOrder, dir.CurrentName);
+        }
 
         errno = dir.Error;
         return rawCount;

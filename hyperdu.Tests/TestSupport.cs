@@ -11,6 +11,15 @@ public sealed class UnixFactAttribute : FactAttribute
     }
 }
 
+public sealed class WindowsFactAttribute : FactAttribute
+{
+    public WindowsFactAttribute()
+    {
+        if (!OperatingSystem.IsWindows())
+            Skip = "Requires Windows.";
+    }
+}
+
 public sealed class LinuxFactAttribute : FactAttribute
 {
     public LinuxFactAttribute(string reason)

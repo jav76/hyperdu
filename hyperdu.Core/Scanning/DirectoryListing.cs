@@ -93,7 +93,8 @@ public static class DirectoryListing
     {
         List<(string Name, long Size)> files = new List<(string Name, long Size)>();
         Span<byte> statBuffer = stackalloc byte[NativeIo.StatBufferSize];
-        bool checkHiddenFlag = skipHidden && NativeIo.IsMacOS;
+        bool checkDotHidden = skipHidden && !NativeIo.IsWindows;
+        bool checkHiddenFlag = skipHidden && (NativeIo.IsMacOS || NativeIo.IsWindows);
 
         byte[]? parentNativePath = excludeMatcher != null ? directory.GetNativePath(nullTerminated: false) : null;
         byte[]? pathScratch = excludeMatcher != null
@@ -103,7 +104,7 @@ public static class DirectoryListing
 
         try
         {
-            NativeDirectory? handle = NativeDirectory.OpenPathSafe(directory.GetNativePath(), out int openError);
+            NativeDirectory? handle = NativeDirectory.OpenPathSafe(directory.GetNativePath(), out int openError, followSymlinks: true);
             if (handle == null) throw new IOException(NativeIo.DescribeError(openError));
 
             using (handle)
@@ -111,7 +112,7 @@ public static class DirectoryListing
                 while (handle.MoveNext())
                 {
                     ReadOnlySpan<byte> name = handle.CurrentName;
-                    if (skipHidden && name[0] == (byte)'.') continue;
+                    if (checkDotHidden && name[0] == (byte)'.') continue;
 
                     if (excludeMatcher != null && pathScratch != null)
                     {
