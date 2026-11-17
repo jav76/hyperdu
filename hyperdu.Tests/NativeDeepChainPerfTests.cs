@@ -89,22 +89,21 @@ public sealed partial class NativeDeepChainPerfTests
 
         Assert.True(fixture.LeafPathLength > 8000, $"Expected leaf path > 8000, got {fixture.LeafPathLength}.");
 
-        // Add an ancestor cycle symlink at depth 495 pointing back to depth 50,
+        // Add an ancestor cycle symlink at depth 495 pointing back to depth 200
+        // (relative target length stays < 1024 macOS PATH_MAX so symlinkat succeeds on macOS),
         // a dangling symlink at depth 498, and a peer branch symlink at depth 10.
-        int dir50 = fixture.OpenLevelFd(50);
         int dir495 = fixture.OpenLevelFd(495);
         int dir498 = fixture.OpenLevelFd(498);
         int dir10 = fixture.OpenLevelFd(10);
         try
         {
-            string relUpTo50 = string.Join("/", Enumerable.Repeat("..", 495 - 50));
-            Assert.Equal(0, SymlinkAt(NullTerm(relUpTo50), dir495, NullTerm("cycle_to_50")));
+            string relUpTo200 = string.Join("/", Enumerable.Repeat("..", 495 - 200));
+            Assert.Equal(0, SymlinkAt(NullTerm(relUpTo200), dir495, NullTerm("cycle_to_200")));
             Assert.Equal(0, SymlinkAt(NullTerm("missing_target_abc"), dir498, NullTerm("dangling_sym")));
             Assert.Equal(0, SymlinkAt(NullTerm("deep_s_011_pad012345"), dir10, NullTerm("peer_to_11")));
         }
         finally
         {
-            _ = Close(dir50);
             _ = Close(dir495);
             _ = Close(dir498);
             _ = Close(dir10);

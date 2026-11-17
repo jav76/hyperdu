@@ -359,13 +359,20 @@ public sealed partial class DuDeepChainPerfTests : IDisposable
 
         foreach (string[] args in argMatrix)
         {
-            RunResult seq = RunSequential(args);
             RunResult par = RunParallel(args, workerBudget: 4);
-            Assert.True(seq.ExitCode == 0, $"args=[{string.Join(' ', args)}] seqErr={seq.Stderr}");
-            Assert.Equal(seq.ExitCode, par.ExitCode);
-            Assert.Equal(seq.Stdout, par.Stdout);
-            Assert.Equal(seq.Stderr, par.Stderr);
+            Assert.True(par.ExitCode == 0, $"args=[{string.Join(' ', args)}] parErr={par.Stderr}");
+            Assert.Empty(par.Stderr);
             Assert.Equal(0, par.WorkersStarted);
+
+            // SequentialWalker hits macOS ENAMETOOLONG past ~3.7KB; compare byte-for-byte on Linux.
+            if (!OperatingSystem.IsMacOS())
+            {
+                RunResult seq = RunSequential(args);
+                Assert.True(seq.ExitCode == 0, $"args=[{string.Join(' ', args)}] seqErr={seq.Stderr}");
+                Assert.Equal(seq.ExitCode, par.ExitCode);
+                Assert.Equal(seq.Stdout, par.Stdout);
+                Assert.Equal(seq.Stderr, par.Stderr);
+            }
         }
     }
 
@@ -459,20 +466,30 @@ public sealed partial class DuDeepChainPerfTests : IDisposable
                          new[] { "-B1", "-d", "1", tree.Root }
                      })
             {
-                RunResult seqGnu = RunSequential(args, dialect: "gnu");
                 RunResult parGnu = RunParallel(args, workerBudget: 4, dialect: "gnu");
-                Assert.Equal(1, seqGnu.ExitCode);
-                Assert.Equal(seqGnu.Stdout, parGnu.Stdout);
-                Assert.Equal(seqGnu.Stderr, parGnu.Stderr);
+                Assert.Equal(1, parGnu.ExitCode);
                 Assert.Contains(lockName, parGnu.Stderr, StringComparison.Ordinal);
                 Assert.True(parGnu.Stderr.Length > 5000);
+
+                if (!OperatingSystem.IsMacOS())
+                {
+                    RunResult seqGnu = RunSequential(args, dialect: "gnu");
+                    Assert.Equal(1, seqGnu.ExitCode);
+                    Assert.Equal(seqGnu.Stdout, parGnu.Stdout);
+                    Assert.Equal(seqGnu.Stderr, parGnu.Stderr);
+                }
             }
 
-            RunResult seqBsd = RunSequential(["-A", "-B", "1", "-s", tree.Root], dialect: "bsd");
             RunResult parBsd = RunParallel(["-A", "-B", "1", "-s", tree.Root], workerBudget: 4, dialect: "bsd");
-            Assert.Equal(1, seqBsd.ExitCode);
-            Assert.Equal(seqBsd.Stdout, parBsd.Stdout);
-            Assert.Equal(seqBsd.Stderr, parBsd.Stderr);
+            Assert.Equal(1, parBsd.ExitCode);
+            Assert.Contains(lockName, parBsd.Stderr, StringComparison.Ordinal);
+            if (!OperatingSystem.IsMacOS())
+            {
+                RunResult seqBsd = RunSequential(["-A", "-B", "1", "-s", tree.Root], dialect: "bsd");
+                Assert.Equal(1, seqBsd.ExitCode);
+                Assert.Equal(seqBsd.Stdout, parBsd.Stdout);
+                Assert.Equal(seqBsd.Stderr, parBsd.Stderr);
+            }
         }
         finally
         {
