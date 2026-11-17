@@ -66,14 +66,17 @@ public sealed unsafe class ParallelDuWalker
     private sealed class DirNode
     {
         public readonly DirNode? Parent;
-        public readonly byte[] NullTermPath;
-        public readonly NativeStat DirStat;
+        private readonly byte[] _pathOrSegmentNullTerm;
         public readonly FileIdentity Identity;
-        public readonly ulong RootDevice;
         public readonly ulong Depth;
-        public readonly int ChildIndex;
+        public readonly ulong OwnBytes;
+        public readonly FileTimestamp OwnTime;
+        public readonly int FullDisplayLength;
+        public readonly uint HardLinks;
         public readonly bool FollowChildSymlinks;
         public readonly bool SkipDescent;
+        public readonly bool HasValidFileId;
+        public readonly bool NeedsChildSeparator;
 
         public int PreOpenedFd = -1;
         public int OpenErrno;
@@ -83,6 +86,7 @@ public sealed unsafe class ParallelDuWalker
         public ScannedEntry[]? Entries;
         public int EntryCount;
         public byte[]? NameArena;
+        public DirNode? SingleSubdir;
         public DirNode?[]? Subdirs;
         public int SubdirCount;
         public int UnprintedWeight;
@@ -92,30 +96,48 @@ public sealed unsafe class ParallelDuWalker
 
         public DirNode(
             DirNode? parent,
-            byte[] nullTermPath,
+            byte[] pathOrSegmentNullTerm,
             in NativeStat dirStat,
             FileIdentity identity,
-            ulong rootDevice,
             ulong depth,
-            int childIndex,
+            DuOptions options,
             bool followChildSymlinks,
             bool skipDescent = false)
         {
             Parent = parent;
-            NullTermPath = nullTermPath;
-            DirStat = dirStat;
+            _pathOrSegmentNullTerm = pathOrSegmentNullTerm;
             Identity = identity;
-            RootDevice = rootDevice;
             Depth = depth;
-            ChildIndex = childIndex;
+            OwnBytes = DuAccounting.ComputeEntryValue(in dirStat, options);
+            OwnTime = DuAccounting.ExtractTimestamp(in dirStat, options);
+            HardLinks = dirStat.HardLinks;
+            HasValidFileId = dirStat.HasValidFileId;
             FollowChildSymlinks = followChildSymlinks;
             SkipDescent = skipDescent;
+
+            int segDisplayLen = pathOrSegmentNullTerm.Length > 0 ? pathOrSegmentNullTerm.Length - 1 : 0;
+            if (parent == null)
+            {
+                FullDisplayLength = segDisplayLen;
+                NeedsChildSeparator = segDisplayLen > 0 && !DuAccounting.IsSeparator(pathOrSegmentNullTerm[segDisplayLen - 1]);
+            }
+            else
+            {
+                FullDisplayLength = parent.FullDisplayLength + (parent.NeedsChildSeparator ? 1 : 0) + segDisplayLen;
+                NeedsChildSeparator = FullDisplayLength > 0 &&
+                                      (segDisplayLen > 0
+                                          ? !DuAccounting.IsSeparator(pathOrSegmentNullTerm[segDisplayLen - 1])
+                                          : parent.NeedsChildSeparator);
+            }
+
             if (skipDescent)
                 State = StateCompleted;
         }
 
-        public ReadOnlySpan<byte> DisplayPath =>
-            NullTermPath.Length > 0 ? NullTermPath.AsSpan(0, NullTermPath.Length - 1) : [];
+        public ReadOnlySpan<byte> SegmentOrRootDisplaySpan =>
+            _pathOrSegmentNullTerm.Length > 0 ? _pathOrSegmentNullTerm.AsSpan(0, _pathOrSegmentNullTerm.Length - 1) : [];
+
+        public byte[] RawPathOrSegmentNullTerm => _pathOrSegmentNullTerm;
     }
 
     private sealed class LargeDirBatch
@@ -123,19 +145,18 @@ public sealed unsafe class ParallelDuWalker
         public readonly DirNode Node;
         public readonly int DirFd;
         public readonly NativeDirectory? FallbackDir;
-        public readonly ulong RootDevice;
         public readonly RawDirEntry[] RawEntries;
         public readonly int RawCount;
         public readonly byte[] RawNameArena;
         public readonly ChunkSpec[] Chunks;
         public readonly int FinalReadErrno;
         public int RemainingChunks;
+        public int ResourcesReleased;
 
         public LargeDirBatch(
             DirNode node,
             int dirFd,
             NativeDirectory? fallbackDir,
-            ulong rootDevice,
             RawDirEntry[] rawEntries,
             int rawCount,
             byte[] rawNameArena,
@@ -145,7 +166,6 @@ public sealed unsafe class ParallelDuWalker
             Node = node;
             DirFd = dirFd;
             FallbackDir = fallbackDir;
-            RootDevice = rootDevice;
             RawEntries = rawEntries;
             RawCount = rawCount;
             RawNameArena = rawNameArena;
@@ -195,23 +215,38 @@ public sealed unsafe class ParallelDuWalker
 
     private sealed class WorkerScratch
     {
-        public readonly byte[] DirentBuffer = new byte[DuAccounting.DirentReadBufferSize];
+        public byte[] DirentBuffer = new byte[4096];
         public readonly byte[] StatBuffer = new byte[NativeIo.StatBufferSize];
-        public byte[] PathScratch = new byte[8192];
-        public byte[] TempNameArena = new byte[65536];
+        public byte[] PathScratch = new byte[1024];
+        public byte[]? ParentPathBuffer;
+        public byte[] TempNameArena = new byte[4096];
         public int TempNameArenaLen;
-        public RawDirEntry[] TempEntries = new RawDirEntry[1024];
-        public ScannedEntry[] TempScanned = new ScannedEntry[1024];
-        public readonly List<DirNode> TempSubdirs = new(32);
-        public byte[] CompactArena = new byte[65536];
+        public RawDirEntry[] TempEntries = new RawDirEntry[64];
+        public ScannedEntry[] TempScanned = new ScannedEntry[64];
+        public readonly List<DirNode> TempSubdirs = new(16);
+        public byte[] CompactArena = [];
         public int CompactArenaLen;
         public NativeStat[] TempInlineStats = [];
+
+        public DirNode? AncestorTip;
+        public List<DirNode>? AncestorPath;
+        public HashSet<FileIdentity>? AncestorSet;
+        public List<DirNode>? TempAlignNodes;
+
+        public void ResetAncestors()
+        {
+            AncestorTip = null;
+            AncestorPath?.Clear();
+            AncestorSet?.Clear();
+            TempAlignNodes?.Clear();
+        }
     }
 
     private struct EmitFrame
     {
         public DirNode Node;
         public int EntryIndex;
+        public int SavedPathLen;
         public ulong DirectNonDirBytes;
         public ulong DirectSubdirReportedBytes;
         public ulong SubdirFullBytes;
@@ -234,11 +269,13 @@ public sealed unsafe class ParallelDuWalker
     private readonly bool _hasExcludes;
     private readonly bool _showTime;
     private bool _trackSingleLinkFiles;
+    private ulong _currentRootDevice;
     private WorkerScratch? _inlineScratch;
 
     private readonly object _emitterSync = new();
     private readonly object _workerSpawnLock = new();
     private readonly List<Thread> _workerThreads = [];
+    private readonly List<LargeDirBatch> _activeLargeBatches = [];
 
     private DuOutputWriter? _writer;
     private FrontierWorkQueue<WorkItem>? _queue;
@@ -248,6 +285,8 @@ public sealed unsafe class ParallelDuWalker
 
     private EmitFrame[]? _emitStack;
     private int _emitStackDepth;
+    private byte[]? _emitPathBuf;
+    private int _emitPathLen;
 
     private ulong _grandTotal;
     private FileTimestamp _grandMaxTime = new(0, 0);
@@ -259,7 +298,7 @@ public sealed unsafe class ParallelDuWalker
     private int _pendingInlineSiblings;
     private bool _heuristicsResolved;
     private bool _canEverFanOut = true;
-    private bool _workersStarted;
+    private volatile bool _workersStarted;
     private int _maxWorkerBudget = 1;
     private int _spawnedWorkers;
     private volatile bool _stoppedEarly;
@@ -393,6 +432,19 @@ public sealed unsafe class ParallelDuWalker
             foreach (Thread t in toWait)
                 t.Join();
         }
+
+        LargeDirBatch[]? leftoverBatches;
+        lock (_workerSpawnLock)
+        {
+            leftoverBatches = _activeLargeBatches.Count > 0 ? [.. _activeLargeBatches] : null;
+            _activeLargeBatches.Clear();
+        }
+
+        if (leftoverBatches != null)
+        {
+            foreach (LargeDirBatch batch in leftoverBatches)
+                ReleaseBatchResources(batch);
+        }
     }
 
     private bool IsBackpressureActive()
@@ -436,13 +488,10 @@ public sealed unsafe class ParallelDuWalker
         if (_stoppedEarly)
             return;
 
-        byte[] displayPath = DuAccounting.NormalizeDisplayPath(rawOperand);
+        byte[] nullTermPath = DuAccounting.NormalizeNullTerminatedDisplayPath(rawOperand);
+        ReadOnlySpan<byte> displayPath = nullTermPath.AsSpan(0, nullTermPath.Length - 1);
         if (_hasExcludes && _options.Excludes.IsExcluded(displayPath))
             return;
-
-        byte[] nullTermPath = new byte[displayPath.Length + 1];
-        displayPath.CopyTo(nullTermPath, 0);
-        nullTermPath[displayPath.Length] = 0;
 
         bool followOperand = _options.SymlinkPolicy is SymlinkPolicy.DereferenceArgs or SymlinkPolicy.DereferenceAll;
         NativeStat stat;
@@ -488,18 +537,21 @@ public sealed unsafe class ParallelDuWalker
             return;
         }
 
+        _currentRootDevice = stat.Device;
         bool followChild = _options.SymlinkPolicy == SymlinkPolicy.DereferenceAll;
         DirNode rootNode = new(
             parent: null,
-            nullTermPath: nullTermPath,
+            pathOrSegmentNullTerm: nullTermPath,
             dirStat: in stat,
             identity: operandId,
-            rootDevice: stat.Device,
             depth: 0,
-            childIndex: 0,
+            options: _options,
             followChildSymlinks: followChild);
 
-        Volatile.Write(ref _frontierTarget, rootNode);
+        if (_workersStarted)
+            Volatile.Write(ref _frontierTarget, rootNode);
+        else
+            _frontierTarget = rootNode;
         _pendingInlineSiblings = 0;
         DirWalkResult walked = EmitTreeIterative(rootNode);
         _grandTotal += walked.FullBytes;
@@ -512,182 +564,226 @@ public sealed unsafe class ParallelDuWalker
     private DirWalkResult EmitTreeIterative(DirNode rootNode)
     {
         WorkerScratch inlineScratch = EnsureInlineScratch();
+        inlineScratch.ResetAncestors();
+        _activeAncestors.Clear();
         _emitStackDepth = 0;
+        _emitPathLen = 0;
         if (!PushEmitFrame(rootNode))
             return default;
 
         DirWalkResult rootResult = default;
-        while (_emitStackDepth > 0)
+        try
         {
-            if (_cancellationToken.IsCancellationRequested)
-                throw new OperationCanceledException(_cancellationToken);
-
-            ref EmitFrame frame = ref _emitStack![_emitStackDepth - 1];
-            DirNode node = frame.Node;
-            ScannedEntry[]? entries = node.Entries;
-            int entryCount = node.EntryCount;
-
-            if (frame.EntryIndex < entryCount && entries != null)
-            {
-                int idx = frame.EntryIndex;
-                frame.EntryIndex = idx + 1;
-                ref readonly ScannedEntry entry = ref entries[idx];
-
-                switch (entry.Kind)
-                {
-                    case ScannedEntryKind.StatError:
-                    {
-                        ReadOnlySpan<byte> name = node.NameArena.AsSpan(entry.NameOffset, entry.NameLength);
-                        int len = DuAccounting.WriteChildPathInto(node.DisplayPath, name, ref inlineScratch.PathScratch);
-                        _writer!.WritePosixError("cannot access", inlineScratch.PathScratch.AsSpan(0, len), entry.SubdirOrErrno);
-                        break;
-                    }
-                    case ScannedEntryKind.ReadError:
-                    {
-                        _writer!.WritePosixError("cannot read directory", node.DisplayPath, entry.SubdirOrErrno);
-                        break;
-                    }
-                    case ScannedEntryKind.BsdSymlinkLoop:
-                    {
-                        ReadOnlySpan<byte> name = node.NameArena.AsSpan(entry.NameOffset, entry.NameLength);
-                        int len = DuAccounting.WriteChildPathInto(node.DisplayPath, name, ref inlineScratch.PathScratch);
-                        _writer!.WriteBsdTooManySymlinksError(inlineScratch.PathScratch.AsSpan(0, len));
-                        ShutdownWorkers();
-                        break;
-                    }
-                    case ScannedEntryKind.BsdSymlinkCycle:
-                    {
-                        DirNode? cycleTarget = FindAncestorNode(node, entry.Identity);
-                        if (cycleTarget != null)
-                        {
-                            ReadOnlySpan<byte> name = node.NameArena.AsSpan(entry.NameOffset, entry.NameLength);
-                            int len = DuAccounting.WriteChildPathInto(node.DisplayPath, name, ref inlineScratch.PathScratch);
-                            _writer!.WriteBsdSymlinkCycleError(inlineScratch.PathScratch.AsSpan(0, len), cycleTarget.DisplayPath);
-                            ShutdownWorkers();
-                        }
-
-                        break;
-                    }
-                    case ScannedEntryKind.NonDir:
-                    {
-                        if (!_options.CountLinks && entry.TrackIdentity && !_seen.TryClaim(entry.Identity, entry.HardLinks))
-                            break;
-
-                        frame.DirectNonDirBytes += entry.Value;
-                        if (_showTime)
-                            frame.DirectMaxTime = FileTimestamp.Max(frame.DirectMaxTime, entry.Time);
-
-                        if (_options.All && node.Depth + 1 <= _maxDepth && DuAccounting.ShouldEmitForThreshold(entry.Value, _options, isDirectory: false))
-                        {
-                            ReadOnlySpan<byte> name = node.NameArena.AsSpan(entry.NameOffset, entry.NameLength);
-                            int len = DuAccounting.WriteChildPathInto(node.DisplayPath, name, ref inlineScratch.PathScratch);
-                            _writer!.EmitLine(entry.Value, entry.Time, inlineScratch.PathScratch.AsSpan(0, len));
-                        }
-
-                        break;
-                    }
-                    case ScannedEntryKind.Subdir:
-                    {
-                        DirNode? child = node.Subdirs![entry.SubdirOrErrno];
-                        if (child == null)
-                            break;
-
-                        if (!_workersStarted)
-                            _pendingInlineSiblings = Math.Max(0, _pendingInlineSiblings - 1);
-
-                        if (_activeAncestors.Contains(child.Identity))
-                        {
-                            if (_options.Dialect == DuDialect.Bsd)
-                            {
-                                DirNode? cycleTarget = FindAncestorNode(node, child.Identity);
-                                if (cycleTarget != null)
-                                {
-                                    _writer!.WriteBsdSymlinkCycleError(child.DisplayPath, cycleTarget.DisplayPath);
-                                    ShutdownWorkers();
-                                    break;
-                                }
-                            }
-
-                            CancelAndReleaseSubtree(child);
-                            break;
-                        }
-
-                        if (!_options.CountLinks && _options.Dialect == DuDialect.Gnu && !_seen.TryClaim(child.Identity, child.DirStat.HardLinks))
-                        {
-                            CancelAndReleaseSubtree(child);
-                            break;
-                        }
-
-                        Volatile.Write(ref _frontierTarget, child);
-                        _ = PushEmitFrame(child);
-                        break;
-                    }
-                }
-
-                if (_stoppedEarly)
-                    break;
-
-                continue;
-            }
-
-            // Directory children finished: compute totals, emit line if within max-depth/threshold, and pop frame.
-            _activeAncestors.Remove(node.Identity);
-
-            ulong ownBytes = DuAccounting.ComputeEntryValue(in node.DirStat, _options);
-            ulong ownAndFiles = ownBytes + frame.DirectNonDirBytes;
-            ulong reportedTotal = _options.SeparateDirs ? ownAndFiles : ownAndFiles + frame.DirectSubdirReportedBytes;
-            ulong fullTotal = ownAndFiles + frame.SubdirFullBytes;
-
-            FileTimestamp reportedTime = (!_options.SeparateDirs && frame.HasSubdirReportedTime)
-                ? FileTimestamp.Max(frame.DirectMaxTime, frame.SubdirReportedMaxTime)
-                : frame.DirectMaxTime;
-            FileTimestamp fullTime = frame.HasSubdirFullTime
-                ? FileTimestamp.Max(frame.DirectMaxTime, frame.SubdirFullMaxTime)
-                : frame.DirectMaxTime;
-
-            if (node.Depth <= _maxDepth && DuAccounting.ShouldEmitForThreshold(reportedTotal, _options))
-                _writer!.EmitLine(reportedTotal, reportedTime, node.DisplayPath);
-
-            DirWalkResult dirResult = new(
-                _options.SeparateDirs ? 0UL : reportedTotal,
-                fullTotal,
-                reportedTime,
-                fullTime);
-
-            ReleaseNodePayload(node);
-            _emitStackDepth--;
-
-            if (_emitStackDepth == 0)
-            {
-                rootResult = dirResult;
-                break;
-            }
-
-            ref EmitFrame parentFrame = ref _emitStack![_emitStackDepth - 1];
-            parentFrame.DirectSubdirReportedBytes += dirResult.ReportedToParent;
-            parentFrame.SubdirFullBytes += dirResult.FullBytes;
-            DuAccounting.AccumulateSubdirTime(
-                in dirResult,
-                _options.SeparateDirs,
-                _showTime,
-                ref parentFrame.HasSubdirReportedTime,
-                ref parentFrame.SubdirReportedMaxTime,
-                ref parentFrame.HasSubdirFullTime,
-                ref parentFrame.SubdirFullMaxTime);
-        }
-
-        if (_emitStackDepth > 0)
-        {
-            ShutdownWorkers();
             while (_emitStackDepth > 0)
             {
-                ref EmitFrame remaining = ref _emitStack![--_emitStackDepth];
-                _activeAncestors.Remove(remaining.Node.Identity);
-                CancelAndReleaseSubtree(remaining.Node);
+                if (_cancellationToken.IsCancellationRequested)
+                    throw new OperationCanceledException(_cancellationToken);
+
+                ref EmitFrame frame = ref _emitStack![_emitStackDepth - 1];
+                DirNode node = frame.Node;
+                ScannedEntry[]? entries = node.Entries;
+                int entryCount = node.EntryCount;
+
+                if (frame.EntryIndex == 0 && node.SingleSubdir != null && entries == null)
+                {
+                    frame.EntryIndex = 1;
+                    if (!TryDescendSubdir(node, node.SingleSubdir, isSiblingAfterFirst: false, inlineScratch))
+                    {
+                        if (_stoppedEarly)
+                            break;
+                    }
+
+                    continue;
+                }
+
+                if (frame.EntryIndex < entryCount && entries != null)
+                {
+                    int idx = frame.EntryIndex;
+                    frame.EntryIndex = idx + 1;
+                    ref readonly ScannedEntry entry = ref entries[idx];
+
+                    switch (entry.Kind)
+                    {
+                        case ScannedEntryKind.StatError:
+                        {
+                            ReadOnlySpan<byte> name = node.NameArena.AsSpan(entry.NameOffset, entry.NameLength);
+                            int len = WriteEmitChildPath(node, name, ref inlineScratch.PathScratch);
+                            _writer!.WritePosixError("cannot access", inlineScratch.PathScratch.AsSpan(0, len), entry.SubdirOrErrno);
+                            break;
+                        }
+                        case ScannedEntryKind.ReadError:
+                        {
+                            ReadOnlySpan<byte> nodePath = GetEmitNodeDisplayPath(node, ref inlineScratch.PathScratch);
+                            _writer!.WritePosixError("cannot read directory", nodePath, entry.SubdirOrErrno);
+                            break;
+                        }
+                        case ScannedEntryKind.BsdSymlinkLoop:
+                        {
+                            ReadOnlySpan<byte> name = node.NameArena.AsSpan(entry.NameOffset, entry.NameLength);
+                            int len = WriteEmitChildPath(node, name, ref inlineScratch.PathScratch);
+                            _writer!.WriteBsdTooManySymlinksError(inlineScratch.PathScratch.AsSpan(0, len));
+                            ShutdownWorkers();
+                            break;
+                        }
+                        case ScannedEntryKind.BsdSymlinkCycle:
+                        {
+                            DirNode? cycleTarget = FindAncestorNode(node, entry.Identity);
+                            if (cycleTarget != null)
+                            {
+                                ReadOnlySpan<byte> name = node.NameArena.AsSpan(entry.NameOffset, entry.NameLength);
+                                int len = WriteEmitChildPath(node, name, ref inlineScratch.PathScratch);
+                                EmitBsdSymlinkCycleError(inlineScratch.PathScratch.AsSpan(0, len), cycleTarget);
+                                ShutdownWorkers();
+                            }
+
+                            break;
+                        }
+                        case ScannedEntryKind.NonDir:
+                        {
+                            if (!_options.CountLinks && entry.TrackIdentity && !_seen.TryClaim(entry.Identity, entry.HardLinks))
+                                break;
+
+                            frame.DirectNonDirBytes += entry.Value;
+                            if (_showTime)
+                                frame.DirectMaxTime = FileTimestamp.Max(frame.DirectMaxTime, entry.Time);
+
+                            if (_options.All && node.Depth < _maxDepth && DuAccounting.ShouldEmitForThreshold(entry.Value, _options, isDirectory: false))
+                            {
+                                ReadOnlySpan<byte> name = node.NameArena.AsSpan(entry.NameOffset, entry.NameLength);
+                                int len = WriteEmitChildPath(node, name, ref inlineScratch.PathScratch);
+                                _writer!.EmitLine(entry.Value, entry.Time, inlineScratch.PathScratch.AsSpan(0, len));
+                            }
+
+                            break;
+                        }
+                        case ScannedEntryKind.Subdir:
+                        {
+                            DirNode? child = node.SubdirCount == 1 ? node.SingleSubdir : node.Subdirs![entry.SubdirOrErrno];
+                            if (child == null)
+                                break;
+
+                            bool isSiblingAfterFirst = node.SubdirCount > 1 && entry.SubdirOrErrno > 0;
+                            _ = TryDescendSubdir(node, child, isSiblingAfterFirst, inlineScratch);
+                            break;
+                        }
+                    }
+
+                    if (_stoppedEarly)
+                        break;
+
+                    continue;
+                }
+
+                // Directory children finished: compute totals, emit line if within max-depth/threshold, and pop frame.
+                if (node.HasValidFileId)
+                    _activeAncestors.Remove(node.Identity);
+
+                ulong ownBytes = node.OwnBytes;
+                ulong ownAndFiles = ownBytes + frame.DirectNonDirBytes;
+                ulong reportedTotal = _options.SeparateDirs ? ownAndFiles : ownAndFiles + frame.DirectSubdirReportedBytes;
+                ulong fullTotal = ownAndFiles + frame.SubdirFullBytes;
+
+                FileTimestamp reportedTime = (!_options.SeparateDirs && frame.HasSubdirReportedTime)
+                    ? FileTimestamp.Max(frame.DirectMaxTime, frame.SubdirReportedMaxTime)
+                    : frame.DirectMaxTime;
+                FileTimestamp fullTime = frame.HasSubdirFullTime
+                    ? FileTimestamp.Max(frame.DirectMaxTime, frame.SubdirFullMaxTime)
+                    : frame.DirectMaxTime;
+
+                if (node.Depth <= _maxDepth && DuAccounting.ShouldEmitForThreshold(reportedTotal, _options))
+                {
+                    ReadOnlySpan<byte> emitPath = GetEmitNodeDisplayPath(node, ref inlineScratch.PathScratch);
+                    _writer!.EmitLine(reportedTotal, reportedTime, emitPath);
+                }
+
+                DirWalkResult dirResult = new(
+                    _options.SeparateDirs ? 0UL : reportedTotal,
+                    fullTotal,
+                    reportedTime,
+                    fullTime);
+
+                _emitPathLen = frame.SavedPathLen;
+                ReleaseNodePayload(node);
+                _emitStackDepth--;
+
+                if (_emitStackDepth == 0)
+                {
+                    rootResult = dirResult;
+                    break;
+                }
+
+                ref EmitFrame parentFrame = ref _emitStack![_emitStackDepth - 1];
+                parentFrame.DirectSubdirReportedBytes += dirResult.ReportedToParent;
+                parentFrame.SubdirFullBytes += dirResult.FullBytes;
+                DuAccounting.AccumulateSubdirTime(
+                    in dirResult,
+                    _options.SeparateDirs,
+                    _showTime,
+                    ref parentFrame.HasSubdirReportedTime,
+                    ref parentFrame.SubdirReportedMaxTime,
+                    ref parentFrame.HasSubdirFullTime,
+                    ref parentFrame.SubdirFullMaxTime);
             }
+        }
+        finally
+        {
+            if (_emitStackDepth > 0)
+            {
+                ShutdownWorkers();
+                while (_emitStackDepth > 0)
+                {
+                    ref EmitFrame remaining = ref _emitStack![--_emitStackDepth];
+                    if (remaining.Node.HasValidFileId)
+                        _activeAncestors.Remove(remaining.Node.Identity);
+                    CancelAndReleaseSubtree(remaining.Node);
+                }
+            }
+
+            _emitPathLen = 0;
         }
 
         return rootResult;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TryDescendSubdir(DirNode parent, DirNode child, bool isSiblingAfterFirst, WorkerScratch inlineScratch)
+    {
+        if (isSiblingAfterFirst && !_workersStarted)
+            _pendingInlineSiblings = Math.Max(0, _pendingInlineSiblings - 1);
+
+        if (_workersStarted && child.HasValidFileId && _activeAncestors.Contains(child.Identity))
+        {
+            if (_options.Dialect == DuDialect.Bsd)
+            {
+                DirNode? cycleTarget = FindAncestorNode(parent, child.Identity);
+                if (cycleTarget != null)
+                {
+                    ReadOnlySpan<byte> childPath = GetNodeDisplayPath(child, ref inlineScratch.PathScratch);
+                    EmitBsdSymlinkCycleError(childPath, cycleTarget);
+                    ShutdownWorkers();
+                    return false;
+                }
+            }
+
+            CancelAndReleaseSubtree(child);
+            return true;
+        }
+
+        if (!_options.CountLinks &&
+            _options.Dialect == DuDialect.Gnu &&
+            child.HasValidFileId &&
+            !_seen.TryClaim(child.Identity, child.HardLinks))
+        {
+            CancelAndReleaseSubtree(child);
+            return true;
+        }
+
+        if (_workersStarted)
+            Volatile.Write(ref _frontierTarget, child);
+        else
+            _frontierTarget = child;
+        _ = PushEmitFrame(child);
+        return !_stoppedEarly;
     }
 
     private bool PushEmitFrame(DirNode node)
@@ -696,9 +792,10 @@ public sealed unsafe class ParallelDuWalker
 
         if (node.OpenErrno != 0)
         {
-            ulong ownBytes = DuAccounting.ComputeEntryValue(in node.DirStat, _options);
-            FileTimestamp ownTime = DuAccounting.ExtractTimestamp(in node.DirStat, _options);
-            _writer!.WritePosixError("cannot read directory", node.DisplayPath, node.OpenErrno);
+            ulong ownBytes = node.OwnBytes;
+            FileTimestamp ownTime = node.OwnTime;
+            ReadOnlySpan<byte> errPath = GetNodeDisplayPath(node, ref EnsureInlineScratch().PathScratch);
+            _writer!.WritePosixError("cannot read directory", errPath, node.OpenErrno);
             if (_options.Dialect == DuDialect.Bsd)
             {
                 ReleaseNodePayload(node);
@@ -706,7 +803,7 @@ public sealed unsafe class ParallelDuWalker
             }
 
             if (node.Depth <= _maxDepth && DuAccounting.ShouldEmitForThreshold(ownBytes, _options))
-                _writer.EmitLine(ownBytes, ownTime, node.DisplayPath);
+                _writer.EmitLine(ownBytes, ownTime, errPath);
 
             DirWalkResult errResult = new(ownBytes, ownBytes, ownTime, ownTime);
             ReleaseNodePayload(node);
@@ -728,14 +825,21 @@ public sealed unsafe class ParallelDuWalker
             return true;
         }
 
-        _activeAncestors.Add(node.Identity);
+        if (node.HasValidFileId)
+            _activeAncestors.Add(node.Identity);
 
-        FileTimestamp dirOwnTime = DuAccounting.ExtractTimestamp(in node.DirStat, _options);
+        int savedPathLen = _emitPathLen;
+        if (_maxDepth > 0 && node.Depth <= _maxDepth)
+        {
+            AppendNodeToEmitPath(node);
+        }
+
+        FileTimestamp dirOwnTime = node.OwnTime;
         FileTimestamp initialMaxTime = node.HasInlineTime
             ? FileTimestamp.Max(dirOwnTime, node.InlineMaxTime)
             : dirOwnTime;
 
-        _emitStack ??= new EmitFrame[128];
+        _emitStack ??= new EmitFrame[32];
         if (_emitStackDepth == _emitStack.Length)
             Array.Resize(ref _emitStack, _emitStack.Length * 2);
 
@@ -743,6 +847,7 @@ public sealed unsafe class ParallelDuWalker
         {
             Node = node,
             EntryIndex = 0,
+            SavedPathLen = savedPathLen,
             DirectNonDirBytes = node.InlineNonDirBytes,
             DirectMaxTime = initialMaxTime
         };
@@ -752,18 +857,20 @@ public sealed unsafe class ParallelDuWalker
 
     private void EnsureNodeCompleted(DirNode node)
     {
-        if (Volatile.Read(ref node.State) == StateCompleted)
-            return;
-
         if (!_workersStarted)
         {
-            if (Interlocked.CompareExchange(ref node.State, StateClaimed, StatePending) == StatePending)
+            if (node.State == StatePending)
             {
+                node.State = StateClaimed;
                 ScanDirectoryNode(node, EnsureInlineScratch(), isWorkerThread: false);
             }
 
-            if (Volatile.Read(ref node.State) == StateCompleted)
+            if (node.State == StateCompleted)
                 return;
+        }
+        else if (Volatile.Read(ref node.State) == StateCompleted)
+        {
+            return;
         }
 
         // Workers exist (either previously spawned or started mid-scan via chunk batching).
@@ -843,11 +950,23 @@ public sealed unsafe class ParallelDuWalker
 
     private DirNode? ScanDirectoryNode(DirNode node, WorkerScratch scratch, bool isWorkerThread)
     {
+        bool isConcurrent = isWorkerThread || _workersStarted;
         int dirFd;
         NativeDirectory? fallbackDir;
         int openErrno;
 
-        int preOpenedFd = Interlocked.Exchange(ref node.PreOpenedFd, -1);
+        int preOpenedFd;
+        if (isConcurrent)
+        {
+            preOpenedFd = Interlocked.Exchange(ref node.PreOpenedFd, -1);
+        }
+        else
+        {
+            preOpenedFd = node.PreOpenedFd;
+            if (preOpenedFd >= 0)
+                node.PreOpenedFd = -1;
+        }
+
         if (preOpenedFd >= 0)
         {
             dirFd = preOpenedFd;
@@ -858,8 +977,9 @@ public sealed unsafe class ParallelDuWalker
         {
             bool followOpen = node.FollowChildSymlinks ||
                               (node.Parent == null && _options.SymlinkPolicy is SymlinkPolicy.DereferenceArgs or SymlinkPolicy.DereferenceAll);
+            ReadOnlySpan<byte> nullTermPath = GetNodeNullTermPath(node, ref scratch.PathScratch);
             DuAccounting.OpenDirectoryPathSafe(
-                node.NullTermPath,
+                nullTermPath,
                 out dirFd,
                 out fallbackDir,
                 out openErrno,
@@ -869,7 +989,7 @@ public sealed unsafe class ParallelDuWalker
         if (openErrno != 0)
         {
             node.OpenErrno = openErrno;
-            MarkNodeCompleted(node);
+            MarkNodeCompleted(node, isConcurrent);
             return null;
         }
 
@@ -891,7 +1011,7 @@ public sealed unsafe class ParallelDuWalker
 
             if (rawCount >= LargeDirChunkThreshold &&
                 !hasInlineStats &&
-                TryEnableWorkersForLargeDir(node, rawCount))
+                TryEnableWorkersForLargeDir(node, rawCount, scratch))
             {
                 if (node.FollowChildSymlinks)
                 {
@@ -918,7 +1038,8 @@ public sealed unsafe class ParallelDuWalker
                 rawCount,
                 readErrno,
                 scratch,
-                isWorkerThread);
+                isWorkerThread,
+                isConcurrent);
         }
         finally
         {
@@ -940,18 +1061,24 @@ public sealed unsafe class ParallelDuWalker
         int rawCount,
         int readErrno,
         WorkerScratch scratch,
-        bool isWorkerThread)
+        bool isWorkerThread,
+        bool isConcurrent)
     {
         scratch.TempSubdirs.Clear();
         scratch.CompactArenaLen = 0;
         if (scratch.TempScanned.Length < rawCount + 1)
-            scratch.TempScanned = new ScannedEntry[rawCount + 1];
+            scratch.TempScanned = new ScannedEntry[Math.Max(scratch.TempScanned.Length * 2, rawCount + 1)];
 
         int keptCount = 0;
         ulong inlineBytes = 0;
         FileTimestamp inlineTime = default;
         bool hasInlineTime = false;
         bool followChild = node.FollowChildSymlinks;
+
+        bool needParentPath = followChild || (_hasExcludes && !_options.Excludes.MatchBasenameOnly);
+        ReadOnlySpan<byte> parentDisplayPath = needParentPath && rawCount > 0
+            ? GetNodeParentDisplayPath(node, ref scratch.ParentPathBuffer)
+            : [];
 
         for (int i = 0; i < rawCount; i++)
         {
@@ -961,7 +1088,7 @@ public sealed unsafe class ParallelDuWalker
             ref readonly RawDirEntry raw = ref scratch.TempEntries[i];
             ReadOnlySpan<byte> nameSpan = scratch.TempNameArena.AsSpan(raw.NameOffset, raw.NameLength);
 
-            if (_hasExcludes && DuAccounting.ShouldExcludeChild(_options, node.DisplayPath, nameSpan, ref scratch.PathScratch))
+            if (_hasExcludes && DuAccounting.ShouldExcludeChild(_options, parentDisplayPath, nameSpan, ref scratch.PathScratch))
                 continue;
 
             NativeStat childStat;
@@ -983,7 +1110,7 @@ public sealed unsafe class ParallelDuWalker
                 {
                     statOk = DuAccounting.TryStatChildEntry(
                         dirFd,
-                        node.DisplayPath,
+                        parentDisplayPath,
                         nameSpan,
                         pName,
                         followChild,
@@ -1009,7 +1136,7 @@ public sealed unsafe class ParallelDuWalker
                 continue;
             }
 
-            if (!TryClassifyChild(node, node.RootDevice, nameSpan, in childStat, scratch.TempSubdirs.Count, ref scratch.PathScratch, out DirNode? childNode, out FileIdentity childId, out bool isBsdCycle))
+            if (!TryClassifyChild(node, nameSpan, in childStat, scratch, isConcurrent, out DirNode? childNode, out FileIdentity childId, out bool isBsdCycle))
             {
                 if (isBsdCycle)
                 {
@@ -1087,13 +1214,14 @@ public sealed unsafe class ParallelDuWalker
             hasInlineTime,
             scratch.TempScanned.AsSpan(0, keptCount),
             scratch.CompactArena.AsSpan(0, scratch.CompactArenaLen),
-            scratch.TempSubdirs);
+            scratch.TempSubdirs,
+            isConcurrent);
 
         // Pre-open Subdirs[0] via openat while parent dirFd is still open for fast FD-relative spine traversal.
         DirNode? inlineContinuation = null;
         if (node.SubdirCount > 0 && fallbackDir == null && !followChild && NativeIo.UsesGetdents64)
         {
-            DirNode firstChild = node.Subdirs![0]!;
+            DirNode firstChild = node.SubdirCount == 1 ? node.SingleSubdir! : node.Subdirs![0]!;
             if (!firstChild.SkipDescent)
             {
                 if (isWorkerThread)
@@ -1104,7 +1232,9 @@ public sealed unsafe class ParallelDuWalker
                         inlineContinuation = firstChild;
                     }
                 }
-                else if (node.SubdirCount == 1)
+                else if (node.SubdirCount == 1 ||
+                         !_canEverFanOut ||
+                         _pendingInlineSiblings + (node.SubdirCount - 1) < FanOutSiblingThreshold)
                 {
                     OpenPreOpenedChild(dirFd, firstChild);
                 }
@@ -1114,18 +1244,18 @@ public sealed unsafe class ParallelDuWalker
         if (isWorkerThread)
         {
             EnqueueRemainingSubdirs(node, startIndex: inlineContinuation != null ? 1 : 0);
-            MarkNodeCompleted(node);
+            MarkNodeCompleted(node, isConcurrent: true);
             return inlineContinuation;
         }
 
-        MarkNodeCompleted(node);
+        MarkNodeCompleted(node, isConcurrent);
 
-        if (node.SubdirCount > 0)
+        if (node.SubdirCount > 1)
         {
-            _pendingInlineSiblings += Math.Max(0, node.SubdirCount - 1);
+            _pendingInlineSiblings += node.SubdirCount - 1;
             if (_canEverFanOut && _pendingInlineSiblings >= FanOutSiblingThreshold)
             {
-                if (TryActivateWorkersFromInline(node))
+                if (TryActivateWorkersFromInline(node, scratch))
                     return null;
             }
         }
@@ -1140,12 +1270,42 @@ public sealed unsafe class ParallelDuWalker
         bool hasInlineTime,
         ReadOnlySpan<ScannedEntry> entries,
         ReadOnlySpan<byte> arena,
-        List<DirNode> subdirs)
+        List<DirNode> subdirs,
+        bool isConcurrent)
     {
         node.InlineNonDirBytes = inlineBytes;
         node.InlineMaxTime = inlineTime;
         node.HasInlineTime = hasInlineTime;
         node.EntryCount = entries.Length;
+
+        if (subdirs.Count == 1)
+        {
+            node.SingleSubdir = subdirs[0];
+            node.SubdirCount = 1;
+            if (entries.Length == 1)
+            {
+                // Single-subdir fast path: avoid renting a 1-element ScannedEntry[] from ArrayPool.
+                if (arena.Length > 0)
+                {
+                    byte[] rentedArenaOnly = ArrayPool<byte>.Shared.Rent(arena.Length);
+                    arena.CopyTo(rentedArenaOnly);
+                    node.NameArena = rentedArenaOnly;
+                }
+
+                if (isConcurrent)
+                {
+                    node.UnprintedWeight = 2;
+                    AddUnprintedEntries(2);
+                }
+
+                return;
+            }
+        }
+        else if (subdirs.Count > 1)
+        {
+            node.Subdirs = subdirs.ToArray();
+            node.SubdirCount = subdirs.Count;
+        }
 
         if (entries.Length > 0)
         {
@@ -1161,19 +1321,22 @@ public sealed unsafe class ParallelDuWalker
             node.NameArena = rentedArena;
         }
 
-        if (subdirs.Count > 0)
+        if (isConcurrent)
         {
-            node.Subdirs = subdirs.ToArray();
-            node.SubdirCount = subdirs.Count;
+            int weight = entries.Length + 1;
+            node.UnprintedWeight = weight;
+            AddUnprintedEntries(weight);
         }
-
-        int weight = entries.Length + 1;
-        node.UnprintedWeight = weight;
-        AddUnprintedEntries(weight);
     }
 
-    private void MarkNodeCompleted(DirNode node)
+    private void MarkNodeCompleted(DirNode node, bool isConcurrent)
     {
+        if (!isConcurrent)
+        {
+            node.State = StateCompleted;
+            return;
+        }
+
         Volatile.Write(ref node.State, StateCompleted);
         Thread.MemoryBarrier();
         if (Volatile.Read(ref _waitingOnNode) == node)
@@ -1216,12 +1379,16 @@ public sealed unsafe class ParallelDuWalker
             node,
             dirFd,
             fallbackDir,
-            node.RootDevice,
             rawEntries,
             rawCount,
             rawNames,
             chunks,
             finalReadErrno);
+
+        lock (_workerSpawnLock)
+        {
+            _activeLargeBatches.Add(batch);
+        }
 
         // Push chunks 1..N-1 onto High tier so already-opened dirFd completes without backpressure stalls.
         for (int c = chunkCount - 1; c >= 1; c--)
@@ -1243,6 +1410,11 @@ public sealed unsafe class ParallelDuWalker
         byte[]? chunkArena = _options.All ? ArrayPool<byte>.Shared.Rent(4096) : null;
         int chunkArenaLen = 0;
 
+        bool needParentPath = followChild || (_hasExcludes && !_options.Excludes.MatchBasenameOnly);
+        ReadOnlySpan<byte> parentDisplayPath = needParentPath && spec.Start < spec.End
+            ? GetNodeParentDisplayPath(node, ref scratch.ParentPathBuffer)
+            : [];
+
         for (int i = spec.Start; i < spec.End; i++)
         {
             if ((i & 255) == 0 && _cancellationToken.IsCancellationRequested)
@@ -1251,7 +1423,7 @@ public sealed unsafe class ParallelDuWalker
             ref readonly RawDirEntry raw = ref batch.RawEntries[i];
             ReadOnlySpan<byte> nameSpan = batch.RawNameArena.AsSpan(raw.NameOffset, raw.NameLength);
 
-            if (_hasExcludes && DuAccounting.ShouldExcludeChild(_options, node.DisplayPath, nameSpan, ref scratch.PathScratch))
+            if (_hasExcludes && DuAccounting.ShouldExcludeChild(_options, parentDisplayPath, nameSpan, ref scratch.PathScratch))
                 continue;
 
             NativeStat childStat;
@@ -1263,7 +1435,7 @@ public sealed unsafe class ParallelDuWalker
             {
                 statOk = DuAccounting.TryStatChildEntry(
                     batch.DirFd,
-                    node.DisplayPath,
+                    parentDisplayPath,
                     nameSpan,
                     pName,
                     followChild,
@@ -1288,7 +1460,7 @@ public sealed unsafe class ParallelDuWalker
                 continue;
             }
 
-            if (!TryClassifyChild(node, batch.RootDevice, nameSpan, in childStat, subdirs?.Count ?? 0, ref scratch.PathScratch, out DirNode? childNode, out FileIdentity childId, out bool isBsdCycle))
+            if (!TryClassifyChild(node, nameSpan, in childStat, scratch, isConcurrent: true, out DirNode? childNode, out FileIdentity childId, out bool isBsdCycle))
             {
                 if (isBsdCycle)
                 {
@@ -1370,14 +1542,44 @@ public sealed unsafe class ParallelDuWalker
             FinalizeLargeDirBatch(batch);
     }
 
-    private void FinalizeLargeDirBatch(LargeDirBatch batch)
+    private void ReleaseBatchResources(LargeDirBatch batch)
     {
+        if (Interlocked.Exchange(ref batch.ResourcesReleased, 1) != 0)
+            return;
+
         if (batch.FallbackDir != null)
             batch.FallbackDir.Dispose();
         else if (batch.DirFd >= 0)
             _ = Libc.close(batch.DirFd);
+
         ArrayPool<RawDirEntry>.Shared.Return(batch.RawEntries);
         ArrayPool<byte>.Shared.Return(batch.RawNameArena);
+        foreach (ChunkSpec c in batch.Chunks)
+        {
+            if (c.Arena != null)
+            {
+                ArrayPool<byte>.Shared.Return(c.Arena);
+                c.Arena = null;
+            }
+        }
+    }
+
+    private void FinalizeLargeDirBatch(LargeDirBatch batch)
+    {
+        lock (_workerSpawnLock)
+        {
+            _activeLargeBatches.Remove(batch);
+        }
+
+        if (Interlocked.Exchange(ref batch.ResourcesReleased, 1) == 0)
+        {
+            if (batch.FallbackDir != null)
+                batch.FallbackDir.Dispose();
+            else if (batch.DirFd >= 0)
+                _ = Libc.close(batch.DirFd);
+            ArrayPool<RawDirEntry>.Shared.Return(batch.RawEntries);
+            ArrayPool<byte>.Shared.Return(batch.RawNameArena);
+        }
 
         DirNode node = batch.Node;
         int totalEntries = batch.FinalReadErrno != 0 ? 1 : 0;
@@ -1405,7 +1607,8 @@ public sealed unsafe class ParallelDuWalker
 
         ScannedEntry[]? finalEntries = totalEntries > 0 ? ArrayPool<ScannedEntry>.Shared.Rent(totalEntries) : null;
         byte[]? finalArena = totalArena > 0 ? ArrayPool<byte>.Shared.Rent(totalArena) : null;
-        DirNode?[]? finalSubdirs = totalSubdirs > 0 ? new DirNode?[totalSubdirs] : null;
+        DirNode?[]? finalSubdirs = totalSubdirs > 1 ? new DirNode?[totalSubdirs] : null;
+        DirNode? singleSubdir = null;
 
         int entryPos = 0;
         int arenaPos = 0;
@@ -1437,7 +1640,13 @@ public sealed unsafe class ParallelDuWalker
             if (c.Subdirs != null)
             {
                 foreach (DirNode s in c.Subdirs)
-                    finalSubdirs![subdirOffset++] = s;
+                {
+                    if (totalSubdirs == 1)
+                        singleSubdir = s;
+                    else
+                        finalSubdirs![subdirOffset] = s;
+                    subdirOffset++;
+                }
             }
 
             arenaPos += c.ArenaLen;
@@ -1458,23 +1667,36 @@ public sealed unsafe class ParallelDuWalker
         node.Entries = finalEntries;
         node.EntryCount = entryPos;
         node.NameArena = finalArena;
+        node.SingleSubdir = singleSubdir;
         node.Subdirs = finalSubdirs;
         node.SubdirCount = subdirOffset;
         node.UnprintedWeight = entryPos + 1;
         AddUnprintedEntries(node.UnprintedWeight);
 
         EnqueueRemainingSubdirs(node, startIndex: 0);
-        MarkNodeCompleted(node);
+        MarkNodeCompleted(node, isConcurrent: true);
     }
 
     private void EnqueueRemainingSubdirs(DirNode parent, int startIndex)
     {
-        if (_stoppedEarly || _cancellationToken.IsCancellationRequested)
+        if (_stoppedEarly || _cancellationToken.IsCancellationRequested || _queue == null)
             return;
+
+        if (parent.SubdirCount == 1 && parent.SingleSubdir != null)
+        {
+            if (startIndex == 0 && Volatile.Read(ref parent.SingleSubdir.State) == StatePending)
+            {
+                bool onFrontierSingle = IsFrontierOrNear(parent);
+                int priority = onFrontierSingle ? ScanTier.High : ScanTier.Medium;
+                _queue.Enqueue(WorkItem.ForDir(parent.SingleSubdir), priority);
+            }
+
+            return;
+        }
 
         DirNode?[]? subdirs = parent.Subdirs;
         int subdirCount = parent.SubdirCount;
-        if (subdirs == null || subdirCount <= startIndex || _queue == null)
+        if (subdirs == null || subdirCount <= startIndex)
             return;
 
         DirNode? frontier = Volatile.Read(ref _frontierTarget);
@@ -1511,13 +1733,13 @@ public sealed unsafe class ParallelDuWalker
         return ScanTier.Low;
     }
 
-    private bool TryEnableWorkersForLargeDir(DirNode node, int rawCount)
+    private bool TryEnableWorkersForLargeDir(DirNode node, int rawCount, WorkerScratch scratch)
     {
         if (!_canEverFanOut)
             return false;
 
         if (!_heuristicsResolved)
-            ResolveWorkerBudget(Encoding.UTF8.GetString(node.DisplayPath));
+            ResolveWorkerBudget(Encoding.UTF8.GetString(GetNodeDisplayPath(node, ref scratch.PathScratch)));
 
         if (!_canEverFanOut)
             return false;
@@ -1527,10 +1749,10 @@ public sealed unsafe class ParallelDuWalker
         return _workersStarted;
     }
 
-    private bool TryActivateWorkersFromInline(DirNode latestNode)
+    private bool TryActivateWorkersFromInline(DirNode latestNode, WorkerScratch scratch)
     {
         if (!_heuristicsResolved)
-            ResolveWorkerBudget(Encoding.UTF8.GetString(latestNode.DisplayPath));
+            ResolveWorkerBudget(Encoding.UTF8.GetString(GetNodeDisplayPath(latestNode, ref scratch.PathScratch)));
 
         if (!_canEverFanOut)
             return false;
@@ -1543,7 +1765,14 @@ public sealed unsafe class ParallelDuWalker
         {
             ref EmitFrame frame = ref _emitStack![f];
             DirNode frameNode = frame.Node;
-            if (frameNode.Entries == null || frameNode.Subdirs == null)
+            if (frameNode.SingleSubdir != null && frameNode.Entries == null)
+            {
+                if (frame.EntryIndex == 0 && Volatile.Read(ref frameNode.SingleSubdir.State) == StatePending)
+                    _queue!.Enqueue(WorkItem.ForDir(frameNode.SingleSubdir), ScanTier.Medium);
+                continue;
+            }
+
+            if (frameNode.Entries == null || (frameNode.Subdirs == null && frameNode.SingleSubdir == null))
                 continue;
 
             for (int e = frameNode.EntryCount - 1; e >= frame.EntryIndex; e--)
@@ -1552,7 +1781,9 @@ public sealed unsafe class ParallelDuWalker
                 if (se.Kind != ScannedEntryKind.Subdir)
                     continue;
 
-                DirNode? pendingSub = frameNode.Subdirs[se.SubdirOrErrno];
+                DirNode? pendingSub = frameNode.SubdirCount == 1
+                    ? frameNode.SingleSubdir
+                    : frameNode.Subdirs![se.SubdirOrErrno];
                 if (pendingSub != null && Volatile.Read(ref pendingSub.State) == StatePending)
                 {
                     int tier = se.SubdirOrErrno <= 2 ? ScanTier.Medium : ScanTier.Low;
@@ -1562,7 +1793,12 @@ public sealed unsafe class ParallelDuWalker
         }
 
         // Enqueue latestNode's own discovered subdirs with Subdirs[0] in High tier.
-        if (latestNode.SubdirCount > 0 && latestNode.Subdirs != null)
+        if (latestNode.SubdirCount == 1 && latestNode.SingleSubdir != null)
+        {
+            if (Volatile.Read(ref latestNode.SingleSubdir.State) == StatePending)
+                _queue!.Enqueue(WorkItem.ForDir(latestNode.SingleSubdir), ScanTier.High);
+        }
+        else if (latestNode.SubdirCount > 1 && latestNode.Subdirs != null)
         {
             for (int i = latestNode.SubdirCount - 1; i >= 0; i--)
             {
@@ -1593,16 +1829,16 @@ public sealed unsafe class ParallelDuWalker
 
     private void EnsureQueueAndWorkersStarted(int targetWorkers)
     {
-        if (_queue == null)
+        if (_queue == null || !_workersStarted)
         {
             lock (_workerSpawnLock)
             {
                 _queue ??= new FrontierWorkQueue<WorkItem>(IsBackpressureActive);
+                _workersStarted = true;
             }
         }
 
         EnsureWorkersSpawned(targetWorkers);
-        _workersStarted = true;
     }
 
     private void EnsureWorkersSpawned(int targetWorkers)
@@ -1660,11 +1896,10 @@ public sealed unsafe class ParallelDuWalker
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool TryClassifyChild(
         DirNode parent,
-        ulong rootDevice,
         ReadOnlySpan<byte> nameSpan,
         in NativeStat childStat,
-        int childIndex,
-        ref byte[] pathScratch,
+        WorkerScratch scratch,
+        bool isConcurrent,
         out DirNode? subdirNode,
         out FileIdentity childId,
         out bool isBsdCycle)
@@ -1673,35 +1908,141 @@ public sealed unsafe class ParallelDuWalker
         isBsdCycle = false;
         childId = new FileIdentity(childStat.Device, childStat.Inode);
 
-        if (DuAccounting.ShouldIgnoreBsdChild(in childStat, _options, parent.DisplayPath, nameSpan, ref pathScratch))
-            return false;
+        if (_options.Dialect == DuDialect.Bsd)
+        {
+            if (_options.IgnoreNoDump && childStat.HasNoDumpFlag)
+                return false;
 
-        bool crossDevice = _options.OneFileSystem && childStat.Device != rootDevice;
+            if (childStat.Kind == NativeEntryKind.Directory && NativeIo.IsMacOS && nameSpan.SequenceEqual("fd"u8))
+            {
+                int len = WriteNodeChildPathInto(parent, nameSpan, ref scratch.PathScratch, appendNul: true);
+                if (NativeIo.IsMacOsDevFdDirectory(scratch.PathScratch.AsSpan(0, len + 1), nameSpan))
+                    return false;
+            }
+        }
+
+        bool crossDevice = _options.OneFileSystem && childStat.Device != _currentRootDevice;
         if (crossDevice && _options.Dialect != DuDialect.Bsd)
             return false;
 
         if (childStat.Kind == NativeEntryKind.Directory)
         {
-            if (FindAncestorNode(parent, childId) != null)
+            if (IsAncestorCycle(parent, in childStat, childId, scratch, isConcurrent))
             {
                 isBsdCycle = _options.Dialect == DuDialect.Bsd;
                 return false;
             }
 
-            byte[] childNullTermPath = DuAccounting.BuildNullTerminatedChildPath(parent.DisplayPath, nameSpan);
+            byte[] segNullTerm = new byte[nameSpan.Length + 1];
+            nameSpan.CopyTo(segNullTerm);
+            segNullTerm[nameSpan.Length] = 0;
+
             subdirNode = new DirNode(
                 parent: parent,
-                nullTermPath: childNullTermPath,
+                pathOrSegmentNullTerm: segNullTerm,
                 dirStat: in childStat,
                 identity: childId,
-                rootDevice: rootDevice,
                 depth: parent.Depth + 1,
-                childIndex: childIndex,
+                options: _options,
                 followChildSymlinks: parent.FollowChildSymlinks,
                 skipDescent: crossDevice);
         }
 
         return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool IsAncestorCycle(
+        DirNode parent,
+        in NativeStat childStat,
+        FileIdentity childId,
+        WorkerScratch scratch,
+        bool isConcurrent)
+    {
+        if (!childStat.HasValidFileId)
+            return false;
+
+        if (!isConcurrent)
+            return (parent.HasValidFileId && childId == parent.Identity) || _activeAncestors.Contains(childId);
+
+        if (parent.Depth <= 32)
+            return FindAncestorNode(parent, childId) != null;
+
+        EnsureWorkerAncestorsAligned(parent, scratch);
+        return scratch.AncestorSet!.Contains(childId);
+    }
+
+    private static void EnsureWorkerAncestorsAligned(DirNode parent, WorkerScratch scratch)
+    {
+        if (scratch.AncestorTip == parent)
+            return;
+
+        List<DirNode> path = scratch.AncestorPath ??= [];
+        HashSet<FileIdentity> set = scratch.AncestorSet ??= [];
+
+        // Fast path 1: descending directly into a child of the current tip.
+        if (path.Count > 0 && parent.Parent == path[^1])
+        {
+            path.Add(parent);
+            if (parent.HasValidFileId)
+                set.Add(parent.Identity);
+            scratch.AncestorTip = parent;
+            return;
+        }
+
+        // Fast path 2: moving horizontally to a sibling of the current tip.
+        if (path.Count >= 2 && parent.Parent == path[^2])
+        {
+            DirNode popped = path[^1];
+            path.RemoveAt(path.Count - 1);
+            if (popped.HasValidFileId)
+                set.Remove(popped.Identity);
+            path.Add(parent);
+            if (parent.HasValidFileId)
+                set.Add(parent.Identity);
+            scratch.AncestorTip = parent;
+            return;
+        }
+
+        // General LCA alignment: walk up from parent until meeting current path.
+        List<DirNode> missing = scratch.TempAlignNodes ??= [];
+        missing.Clear();
+        DirNode? cur = parent;
+        while (cur != null)
+        {
+            while (path.Count > 0 && path[^1].Depth > cur.Depth)
+            {
+                DirNode removed = path[^1];
+                path.RemoveAt(path.Count - 1);
+                if (removed.HasValidFileId)
+                    set.Remove(removed.Identity);
+            }
+
+            if (path.Count > 0 && path[^1] == cur)
+                break;
+
+            if (path.Count > 0 && path[^1].Depth == cur.Depth)
+            {
+                DirNode removed = path[^1];
+                path.RemoveAt(path.Count - 1);
+                if (removed.HasValidFileId)
+                    set.Remove(removed.Identity);
+            }
+
+            missing.Add(cur);
+            cur = cur.Parent;
+        }
+
+        for (int i = missing.Count - 1; i >= 0; i--)
+        {
+            DirNode added = missing[i];
+            path.Add(added);
+            if (added.HasValidFileId)
+                set.Add(added.Identity);
+        }
+
+        missing.Clear();
+        scratch.AncestorTip = parent;
     }
 
     private static DirNode? FindAncestorNode(DirNode current, FileIdentity candidate)
@@ -1712,7 +2053,7 @@ public sealed unsafe class ParallelDuWalker
         DirNode? cursor = current;
         while (cursor != null)
         {
-            if (cursor.Identity == candidate)
+            if (cursor.HasValidFileId && cursor.Identity == candidate)
                 return cursor;
             cursor = cursor.Parent;
         }
@@ -1720,31 +2061,215 @@ public sealed unsafe class ParallelDuWalker
         return null;
     }
 
-    private static void OpenPreOpenedChild(int parentFd, DirNode child)
+    private static void FillNodeDisplayPath(DirNode node, byte[] destination)
     {
-        ReadOnlySpan<byte> full = child.DisplayPath;
-        int lastSlash = DuAccounting.LastSeparatorIndex(full);
-        ReadOnlySpan<byte> childName = lastSlash >= 0 ? full[(lastSlash + 1)..] : full;
-        if (childName.IsEmpty)
-            return;
-
-        byte* nameBuf = stackalloc byte[childName.Length + 1];
-        childName.CopyTo(new Span<byte>(nameBuf, childName.Length));
-        nameBuf[childName.Length] = 0;
-
-        if (NativeIo.OpenRawDirectoryFdRelative(parentFd, nameBuf, out int fd) == 0 && fd >= 0)
-            child.PreOpenedFd = fd;
+        int pos = node.FullDisplayLength;
+        DirNode? cur = node;
+        while (cur != null)
+        {
+            ReadOnlySpan<byte> seg = cur.SegmentOrRootDisplaySpan;
+            pos -= seg.Length;
+            seg.CopyTo(destination.AsSpan(pos));
+            DirNode? p = cur.Parent;
+            if (p != null && p.NeedsChildSeparator)
+                destination[--pos] = DuAccounting.DefaultSeparator;
+            cur = p;
+        }
     }
 
-    private static void CloseAndClearPreOpenedFd(DirNode node)
+    private static ReadOnlySpan<byte> GetNodeDisplayPath(DirNode node, ref byte[] scratch)
     {
-        int fd = Interlocked.Exchange(ref node.PreOpenedFd, -1);
-        if (fd >= 0)
-            _ = Libc.close(fd);
+        if (node.Parent == null)
+            return node.SegmentOrRootDisplaySpan;
+
+        int len = node.FullDisplayLength;
+        if (len > scratch.Length)
+            DuAccounting.GrowByteArray(ref scratch, len);
+        FillNodeDisplayPath(node, scratch);
+        return scratch.AsSpan(0, len);
+    }
+
+    private static ReadOnlySpan<byte> GetNodeNullTermPath(DirNode node, ref byte[] scratch)
+    {
+        if (node.Parent == null)
+            return node.RawPathOrSegmentNullTerm;
+
+        int len = node.FullDisplayLength;
+        if (len + 1 > scratch.Length)
+            DuAccounting.GrowByteArray(ref scratch, len + 1);
+        FillNodeDisplayPath(node, scratch);
+        scratch[len] = 0;
+        return scratch.AsSpan(0, len + 1);
+    }
+
+    private static ReadOnlySpan<byte> GetNodeParentDisplayPath(DirNode node, ref byte[]? parentPathBuffer)
+    {
+        if (node.Parent == null)
+            return node.SegmentOrRootDisplaySpan;
+
+        int len = node.FullDisplayLength;
+        if (parentPathBuffer == null)
+            parentPathBuffer = new byte[Math.Max(1024, len)];
+        else if (len > parentPathBuffer.Length)
+            DuAccounting.GrowByteArray(ref parentPathBuffer, len);
+
+        FillNodeDisplayPath(node, parentPathBuffer);
+        return parentPathBuffer.AsSpan(0, len);
+    }
+
+    private static int WriteNodeChildPathInto(
+        DirNode parent,
+        ReadOnlySpan<byte> childName,
+        ref byte[] scratch,
+        bool appendNul = false)
+    {
+        int parentLen = parent.FullDisplayLength;
+        bool needsSlash = parent.NeedsChildSeparator;
+        int displayLen = parentLen + (needsSlash ? 1 : 0) + childName.Length;
+        int totalLen = displayLen + (appendNul ? 1 : 0);
+        if (totalLen > scratch.Length)
+            DuAccounting.GrowByteArray(ref scratch, totalLen);
+
+        FillNodeDisplayPath(parent, scratch);
+        int pos = parentLen;
+        if (needsSlash)
+            scratch[pos++] = DuAccounting.DefaultSeparator;
+        childName.CopyTo(scratch.AsSpan(pos));
+        if (appendNul)
+            scratch[displayLen] = 0;
+        return displayLen;
+    }
+
+    private void AppendNodeToEmitPath(DirNode node)
+    {
+        if (node.Parent == null)
+        {
+            int rootLen = node.FullDisplayLength;
+            if (_emitPathBuf == null)
+                _emitPathBuf = new byte[Math.Max(1024, rootLen)];
+            else if (rootLen > _emitPathBuf.Length)
+                DuAccounting.GrowByteArray(ref _emitPathBuf, rootLen);
+
+            node.SegmentOrRootDisplaySpan.CopyTo(_emitPathBuf);
+            _emitPathLen = rootLen;
+            return;
+        }
+
+        bool needsSlash = node.Parent.NeedsChildSeparator;
+        ReadOnlySpan<byte> seg = node.SegmentOrRootDisplaySpan;
+        int newLen = _emitPathLen + (needsSlash ? 1 : 0) + seg.Length;
+        if (_emitPathBuf == null)
+            _emitPathBuf = new byte[Math.Max(1024, newLen)];
+        else if (newLen > _emitPathBuf.Length)
+            DuAccounting.GrowByteArray(ref _emitPathBuf, newLen);
+
+        if (needsSlash)
+            _emitPathBuf[_emitPathLen++] = DuAccounting.DefaultSeparator;
+        seg.CopyTo(_emitPathBuf.AsSpan(_emitPathLen));
+        _emitPathLen = newLen;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ReadOnlySpan<byte> GetEmitNodeDisplayPath(DirNode node, ref byte[] scratch)
+    {
+        if (node.Parent == null)
+            return node.SegmentOrRootDisplaySpan;
+        if (_maxDepth > 0 && node.Depth <= _maxDepth)
+            return _emitPathBuf.AsSpan(0, _emitPathLen);
+        return GetNodeDisplayPath(node, ref scratch);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int WriteEmitChildPath(DirNode node, ReadOnlySpan<byte> childName, ref byte[] scratch)
+    {
+        if (node.Parent == null)
+            return DuAccounting.WriteChildPathInto(node.SegmentOrRootDisplaySpan, childName, ref scratch);
+        if (_maxDepth > 0 && node.Depth <= _maxDepth)
+            return DuAccounting.WriteChildPathInto(_emitPathBuf.AsSpan(0, _emitPathLen), childName, ref scratch);
+        return WriteNodeChildPathInto(node, childName, ref scratch);
+    }
+
+    private void EmitBsdSymlinkCycleError(ReadOnlySpan<byte> childPath, DirNode cycleTarget)
+    {
+        byte[] rented = ArrayPool<byte>.Shared.Rent(Math.Max(1, cycleTarget.FullDisplayLength));
+        try
+        {
+            FillNodeDisplayPath(cycleTarget, rented);
+            _writer!.WriteBsdSymlinkCycleError(childPath, rented.AsSpan(0, cycleTarget.FullDisplayLength));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    private static void OpenPreOpenedChild(int parentFd, DirNode child)
+    {
+        byte[] segNullTerm = child.RawPathOrSegmentNullTerm;
+        if (segNullTerm.Length <= 1)
+            return;
+
+        fixed (byte* pName = segNullTerm)
+        {
+            if (NativeIo.OpenRawDirectoryFdRelative(parentFd, pName, out int fd) == 0 && fd >= 0)
+                child.PreOpenedFd = fd;
+        }
+    }
+
+    private void CloseAndClearPreOpenedFd(DirNode node)
+    {
+        if (!_workersStarted)
+        {
+            int fd = node.PreOpenedFd;
+            if (fd >= 0)
+            {
+                node.PreOpenedFd = -1;
+                _ = Libc.close(fd);
+            }
+
+            return;
+        }
+
+        int atomicFd = Interlocked.Exchange(ref node.PreOpenedFd, -1);
+        if (atomicFd >= 0)
+            _ = Libc.close(atomicFd);
     }
 
     private void ReleaseNodePayload(DirNode node)
     {
+        if (!_workersStarted)
+        {
+            if (node.PreOpenedFd >= 0)
+            {
+                _ = Libc.close(node.PreOpenedFd);
+                node.PreOpenedFd = -1;
+            }
+
+            if (node.Entries != null)
+            {
+                ArrayPool<ScannedEntry>.Shared.Return(node.Entries);
+                node.Entries = null;
+            }
+
+            if (node.NameArena != null)
+            {
+                ArrayPool<byte>.Shared.Return(node.NameArena);
+                node.NameArena = null;
+            }
+
+            node.SingleSubdir = null;
+            node.Subdirs = null;
+            node.EntryCount = 0;
+            node.SubdirCount = 0;
+            if (node.UnprintedWeight > 0)
+            {
+                ReleaseUnprintedEntries(node.UnprintedWeight);
+                node.UnprintedWeight = 0;
+            }
+
+            return;
+        }
+
         CloseAndClearPreOpenedFd(node);
 
         ScannedEntry[]? entries = Interlocked.Exchange(ref node.Entries, null);
@@ -1755,13 +2280,17 @@ public sealed unsafe class ParallelDuWalker
         if (arena != null)
             ArrayPool<byte>.Shared.Return(arena);
 
+        node.SingleSubdir = null;
         node.Subdirs = null;
         node.EntryCount = 0;
         node.SubdirCount = 0;
 
-        int weight = Interlocked.Exchange(ref node.UnprintedWeight, 0);
-        if (weight > 0)
-            ReleaseUnprintedEntries(weight);
+        if (node.UnprintedWeight != 0)
+        {
+            int weight = Interlocked.Exchange(ref node.UnprintedWeight, 0);
+            if (weight > 0)
+                ReleaseUnprintedEntries(weight);
+        }
     }
 
     private void CancelAndReleaseSubtree(DirNode root)
@@ -1770,8 +2299,15 @@ public sealed unsafe class ParallelDuWalker
         DirNode? current = root;
         while (current != null)
         {
-            _ = Interlocked.CompareExchange(ref current.State, StateCancelled, StatePending);
+            if (_workersStarted)
+                _ = Interlocked.CompareExchange(ref current.State, StateCancelled, StatePending);
+            else if (current.State == StatePending)
+                current.State = StateCancelled;
+
             CloseAndClearPreOpenedFd(current);
+
+            if (current.SingleSubdir != null)
+                (toVisit ??= new Stack<DirNode>()).Push(current.SingleSubdir);
 
             DirNode?[]? subdirs = current.Subdirs;
             int count = current.SubdirCount;
@@ -1795,11 +2331,12 @@ public sealed unsafe class ParallelDuWalker
         int order = 0;
         errno = 0;
 
-        fixed (byte* pBuf = scratch.DirentBuffer)
+        while (true)
         {
-            while (true)
+            nint read;
+            fixed (byte* pBuf = scratch.DirentBuffer)
             {
-                nint read = Libc.getdents64(dirFd, pBuf, (nuint)scratch.DirentBuffer.Length);
+                read = Libc.getdents64(dirFd, pBuf, (nuint)scratch.DirentBuffer.Length);
                 if (read == 0)
                     return rawCount;
 
@@ -1825,6 +2362,12 @@ public sealed unsafe class ParallelDuWalker
                     ReadOnlySpan<byte> nameSpan = MemoryMarshal.CreateReadOnlySpanFromNullTerminated(namePtr);
                     PushRawEntry(scratch, ref rawCount, inode, order++, nameSpan);
                 }
+            }
+
+            if (scratch.DirentBuffer.Length < DuAccounting.DirentReadBufferSize &&
+                read >= scratch.DirentBuffer.Length - 512)
+            {
+                scratch.DirentBuffer = new byte[DuAccounting.DirentReadBufferSize];
             }
         }
     }
@@ -1885,7 +2428,7 @@ public sealed unsafe class ParallelDuWalker
     {
         int required = scratch.CompactArenaLen + name.Length;
         if (required > scratch.CompactArena.Length)
-            DuAccounting.GrowByteArray(ref scratch.CompactArena, required);
+            DuAccounting.GrowByteArray(ref scratch.CompactArena, Math.Max(2048, required));
 
         int offset = scratch.CompactArenaLen;
         name.CopyTo(scratch.CompactArena.AsSpan(offset));
