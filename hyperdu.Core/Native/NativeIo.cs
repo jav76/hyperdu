@@ -88,6 +88,7 @@ internal readonly struct NativeStat
         _ => NativeEntryKind.Other
     };
 
+    public bool HasNoDumpFlag => (Flags & Libc.UF_NODUMP) != 0;
     public bool HasHiddenFlag => (Flags & Libc.UF_HIDDEN) != 0;
 }
 
@@ -144,6 +145,7 @@ internal static unsafe class NativeIo
     // macOS dirent (64-bit inode): d_ino u64, d_seekoff u64, d_reclen u16, d_namlen u16, d_type u8, d_name.
     internal static int DirentTypeOffset => IsMacOS ? 20 : 18;
     internal static int DirentNameOffset => IsMacOS ? 21 : 19;
+    internal static int EloopErrno => IsMacOS ? 62 : 40;
     internal const int MacDirentNameLengthOffset = 18;
 
     private static int OpenDirectoryFlags => IsMacOS
@@ -768,6 +770,35 @@ internal static unsafe class NativeIo
         }
     }
 
+    internal static string? TryGetMacOsRawArgv0()
+    {
+        if (!OperatingSystem.IsMacOS())
+            return null;
+
+        try
+        {
+            byte*** argvp = Libc._NSGetArgv();
+            if (argvp == null || *argvp == null || (*argvp)[0] == null)
+                return null;
+
+            ReadOnlySpan<byte> raw = MemoryMarshal.CreateReadOnlySpanFromNullTerminated((*argvp)[0]);
+            return raw.IsEmpty ? null : System.Text.Encoding.UTF8.GetString(raw);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    internal static bool IsMacOsDevFdDirectory(ReadOnlySpan<byte> nullTermPath, ReadOnlySpan<byte> entryName)
+    {
+        if (!IsMacOS || !entryName.SequenceEqual("fd"u8))
+            return false;
+
+        return TryStatFsMacOs(nullTermPath, out string fsTypeName, out _) &&
+               string.Equals(fsTypeName, "devfs", StringComparison.Ordinal);
+    }
+
     internal static bool TryGetMacOsMountInfo(string path, out string fsTypeName, out string mountFromName)
     {
         fsTypeName = string.Empty;
@@ -776,45 +807,55 @@ internal static unsafe class NativeIo
         if (!IsMacOS || string.IsNullOrEmpty(path))
             return false;
 
+        int maxBytes = System.Text.Encoding.UTF8.GetMaxByteCount(path.Length) + 1;
+        byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(maxBytes);
         try
         {
-            int maxBytes = System.Text.Encoding.UTF8.GetMaxByteCount(path.Length) + 1;
-            byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(maxBytes);
-            try
+            int len = System.Text.Encoding.UTF8.GetBytes(path, rented);
+            rented[len] = 0;
+            return TryStatFsMacOs(rented.AsSpan(0, len + 1), out fsTypeName, out mountFromName);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    private static bool TryStatFsMacOs(ReadOnlySpan<byte> nullTermPath, out string fsTypeName, out string mountFromName)
+    {
+        fsTypeName = string.Empty;
+        mountFromName = string.Empty;
+
+        if (!IsMacOS || nullTermPath.IsEmpty || nullTermPath[^1] != 0)
+            return false;
+
+        try
+        {
+            byte* buf = stackalloc byte[2200];
+            new Span<byte>(buf, 2200).Clear();
+
+            int rc;
+            fixed (byte* pPath = nullTermPath)
             {
-                int len = System.Text.Encoding.UTF8.GetBytes(path, rented);
-                rented[len] = 0;
-
-                byte* buf = stackalloc byte[2200];
-                new Span<byte>(buf, 2200).Clear();
-
-                int rc;
-                fixed (byte* pPath = rented)
-                {
-                    rc = s_platform == Platform.MacOSInode64
-                        ? Libc.statfs_inode64(pPath, buf)
-                        : Libc.statfs(pPath, buf);
-                }
-
-                if (rc != 0)
-                    return false;
-
-                // XNU __DARWIN_STRUCT_STATFS64: f_fstypename[16] at offset 72, f_mntfromname[1024] at offset 1112.
-                ReadOnlySpan<byte> fsTypeSpan = MemoryMarshal.CreateReadOnlySpanFromNullTerminated(buf + 72);
-                if (fsTypeSpan.Length > 16)
-                    fsTypeSpan = fsTypeSpan[..16];
-                fsTypeName = System.Text.Encoding.UTF8.GetString(fsTypeSpan);
-
-                ReadOnlySpan<byte> mntFromSpan = MemoryMarshal.CreateReadOnlySpanFromNullTerminated(buf + 1112);
-                if (mntFromSpan.Length > 1024)
-                    mntFromSpan = mntFromSpan[..1024];
-                mountFromName = System.Text.Encoding.UTF8.GetString(mntFromSpan);
-                return true;
+                rc = s_platform == Platform.MacOSInode64
+                    ? Libc.statfs_inode64(pPath, buf)
+                    : Libc.statfs(pPath, buf);
             }
-            finally
-            {
-                System.Buffers.ArrayPool<byte>.Shared.Return(rented);
-            }
+
+            if (rc != 0)
+                return false;
+
+            // XNU __DARWIN_STRUCT_STATFS64: f_fstypename[16] at offset 72, f_mntfromname[1024] at offset 1112.
+            ReadOnlySpan<byte> fsTypeSpan = MemoryMarshal.CreateReadOnlySpanFromNullTerminated(buf + 72);
+            if (fsTypeSpan.Length > 16)
+                fsTypeSpan = fsTypeSpan[..16];
+            fsTypeName = System.Text.Encoding.UTF8.GetString(fsTypeSpan);
+
+            ReadOnlySpan<byte> mntFromSpan = MemoryMarshal.CreateReadOnlySpanFromNullTerminated(buf + 1112);
+            if (mntFromSpan.Length > 1024)
+                mntFromSpan = mntFromSpan[..1024];
+            mountFromName = System.Text.Encoding.UTF8.GetString(mntFromSpan);
+            return true;
         }
         catch (EntryPointNotFoundException)
         {
@@ -827,21 +868,49 @@ internal static unsafe class NativeIo
     }
 
     /// <summary>
-    /// Matches gnulib fts_build inode-sort filesystem check: on Linux local block filesystems
-    /// (everything except tmpfs, ramfs, and NFS), sorting large directories by d_ino avoids random disk seeks
-    /// and matches GNU du output ordering on ext4.
+    /// Matches gnulib fts_build inode-sort filesystem check (sorting >10k-entry local disk
+    /// directories by d_ino to avoid random seeks), while keeping BSD du unsorted.
     /// </summary>
-    internal static bool ShouldSortDirectoryByInode(int dirFd)
+    internal static bool ShouldSortDirectoryByInode(int dirFd, bool allowOnMacOs = false)
     {
-        if (s_platform != Platform.Linux)
+        if (s_platform == Platform.Linux)
+        {
+            byte* buf = stackalloc byte[128];
+            if (Libc.fstatfs(dirFd, buf) != 0)
+                return false;
+
+            ulong fsType = *(ulong*)buf;
+            return fsType is not (Libc.TMPFS_MAGIC or Libc.RAMFS_MAGIC or Libc.NFS_SUPER_MAGIC);
+        }
+
+        if (!IsMacOS || !allowOnMacOs || dirFd < 0)
             return false;
 
-        byte* buf = stackalloc byte[128];
-        if (Libc.fstatfs(dirFd, buf) != 0)
-            return false;
+        try
+        {
+            byte* buf = stackalloc byte[2200];
+            new Span<byte>(buf, 2200).Clear();
+            int rc = s_platform == Platform.MacOSInode64
+                ? Libc.fstatfs_inode64(dirFd, buf)
+                : Libc.fstatfs(dirFd, buf);
+            if (rc != 0)
+                return false;
 
-        ulong fsType = *(ulong*)buf;
-        return fsType is not (Libc.TMPFS_MAGIC or Libc.RAMFS_MAGIC or Libc.NFS_SUPER_MAGIC);
+            ReadOnlySpan<byte> fsTypeSpan = MemoryMarshal.CreateReadOnlySpanFromNullTerminated(buf + 72);
+            if (fsTypeSpan.Length > 16)
+                fsTypeSpan = fsTypeSpan[..16];
+
+            return !fsTypeSpan.SequenceEqual("nfs"u8) &&
+                   !fsTypeSpan.SequenceEqual("smbfs"u8) &&
+                   !fsTypeSpan.SequenceEqual("cifs"u8) &&
+                   !fsTypeSpan.SequenceEqual("afpfs"u8) &&
+                   !fsTypeSpan.SequenceEqual("devfs"u8) &&
+                   !fsTypeSpan.SequenceEqual("autofs"u8);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static bool ProbeGetdents64()

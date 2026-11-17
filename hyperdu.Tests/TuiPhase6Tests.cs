@@ -317,7 +317,7 @@ public sealed partial class TuiPhase6Tests
 
     private static long RunDuTotalBytes(IReadOnlyList<string> flags, string targetPath)
     {
-        List<string> args = ["du", .. flags, targetPath];
+        List<string> args = ["gdu", .. flags, targetPath];
         return RunCliAndParseTotalBytes(args, headlessTui: false);
     }
 

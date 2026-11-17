@@ -6,8 +6,13 @@ using hyperdu.Core.Native;
 namespace hyperdu.Tests;
 
 [Collection("DuEnv")]
-public sealed unsafe partial class DuPhase3Tests
+public sealed unsafe partial class DuPhase3Tests : IDisposable
 {
+    private readonly string? _prevDialect = Environment.GetEnvironmentVariable("HYPERDU_DU_DIALECT");
+
+    public DuPhase3Tests() => Environment.SetEnvironmentVariable("HYPERDU_DU_DIALECT", "gnu");
+
+    public void Dispose() => Environment.SetEnvironmentVariable("HYPERDU_DU_DIALECT", _prevDialect);
     [StructLayout(LayoutKind.Sequential)]
     private struct PosixTimespec
     {

@@ -102,6 +102,18 @@ public static class Messages
 
     internal static string QuoteAscii(string value) => string.Concat("'", value, "'");
 
+    internal static string BsdProgramName(string programName)
+    {
+        if (string.IsNullOrEmpty(programName))
+            return "du";
+
+        string fileName = Path.GetFileName(programName);
+        if (fileName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            fileName = fileName[..^4];
+
+        return string.IsNullOrEmpty(fileName) ? "du" : fileName;
+    }
+
     internal static void WriteError(Stream stderr, string programName, string message)
     {
         WriteUtf8(stderr, $"{programName}: {message}\n");
@@ -120,26 +132,81 @@ public static class Messages
     internal static void WritePosixError(Stream stderr, string programName, string verb, ReadOnlySpan<byte> pathBytes, int errno)
     {
         // gnulib quotearg_colon always uses ASCII straight single quotes for path diagnostics.
-        byte[] openQuote = CQuoteOpen;
-        byte[] closeQuote = CQuoteClose;
         string prefix = $"{programName}: {verb} ";
         string suffix = errno == 0 ? "\n" : $": {NativeIo.DescribePosixError(errno)}\n";
+        WriteFormattedError(stderr, prefix, CQuoteOpen, pathBytes, CQuoteClose, suffix);
+    }
 
+    internal static void WriteBsdPosixError(Stream stderr, string programName, ReadOnlySpan<byte> pathBytes, int errno)
+    {
+        string prefix = $"{BsdProgramName(programName)}: ";
+        string suffix = errno == 0 ? "\n" : $": {NativeIo.DescribePosixError(errno)}\n";
+        WriteFormattedError(stderr, prefix, [], pathBytes, [], [], suffix);
+    }
+
+    internal static void WriteBsdTooManySymlinksError(Stream stderr, string programName, ReadOnlySpan<byte> pathBytes)
+    {
+        string prefix = $"{BsdProgramName(programName)}: Too many symlinks at ";
+        WriteFormattedError(stderr, prefix, [], pathBytes, [], [], "\n");
+    }
+
+    internal static void WriteBsdSymlinkCycleError(
+        Stream stderr,
+        string programName,
+        ReadOnlySpan<byte> pathBytes,
+        ReadOnlySpan<byte> cyclePathBytes)
+    {
+        string prefix = $"{BsdProgramName(programName)}: Can't follow symlink cycle from ";
+        WriteFormattedError(stderr, prefix, [], pathBytes, " to "u8, cyclePathBytes, "\n");
+    }
+
+    private static void WriteFormattedError(
+        Stream stderr,
+        string prefix,
+        ReadOnlySpan<byte> openQuote,
+        ReadOnlySpan<byte> pathBytes,
+        ReadOnlySpan<byte> closeQuote,
+        string suffix) =>
+        WriteFormattedError(stderr, prefix, openQuote, pathBytes, closeQuote, [], suffix);
+
+    private static void WriteFormattedError(
+        Stream stderr,
+        string prefix,
+        ReadOnlySpan<byte> openQuote,
+        ReadOnlySpan<byte> pathBytes,
+        ReadOnlySpan<byte> middle,
+        ReadOnlySpan<byte> secondPathBytes,
+        string suffix)
+    {
         int prefixLen = Encoding.UTF8.GetByteCount(prefix);
         int suffixLen = Encoding.UTF8.GetByteCount(suffix);
-        int totalLen = prefixLen + openQuote.Length + pathBytes.Length + closeQuote.Length + suffixLen;
+        int totalLen = prefixLen + openQuote.Length + pathBytes.Length + middle.Length + secondPathBytes.Length + suffixLen;
 
         byte[] rented = ArrayPool<byte>.Shared.Rent(totalLen);
         try
         {
             Span<byte> dest = rented.AsSpan(0, totalLen);
             int pos = Encoding.UTF8.GetBytes(prefix, dest);
-            openQuote.CopyTo(dest.Slice(pos));
-            pos += openQuote.Length;
+            if (!openQuote.IsEmpty)
+            {
+                openQuote.CopyTo(dest.Slice(pos));
+                pos += openQuote.Length;
+            }
+
             pathBytes.CopyTo(dest.Slice(pos));
             pos += pathBytes.Length;
-            closeQuote.CopyTo(dest.Slice(pos));
-            pos += closeQuote.Length;
+            if (!middle.IsEmpty)
+            {
+                middle.CopyTo(dest.Slice(pos));
+                pos += middle.Length;
+            }
+
+            if (!secondPathBytes.IsEmpty)
+            {
+                secondPathBytes.CopyTo(dest.Slice(pos));
+                pos += secondPathBytes.Length;
+            }
+
             Encoding.UTF8.GetBytes(suffix, dest.Slice(pos));
             stderr.Write(dest);
         }

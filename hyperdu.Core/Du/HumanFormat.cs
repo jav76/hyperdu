@@ -35,8 +35,85 @@ public static class HumanFormat
         {
             HumanMode.Binary => TryFormatHuman(bytes, 1024, BinarySuffixes, group, in localeFormat, destination, out bytesWritten),
             HumanMode.Si => TryFormatHuman(bytes, 1000, SiSuffixes, group, in localeFormat, destination, out bytesWritten),
+            HumanMode.BsdBinary => TryFormatBsdHuman(bytes, 1024, 973, BsdBinarySuffixes, in localeFormat, destination, out bytesWritten),
+            HumanMode.BsdSi => TryFormatBsdHuman(bytes, 1000, 950, BsdSiSuffixes, in localeFormat, destination, out bytesWritten),
             _ => TryFormatFixedScale(bytes, spec.Scale, spec.Suffix, group, in localeFormat, destination, out bytesWritten)
         };
+    }
+
+    private static readonly string[] BsdBinarySuffixes = ["B", "K", "M", "G", "T", "P", "E"];
+    private static readonly string[] BsdSiSuffixes = ["B", "k", "M", "G", "T", "P", "E"];
+
+    /// <summary>
+    /// Ports BSD libutil humanize_number(buf[5], "", HN_AUTOSCALE, HN_B | HN_NOSPACE | HN_DECIMAL)
+    /// and du(1) prthumanval() "%4s" right alignment.
+    /// </summary>
+    internal static bool TryFormatBsdHuman(
+        ulong bytes,
+        ulong divisor,
+        ulong divisorDecCut,
+        string[] suffixes,
+        in NumericLocaleFormat localeFormat,
+        Span<byte> destination,
+        out int bytesWritten)
+    {
+        const int maxScale = 6;
+        ulong halfDivisor = divisor / 2UL;
+        ulong quotient = bytes;
+        ulong remainder = 0;
+        int scaleIndex = 0;
+
+        // buf[5] with HN_B (baselen=2) gives max=10^3=1000.
+        while (scaleIndex < maxScale &&
+               (quotient >= 1000UL ||
+                (quotient == 999UL && (remainder >= divisorDecCut || remainder >= halfDivisor))))
+        {
+            remainder = quotient % divisor;
+            quotient /= divisor;
+            scaleIndex++;
+        }
+
+        Span<byte> formatted = stackalloc byte[32];
+        int rawLen;
+        string suffix = suffixes[scaleIndex];
+        if (((quotient == 9UL && remainder < divisorDecCut) || quotient < 9UL) && scaleIndex > 0)
+        {
+            ulong tenths = (remainder * 10UL + halfDivisor) / divisor;
+            ulong s1 = quotient + (tenths / 10UL);
+            ulong s2 = tenths % 10UL;
+            if (!TryWriteTenths(s1 * 10UL + s2, suffix, localeFormat.DecimalPoint, formatted, out rawLen))
+            {
+                bytesWritten = 0;
+                return false;
+            }
+        }
+        else
+        {
+            ulong rounded = quotient + ((remainder + halfDivisor) / divisor);
+            if (!rounded.TryFormat(formatted, out rawLen, provider: CultureInfo.InvariantCulture) ||
+                rawLen + suffix.Length > formatted.Length)
+            {
+                bytesWritten = 0;
+                return false;
+            }
+
+            Encoding.ASCII.GetBytes(suffix, formatted[rawLen..]);
+            rawLen += suffix.Length;
+        }
+
+        int pad = rawLen < 4 ? 4 - rawLen : 0;
+        if (pad + rawLen > destination.Length)
+        {
+            bytesWritten = 0;
+            return false;
+        }
+
+        for (int p = 0; p < pad; p++)
+            destination[p] = (byte)' ';
+
+        formatted[..rawLen].CopyTo(destination[pad..]);
+        bytesWritten = pad + rawLen;
+        return true;
     }
 
     private static bool TryFormatFixedScale(

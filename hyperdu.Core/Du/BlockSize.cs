@@ -6,7 +6,9 @@ internal enum HumanMode
 {
     None,
     Binary,
-    Si
+    Si,
+    BsdBinary,
+    BsdSi
 }
 
 /// <summary>
@@ -33,6 +35,8 @@ public readonly record struct BlockSizeSpec
     public static BlockSizeSpec Megabytes => new(1048576, HumanMode.None, null, false);
     public static BlockSizeSpec HumanBinary => new(1024, HumanMode.Binary, null, false);
     public static BlockSizeSpec HumanSi => new(1000, HumanMode.Si, null, false);
+    public static BlockSizeSpec BsdHumanBinary => new(1024, HumanMode.BsdBinary, null, false);
+    public static BlockSizeSpec BsdHumanSi => new(1000, HumanMode.BsdSi, null, false);
 
     internal BlockSizeSpec WithGrouping(bool grouping) => new(Scale, Mode, Suffix, grouping);
 }
@@ -98,6 +102,245 @@ public static class BlockSize
         if (humanReadableOverride == false)
             return new BlockSizeSpec(1000, HumanMode.Si, null, spec.Grouping);
         return spec;
+    }
+
+    /// <summary>
+    /// Resolves BSD getbsize(3) from the BLOCKSIZE environment variable (512 default, 1G max, 512 min).
+    /// </summary>
+    internal static ulong ResolveBsdBlockSize(string diagName, Stream stderr)
+    {
+        const ulong kb = 1024UL;
+        const ulong mb = 1024UL * 1024UL;
+        const ulong gb = 1024UL * 1024UL * 1024UL;
+
+        string? raw = Environment.GetEnvironmentVariable("BLOCKSIZE");
+        if (string.IsNullOrEmpty(raw))
+            return 512UL;
+
+        long parsed = ParseStrtolPrefix(raw, out int endIdx, out bool overflow);
+        if (parsed < 0)
+        {
+            Messages.WriteError(stderr, diagName, "minimum blocksize is 512");
+            return 512UL;
+        }
+
+        long n = parsed == 0 && !overflow ? 1 : parsed;
+        int remaining = raw.Length - endIdx;
+        if (remaining > 1)
+        {
+            Messages.WriteError(stderr, diagName, $"{raw}: unknown blocksize");
+            return 512UL;
+        }
+
+        ulong max;
+        ulong mul;
+        char unit = remaining == 1 ? raw[endIdx] : '\0';
+        switch (unit)
+        {
+            case 'G':
+            case 'g':
+                max = 1;
+                mul = gb;
+                break;
+            case 'K':
+            case 'k':
+                max = gb / kb;
+                mul = kb;
+                break;
+            case 'M':
+            case 'm':
+                max = gb / mb;
+                mul = mb;
+                break;
+            case '\0':
+                max = gb;
+                mul = 1;
+                break;
+            default:
+                Messages.WriteError(stderr, diagName, $"{raw}: unknown blocksize");
+                return 512UL;
+        }
+
+        ulong un = overflow ? gb + 1 : (ulong)n;
+        if (un > max)
+        {
+            Messages.WriteError(stderr, diagName, "maximum blocksize is 1G");
+            un = max;
+        }
+
+        ulong blockSize = un * mul;
+        if (blockSize < 512UL)
+        {
+            Messages.WriteError(stderr, diagName, "minimum blocksize is 512");
+            return 512UL;
+        }
+
+        return blockSize;
+    }
+
+    internal static bool TryParseBsdAtoi(string raw, out int value, out bool overflow)
+    {
+        long parsed = ParseStrtolPrefix(raw, out _, out overflow);
+        value = unchecked((int)parsed);
+        return !overflow;
+    }
+
+    internal static bool TryParseBsdExpandNumber(string raw, out long value)
+    {
+        value = 0;
+        int i = 0;
+        bool negative = SkipWhitespaceAndSign(raw, ref i);
+
+        if (i >= raw.Length || !char.IsAsciiDigit(raw[i]))
+            return false;
+
+        int numBase = 10;
+        if (raw[i] == '0')
+        {
+            if (i + 1 < raw.Length && (raw[i + 1] == 'x' || raw[i + 1] == 'X'))
+            {
+                numBase = 16;
+                i += 2;
+                if (i >= raw.Length || !char.IsAsciiHexDigit(raw[i]))
+                    return false;
+            }
+            else
+            {
+                numBase = 8;
+            }
+        }
+
+        ulong number = 0;
+        int digitStart = i;
+        while (i < raw.Length)
+        {
+            int digit = ParseDigitForBase(raw[i], numBase);
+            if (digit < 0)
+                break;
+
+            if (number > (ulong.MaxValue - (ulong)digit) / (ulong)numBase)
+                return false;
+
+            number = number * (ulong)numBase + (ulong)digit;
+            i++;
+        }
+
+        if (i == digitStart && numBase == 16)
+            return false;
+
+        int shift = 0;
+        if (i < raw.Length)
+        {
+            shift = char.ToLowerInvariant(raw[i]) switch
+            {
+                'e' => 60,
+                'p' => 50,
+                't' => 40,
+                'g' => 30,
+                'm' => 20,
+                'k' => 10,
+                _ => -1
+            };
+
+            if (shift > 0)
+                i++;
+            else
+                shift = 0;
+        }
+
+        if (i < raw.Length && (raw[i] == 'b' || raw[i] == 'B'))
+            i++;
+
+        if (i != raw.Length)
+            return false;
+
+        if (shift > 0)
+        {
+            ulong shifted = number << shift;
+            if ((shifted >> shift) != number)
+                return false;
+            number = shifted;
+        }
+
+        if (negative)
+        {
+            if (number > 0x8000000000000000UL)
+                return false;
+            value = unchecked(-(long)number);
+        }
+        else
+        {
+            if (number > long.MaxValue)
+                return false;
+            value = (long)number;
+        }
+
+        return true;
+    }
+
+    private static long ParseStrtolPrefix(string raw, out int endIdx, out bool overflow)
+    {
+        overflow = false;
+        int i = 0;
+        bool negative = SkipWhitespaceAndSign(raw, ref i);
+
+        int digitStart = i;
+        ulong acc = 0;
+        ulong limit = negative ? 0x8000000000000000UL : (ulong)long.MaxValue;
+        while (i < raw.Length && char.IsAsciiDigit(raw[i]))
+        {
+            ulong d = (ulong)(raw[i] - '0');
+            if (!overflow)
+            {
+                if (acc > (limit - d) / 10UL)
+                    overflow = true;
+                else
+                    acc = acc * 10UL + d;
+            }
+            i++;
+        }
+
+        endIdx = i == digitStart ? i : i;
+        if (overflow)
+            return negative ? long.MinValue : long.MaxValue;
+
+        return negative ? unchecked(-(long)acc) : (long)acc;
+    }
+
+    private static bool SkipWhitespaceAndSign(string raw, ref int index)
+    {
+        while (index < raw.Length && char.IsWhiteSpace(raw[index]))
+            index++;
+
+        bool negative = false;
+        if (index < raw.Length && raw[index] == '-')
+        {
+            negative = true;
+            index++;
+        }
+        else if (index < raw.Length && raw[index] == '+')
+        {
+            index++;
+        }
+
+        return negative;
+    }
+
+    private static int ParseDigitForBase(char c, int numBase)
+    {
+        if (c >= '0' && c <= '9')
+        {
+            int d = c - '0';
+            return d < numBase ? d : -1;
+        }
+
+        if (numBase == 16)
+        {
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        }
+
+        return -1;
     }
 
     internal static bool TryParse(string raw, out BlockSizeSpec spec, out BlockSizeParseStatus errorStatus)

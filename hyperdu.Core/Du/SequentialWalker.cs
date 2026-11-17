@@ -35,12 +35,15 @@ public sealed unsafe class SequentialWalker
     private readonly Stream _stderr;
     private readonly byte[] _statBuffer = new byte[NativeIo.StatBufferSize];
     private readonly byte[] _direntBuffer = new byte[DuAccounting.DirentReadBufferSize];
-    private readonly HashSet<FileIdentity> _seen = [];
+    private byte[] _ignoreScratch = new byte[512];
+    private readonly DuIdentityTracker _seen;
     private readonly HashSet<FileIdentity> _activeAncestors = [];
+    private readonly List<(FileIdentity Id, int PathLen)> _ancestorStack = [];
     private readonly ulong _maxDepth;
     private readonly bool _hasExcludes;
     private readonly bool _showTime;
     private bool _trackSingleLinkFiles;
+    private bool _stoppedEarly;
 
     private byte[] _nameArena = new byte[65536];
     private int _nameArenaPos;
@@ -67,10 +70,12 @@ public sealed unsafe class SequentialWalker
         _stdin = stdin;
         _stdout = stdout;
         _stderr = stderr;
+        _seen = new DuIdentityTracker(options.Dialect);
         _maxDepth = options.Summarize ? 0UL : (options.MaxDepth ?? ulong.MaxValue);
         _hasExcludes = !options.Excludes.IsEmpty;
         _showTime = options.ShowTime;
-        _trackSingleLinkFiles = options.Operands.Count > 1 || options.Files0From != null;
+        _trackSingleLinkFiles = options.Dialect == DuDialect.Gnu &&
+                                (options.Operands.Count > 1 || options.Files0From != null);
     }
 
     public static void RestoreDefaultSigpipe() => NativeIo.RestoreDefaultSigpipe();
@@ -87,6 +92,9 @@ public sealed unsafe class SequentialWalker
         Span<byte> operandStackBuf = stackalloc byte[512];
         foreach (string operand in _options.Operands)
         {
+            if (_stoppedEarly)
+                break;
+
             int maxBytes = Encoding.UTF8.GetMaxByteCount(operand.Length);
             if (maxBytes <= operandStackBuf.Length)
             {
@@ -105,7 +113,12 @@ public sealed unsafe class SequentialWalker
         if (rawOperands.Count > 1)
             _trackSingleLinkFiles = true;
         foreach (byte[] rawBytes in rawOperands)
+        {
+            if (_stoppedEarly)
+                break;
+
             ProcessOperand(rawBytes);
+        }
     });
 
     private int RunWithTimeContext(Action scanAction)
@@ -116,7 +129,7 @@ public sealed unsafe class SequentialWalker
         {
             scanAction();
 
-            if (_options.Total)
+            if (!_stoppedEarly && _options.Total)
                 writer.EmitLine(_grandTotal, _grandMaxTime, "total"u8);
 
             writer.Flush();
@@ -130,6 +143,9 @@ public sealed unsafe class SequentialWalker
 
     private void ProcessOperand(ReadOnlySpan<byte> rawOperand)
     {
+        if (_stoppedEarly)
+            return;
+
         SetNormalizedRootPath(rawOperand);
 
         if (_hasExcludes && _options.Excludes.IsExcluded(CurrentPathSpan))
@@ -147,18 +163,39 @@ public sealed unsafe class SequentialWalker
             ReadOnlySpan<byte> nullTermPath = nullTermSpan[..(rawOperand.Length + 1)];
 
             bool followOperand = _options.SymlinkPolicy is SymlinkPolicy.DereferenceArgs or SymlinkPolicy.DereferenceAll;
-            if (!NativeIo.TryStatPath(nullTermPath, followOperand, _statBuffer, out NativeStat stat, out int errno))
+            NativeStat stat;
+            int errno;
+            bool statOk;
+            bool isBsdFatalSymlinkLoop;
+            fixed (byte* pStat = _statBuffer)
             {
-                if (followOperand)
-                    errno = NormalizeDanglingSymlinkErrno(nullTermPath, errno);
+                statOk = DuAccounting.TryStatPathWithPolicy(nullTermPath, followOperand, _options, pStat, out stat, out errno, out isBsdFatalSymlinkLoop);
+            }
+
+            if (!statOk)
+            {
+                if (isBsdFatalSymlinkLoop)
+                {
+                    _writer!.WriteBsdTooManySymlinksError(CurrentPathSpan);
+                    _stoppedEarly = true;
+                    return;
+                }
+
                 _writer!.WritePosixError("cannot access", CurrentPathSpan, errno);
                 return;
             }
 
+            if (DuAccounting.ShouldIgnoreBsdEntry(in stat, _options, nullTermPath, DuAccounting.ExtractBasename(CurrentPathSpan)))
+                return;
+
             _rootDevice = stat.Device;
             FileIdentity operandId = new(stat.Device, stat.Inode);
-            if (!_options.CountLinks && !_seen.Add(operandId))
+            if (!_options.CountLinks &&
+                DuAccounting.ShouldTrackOperandIdentity(in stat, _options) &&
+                !_seen.TryClaim(operandId, stat.HardLinks))
+            {
                 return;
+            }
 
             if (stat.Kind != NativeEntryKind.Directory)
             {
@@ -167,7 +204,7 @@ public sealed unsafe class SequentialWalker
                 _grandTotal += count;
                 if (_showTime)
                     _grandMaxTime = FileTimestamp.Max(_grandMaxTime, entryTime);
-                if (DuAccounting.ShouldEmitForThreshold(count, _options))
+                if (DuAccounting.ShouldEmitForThreshold(count, _options, isDirectory: false))
                     _writer!.EmitLine(count, entryTime, CurrentPathSpan);
                 return;
             }
@@ -206,6 +243,9 @@ public sealed unsafe class SequentialWalker
         if (openErrno != 0)
         {
             _writer!.WritePosixError("cannot read directory", CurrentPathSpan, openErrno);
+            if (_options.Dialect == DuDialect.Bsd)
+                return default;
+
             if (depth <= _maxDepth && DuAccounting.ShouldEmitForThreshold(ownBytes, _options))
                 _writer.EmitLine(ownBytes, directMaxTime, CurrentPathSpan);
             return new DirWalkResult(ownBytes, ownBytes, directMaxTime, directMaxTime);
@@ -213,6 +253,8 @@ public sealed unsafe class SequentialWalker
 
         FileIdentity dirId = new(dirStat.Device, dirStat.Inode);
         _activeAncestors.Add(dirId);
+        if (_options.Dialect == DuDialect.Bsd)
+            _ancestorStack.Add((dirId, _pathLen));
         _openDirCount++;
         int savedArenaPos = _nameArenaPos;
         int savedEntryPos = _entryStackPos;
@@ -229,12 +271,16 @@ public sealed unsafe class SequentialWalker
             int entryEnd = _entryStackPos;
             int count = entryEnd - entryStart;
 
-            if (count > DuAccounting.InodeSortThreshold && NativeIo.ShouldSortDirectoryByInode(dirFd))
+            if (count > DuAccounting.InodeSortThreshold &&
+                NativeIo.ShouldSortDirectoryByInode(dirFd, allowOnMacOs: _options.Dialect == DuDialect.Gnu))
                 Array.Sort(_entryStack, entryStart, count, DirEntryInodeComparer.Instance);
 
             bool followChild = _options.SymlinkPolicy == SymlinkPolicy.DereferenceAll;
             for (int i = entryStart; i < entryEnd; i++)
             {
+                if (_stoppedEarly)
+                    break;
+
                 int savedPath = _pathLen;
                 ProcessChildEntry(
                     dirFd,
@@ -256,6 +302,8 @@ public sealed unsafe class SequentialWalker
         }
         finally
         {
+            if (_options.Dialect == DuDialect.Bsd && _ancestorStack.Count > 0)
+                _ancestorStack.RemoveAt(_ancestorStack.Count - 1);
             _activeAncestors.Remove(dirId);
             if (fallbackDir != null)
                 fallbackDir.Dispose();
@@ -266,6 +314,9 @@ public sealed unsafe class SequentialWalker
             _nameArenaPos = savedArenaPos;
             _openDirCount--;
         }
+
+        if (_stoppedEarly)
+            return default;
 
         if (deferredSubdirs != null)
         {
@@ -278,6 +329,8 @@ public sealed unsafe class SequentialWalker
                 ref subdirReportedMaxTime,
                 ref hasSubdirFullTime,
                 ref subdirFullMaxTime);
+            if (_stoppedEarly)
+                return default;
         }
 
         ulong ownAndFiles = ownBytes + directNonDirBytes;
@@ -316,6 +369,9 @@ public sealed unsafe class SequentialWalker
         Span<byte> deferredStackBuf = stackalloc byte[512];
         foreach ((byte[] childPath, NativeStat childStat) in deferredSubdirs)
         {
+            if (_stoppedEarly)
+                break;
+
             SetExactPath(childPath);
             byte[]? rentedNullTerm = null;
             Span<byte> buf = childPath.Length + 1 <= deferredStackBuf.Length
@@ -373,10 +429,18 @@ public sealed unsafe class SequentialWalker
         bool pathPushed = false;
         if (_hasExcludes)
         {
-            PushPathSegment(entry.NameOffset, entry.NameLength);
-            pathPushed = true;
-            if (_options.Excludes.IsExcluded(CurrentPathSpan))
-                return;
+            if (_options.Excludes.MatchBasenameOnly)
+            {
+                if (_options.Excludes.IsExcludedChildBasename(_nameArena.AsSpan(entry.NameOffset, entry.NameLength)))
+                    return;
+            }
+            else
+            {
+                PushPathSegment(entry.NameOffset, entry.NameLength);
+                pathPushed = true;
+                if (_options.Excludes.IsExcluded(CurrentPathSpan))
+                    return;
+            }
         }
 
         NativeStat childStat;
@@ -391,12 +455,22 @@ public sealed unsafe class SequentialWalker
             }
 
             ReadOnlySpan<byte> nullTermChildPath = NullTerminatedCurrentPath();
-            if (!NativeIo.TryStatPath(nullTermChildPath, followSymlinks: true, _statBuffer, out childStat, out statErrno))
+            bool statOk;
+            bool isBsdFatalSymlinkLoop;
+            fixed (byte* pStat = _statBuffer)
             {
-                if (!pathPushed)
-                    PushPathSegment(entry.NameOffset, entry.NameLength);
+                statOk = DuAccounting.TryStatFollowed(nullTermChildPath, _options, pStat, out childStat, out statErrno, out isBsdFatalSymlinkLoop);
+            }
 
-                statErrno = NormalizeDanglingSymlinkErrno(nullTermChildPath, statErrno);
+            if (!statOk)
+            {
+                if (isBsdFatalSymlinkLoop)
+                {
+                    _writer!.WriteBsdTooManySymlinksError(CurrentPathSpan);
+                    _stoppedEarly = true;
+                    return;
+                }
+
                 _writer!.WritePosixError("cannot access", CurrentPathSpan, statErrno);
                 return;
             }
@@ -410,21 +484,70 @@ public sealed unsafe class SequentialWalker
             return;
         }
 
-        if (_options.OneFileSystem && childStat.Device != _rootDevice)
+        if (_options.Dialect == DuDialect.Bsd &&
+            DuAccounting.ShouldIgnoreBsdChild(
+                in childStat,
+                _options,
+                CurrentPathWithoutLastSegment(pathPushed, entry.NameLength),
+                _nameArena.AsSpan(entry.NameOffset, entry.NameLength),
+                ref _ignoreScratch))
+        {
             return;
+        }
+
+        if (_options.OneFileSystem && childStat.Device != _rootDevice)
+        {
+            if (_options.Dialect != DuDialect.Bsd)
+                return;
+
+            if (childStat.Kind == NativeEntryKind.Directory)
+            {
+                ulong mountOwn = DuAccounting.ComputeEntryValue(in childStat, _options);
+                FileTimestamp mountTime = DuAccounting.ExtractTimestamp(in childStat, _options);
+                directSubdirReportedBytes += mountOwn;
+                subdirFullBytes += mountOwn;
+                DuAccounting.AccumulateSubdirTime(
+                    new DirWalkResult(mountOwn, mountOwn, mountTime, mountTime),
+                    _options.SeparateDirs,
+                    _showTime,
+                    ref hasSubdirReportedTime,
+                    ref subdirReportedMaxTime,
+                    ref hasSubdirFullTime,
+                    ref subdirFullMaxTime);
+                if (childDepth <= _maxDepth && DuAccounting.ShouldEmitForThreshold(mountOwn, _options, isDirectory: true))
+                {
+                    if (!pathPushed)
+                        PushPathSegment(entry.NameOffset, entry.NameLength);
+                    _writer!.EmitLine(mountOwn, mountTime, CurrentPathSpan);
+                }
+
+                return;
+            }
+        }
 
         FileIdentity childId = new(childStat.Device, childStat.Inode);
         if (childStat.Kind == NativeEntryKind.Directory && _activeAncestors.Contains(childId))
-            return;
-
-        if (!_options.CountLinks)
         {
-            bool trackIdentity = childStat.Kind == NativeEntryKind.Directory ||
-                                 childStat.HardLinks > 1 ||
-                                 followChild ||
-                                 _trackSingleLinkFiles;
-            if (trackIdentity && !_seen.Add(childId))
-                return;
+            if (_options.Dialect == DuDialect.Bsd)
+            {
+                int cyclePathLen = FindAncestorPathLength(childId);
+                if (cyclePathLen >= 0)
+                {
+                    if (!pathPushed)
+                        PushPathSegment(entry.NameOffset, entry.NameLength);
+                    _writer!.WriteBsdSymlinkCycleError(CurrentPathSpan, _pathStack.AsSpan(0, cyclePathLen));
+                    _stoppedEarly = true;
+                }
+            }
+
+            return;
+        }
+
+        if (!_options.CountLinks &&
+            DuAccounting.ShouldTrackChildIdentity(in childStat, _options, followChild, _trackSingleLinkFiles) &&
+            !_seen.TryClaim(childId, childStat.HardLinks))
+        {
+            return;
         }
 
         if (childStat.Kind == NativeEntryKind.Directory)
@@ -470,7 +593,7 @@ public sealed unsafe class SequentialWalker
         FileTimestamp entryTime = DuAccounting.ExtractTimestamp(in childStat, _options);
         if (_showTime)
             directMaxTime = FileTimestamp.Max(directMaxTime, entryTime);
-        if (_options.All && childDepth <= _maxDepth && DuAccounting.ShouldEmitForThreshold(entryValue, _options))
+        if (_options.All && childDepth <= _maxDepth && DuAccounting.ShouldEmitForThreshold(entryValue, _options, isDirectory: false))
         {
             if (!pathPushed)
                 PushPathSegment(entry.NameOffset, entry.NameLength);
@@ -478,12 +601,15 @@ public sealed unsafe class SequentialWalker
         }
     }
 
-    private int NormalizeDanglingSymlinkErrno(ReadOnlySpan<byte> nullTermPath, int statErrno)
+    private ReadOnlySpan<byte> CurrentPathWithoutLastSegment(bool pathPushed, int childNameLength)
     {
-        fixed (byte* pStat = _statBuffer)
-        {
-            return DuAccounting.NormalizeDanglingSymlinkErrno(nullTermPath, statErrno, pStat);
-        }
+        if (!pathPushed)
+            return CurrentPathSpan;
+
+        int end = _pathLen - childNameLength;
+        if (end > 1 && _pathStack[end - 1] == (byte)'/')
+            end--;
+        return _pathStack.AsSpan(0, Math.Max(0, end));
     }
 
     private ReadOnlySpan<byte> NullTerminatedCurrentPath()
@@ -556,6 +682,17 @@ public sealed unsafe class SequentialWalker
             Array.Resize(ref _entryStack, _entryStack.Length * 2);
 
         _entryStack[_entryStackPos++] = new DirEntry(inode, order, nameOffset, name.Length);
+    }
+
+    private int FindAncestorPathLength(FileIdentity cycleId)
+    {
+        for (int i = _ancestorStack.Count - 1; i >= 0; i--)
+        {
+            if (_ancestorStack[i].Id == cycleId)
+                return _ancestorStack[i].PathLen;
+        }
+
+        return -1;
     }
 
     private bool TryStatArenaEntry(int dirFd, int nameOffset, bool followSymlinks, out NativeStat stat, out int errno)

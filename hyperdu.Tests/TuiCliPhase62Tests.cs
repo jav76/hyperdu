@@ -189,7 +189,7 @@ public sealed class TuiCliPhase62Tests
 
         if (!OperatingSystem.IsWindows())
         {
-            (int rcDu, string outDu, string errDu) = RunCli(["du", "-b", "-s", "--exclude=*.tmp", "--exclude=node_modules", "--exclude=.patterns", tree.Root], headlessTui: false);
+            (int rcDu, string outDu, string errDu) = RunCli(["gdu", "-b", "-s", "--exclude=*.tmp", "--exclude=node_modules", "--exclude=.patterns", tree.Root], headlessTui: false);
             (int rcTui, string outTui, string errTui) = RunCli(["-b", "--exclude=*.tmp", "--exclude=node_modules", "--exclude=.patterns", tree.Root], headlessTui: true);
             Assert.Equal(0, rcDu);
             Assert.Equal(0, rcTui);
@@ -245,14 +245,14 @@ public sealed class TuiCliPhase62Tests
             fs.Flush(flushToDisk: true);
         }
 
-        (int rcDuH, string outDuH, _) = RunCli(["du", "-h", "-s", tree.Root], headlessTui: false);
+        (int rcDuH, string outDuH, _) = RunCli(["gdu", "-h", "-s", tree.Root], headlessTui: false);
         (int rcTuiH, string outTuiH, string errTuiH) = RunCli(["-h", tree.Root], headlessTui: true);
         Assert.Equal(0, rcDuH);
         Assert.Equal(0, rcTuiH);
         Assert.Empty(errTuiH);
         Assert.Equal(outDuH, outTuiH);
 
-        (int rcDuSi, string outDuSi, _) = RunCli(["du", "--si", "-s", tree.Root], headlessTui: false);
+        (int rcDuSi, string outDuSi, _) = RunCli(["gdu", "--si", "-s", tree.Root], headlessTui: false);
         (int rcTuiSi, string outTuiSi, string errTuiSi) = RunCli(["--si", tree.Root], headlessTui: true);
         Assert.Equal(0, rcDuSi);
         Assert.Equal(0, rcTuiSi);

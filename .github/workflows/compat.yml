@@ -107,3 +107,124 @@ jobs:
           name: compat-results
           path: artifacts/compat/
           if-no-files-found: warn
+
+  compat-macos:
+    name: Compat (${{ matrix.os }}, BSD /usr/bin/du + Homebrew gdu)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            rid: osx-arm64
+            startup_max_delta_ms: "8.0"
+          - os: macos-15-intel
+            rid: osx-x64
+            startup_max_delta_ms: "15.0"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Ensure Homebrew GNU gdu and inspect macOS references
+        run: |
+          if ! command -v gdu >/dev/null 2>&1; then
+            brew install coreutils
+          fi
+          BREW_BIN="$(brew --prefix)/bin"
+          echo "$BREW_BIN" >> "$GITHUB_PATH"
+          export PATH="$BREW_BIN:$PATH"
+          echo "Reference BSD du: /usr/bin/du"
+          echo "Reference GNU gdu: $(command -v gdu) ($(gdu --version | head -n 1))"
+
+      - name: Publish Native AOT hyperdu, package archive, and extract du/gdu symlinks
+        run: |
+          mkdir -p artifacts/publish-bin artifacts/compat-archive artifacts/compat-bin artifacts/compat
+          dotnet publish hyperdu.Cli/hyperdu.Cli.csproj -c Release -r ${{ matrix.rid }} -p:PublishAot=true -o artifacts/publish-bin --nologo -v quiet
+          bash .github/scripts/package-unix-archive.sh \
+            artifacts/publish-bin/hyperdu \
+            artifacts/compat-archive/hyperdu-${{ matrix.rid }}.tar.gz \
+            LICENSE \
+            README.md
+          bash .github/scripts/verify-unix-archive.sh \
+            artifacts/compat-archive/hyperdu-${{ matrix.rid }}.tar.gz \
+            --extract-dir artifacts/compat-bin
+
+      - name: Run BSD differential harness (du vs /usr/bin/du, 100% gate)
+        run: |
+          FIXTURES_DIR="$(mktemp -d -t hyperdu-macos-fixtures-XXXXXX)"
+          trap 'bash tests/compat/cleanup-fixtures.sh "$FIXTURES_DIR"' EXIT
+          bash tests/compat/make-fixtures.sh "$FIXTURES_DIR"
+          bash tests/compat/diff-run.sh \
+            --dialect bsd \
+            --fixtures "$FIXTURES_DIR" \
+            --ref-du /usr/bin/du \
+            --candidate-du artifacts/compat-bin/du \
+            --threads-matrix 1,4,auto \
+            --min-score 100 \
+            --timeout 3 \
+            --jobs 4 \
+            --json artifacts/compat/macos-${{ matrix.rid }}-bsd-diff.json \
+            --markdown artifacts/compat/macos-${{ matrix.rid }}-bsd-diff.md
+
+      - name: Run GNU differential harness (gdu vs Homebrew gdu, 100% gate)
+        run: |
+          FIXTURES_DIR="$(mktemp -d -t hyperdu-macos-gdu-fixtures-XXXXXX)"
+          trap 'bash tests/compat/cleanup-fixtures.sh "$FIXTURES_DIR"' EXIT
+          bash tests/compat/make-fixtures.sh "$FIXTURES_DIR"
+          bash tests/compat/diff-run.sh \
+            --dialect gnu \
+            --fixtures "$FIXTURES_DIR" \
+            --ref-du "$(command -v gdu)" \
+            --candidate-du artifacts/compat-bin/gdu \
+            --threads-matrix 1,4,auto \
+            --min-score 100 \
+            --timeout 3 \
+            --jobs 4 \
+            --json artifacts/compat/macos-${{ matrix.rid }}-gnu-diff.json \
+            --markdown artifacts/compat/macos-${{ matrix.rid }}-gnu-diff.md
+
+      - name: Run macOS APFS firmlink and BSD unit tests
+        run: |
+          dotnet test hyperdu.Tests/hyperdu.Tests.csproj -c Release --filter "FullyQualifiedName~DuPhase63Tests|FullyQualifiedName~MacOsMountInfo" --logger "console;verbosity=normal"
+
+      - name: Check AOT du and gdu FILE startup overhead (<= ${{ matrix.startup_max_delta_ms }} ms delta vs /usr/bin/du)
+        run: |
+          python3 .github/scripts/check-aot-startup.py \
+            --binary artifacts/compat-bin/du \
+            --ref-binary /usr/bin/du \
+            --target README.md \
+            --max-delta-ms ${{ matrix.startup_max_delta_ms }} \
+            --markdown artifacts/compat/macos-${{ matrix.rid }}-startup-du.md
+          python3 .github/scripts/check-aot-startup.py \
+            --binary artifacts/compat-bin/gdu \
+            --ref-binary /usr/bin/du \
+            --target README.md \
+            --max-delta-ms ${{ matrix.startup_max_delta_ms }} \
+            --markdown artifacts/compat/macos-${{ matrix.rid }}-startup-gdu.md
+
+      - name: Publish macOS compatibility summary
+        if: always()
+        run: |
+          for f in artifacts/compat/*.md; do
+            if [ -f "$f" ]; then
+              cat "$f" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: Upload macOS compatibility artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-results-${{ matrix.rid }}
+          path: artifacts/compat/
+          if-no-files-found: warn

@@ -135,4 +135,34 @@ else
     "$FIXTURE_ROOT/mnt/submount/inside.bin"
 fi
 
+# Isolated fixtures for BSD/macOS persona (-A, -I, -n UF_NODUMP, -h, broken_sl, hardlinks).
+python3 - "$FIXTURE_ROOT/bsd_extra" <<'PY'
+import os, sys
+root = sys.argv[1]
+os.makedirs(root, exist_ok=True)
+files = {
+    "empty.bin": b"",
+    "halfk.bin": b"a" * 512,
+    "fourk.bin": b"b" * 4096,
+    "tenk.bin": b"c" * 10240,
+    "ignore.tmp": b"x" * 2048,
+    "keep.log": b"y" * 2048,
+    "nodump.bin": b"n" * 4096,
+    "sub_skip/nested.bin": b"s" * 4096,
+    "nodump_dir/inside.bin": b"d" * 4096,
+}
+for rel, data in files.items():
+    p = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "wb") as f:
+        f.write(data)
+os.link(os.path.join(root, "fourk.bin"), os.path.join(root, "fourk_hl.bin"))
+os.symlink("missing_target", os.path.join(root, "broken_sl"))
+os.symlink("keep.log", os.path.join(root, "file_sl"))
+PY
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  chflags nodump "$FIXTURE_ROOT/bsd_extra/nodump.bin" "$FIXTURE_ROOT/bsd_extra/nodump_dir"
+fi
+
 echo "Created compatibility fixtures at $FIXTURE_ROOT"

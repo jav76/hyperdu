@@ -50,6 +50,7 @@ internal static unsafe partial class Libc
     internal const uint STATX_SIZE = 0x200;
     internal const uint STATX_BLOCKS = 0x400;
 
+    internal const uint UF_NODUMP = 0x00000001;
     internal const uint UF_HIDDEN = 0x8000;
 
     internal const ulong TMPFS_MAGIC = 0x01021994;
@@ -128,6 +129,12 @@ internal static unsafe partial class Libc
 
     [LibraryImport(Lib, EntryPoint = "statfs$INODE64")]
     internal static partial int statfs_inode64(byte* path, byte* buf);
+
+    [LibraryImport(Lib, EntryPoint = "fstatfs$INODE64")]
+    internal static partial int fstatfs_inode64(int fd, byte* buf);
+
+    [LibraryImport(Lib, EntryPoint = "_NSGetArgv")]
+    internal static partial byte*** _NSGetArgv();
 
     [LibraryImport(Lib)]
     internal static partial void tzset();

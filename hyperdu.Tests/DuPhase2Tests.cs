@@ -6,8 +6,13 @@ using hyperdu.Core.Native;
 namespace hyperdu.Tests;
 
 [Collection("DuEnv")]
-public sealed partial class DuPhase2Tests
+public sealed partial class DuPhase2Tests : IDisposable
 {
+    private readonly string? _prevDialect = Environment.GetEnvironmentVariable("HYPERDU_DU_DIALECT");
+
+    public DuPhase2Tests() => Environment.SetEnvironmentVariable("HYPERDU_DU_DIALECT", "gnu");
+
+    public void Dispose() => Environment.SetEnvironmentVariable("HYPERDU_DU_DIALECT", _prevDialect);
     [LibraryImport("libc", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
     private static partial int link(string existingPath, string newPath);
 

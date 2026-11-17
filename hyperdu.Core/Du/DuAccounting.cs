@@ -21,6 +21,13 @@ internal static unsafe class DuAccounting
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static ulong ComputeEntryValue(in NativeStat stat, DuOptions options)
     {
+        if (options.Dialect == DuDialect.Bsd)
+        {
+            ulong raw = (ulong)Math.Max(0L, options.ApparentSize ? stat.Size : stat.Blocks);
+            ulong div = options.BsdCountDivisor;
+            return div <= 1UL ? raw : (raw + div - 1) / div;
+        }
+
         if (options.Inodes)
             return 1UL;
 
@@ -28,8 +35,94 @@ internal static unsafe class DuAccounting
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static bool ShouldEmitForThreshold(ulong value, DuOptions options) =>
-        options.Threshold is not ThresholdSpec t || t.Matches(value);
+    internal static bool ShouldEmitForThreshold(ulong value, DuOptions options, bool isDirectory = true)
+    {
+        if (options.Threshold is not ThresholdSpec t)
+            return true;
+
+        if (options.Dialect == DuDialect.Bsd)
+            return !isDirectory || t.Matches(options.ComputeBsdDisplayBlocks(value));
+
+        return t.Matches(value);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool ShouldIgnoreBsdEntry(
+        in NativeStat stat,
+        DuOptions options,
+        ReadOnlySpan<byte> nullTermPath,
+        ReadOnlySpan<byte> entryName)
+    {
+        if (options.Dialect != DuDialect.Bsd)
+            return false;
+
+        if (options.IgnoreNoDump && stat.HasNoDumpFlag)
+            return true;
+
+        return stat.Kind == NativeEntryKind.Directory && NativeIo.IsMacOsDevFdDirectory(nullTermPath, entryName);
+    }
+
+    internal static ReadOnlySpan<byte> ExtractBasename(ReadOnlySpan<byte> path)
+    {
+        int slash = path.LastIndexOf((byte)'/');
+        // Mirrors FreeBSD fts_load: keeps "/" as "/", strips prefix when '/' has trailing text or is non-leading.
+        return slash >= 0 && (slash > 0 || slash + 1 < path.Length)
+            ? path[(slash + 1)..]
+            : path;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool ShouldTrackOperandIdentity(in NativeStat stat, DuOptions options) =>
+        options.Dialect == DuDialect.Gnu
+        || (stat.Kind != NativeEntryKind.Directory && stat.HardLinks > 1);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool ShouldTrackChildIdentity(
+        in NativeStat stat,
+        DuOptions options,
+        bool followChild,
+        bool trackSingleLinkFiles) =>
+        options.Dialect == DuDialect.Bsd
+            ? (stat.Kind != NativeEntryKind.Directory && stat.HardLinks > 1)
+            : (stat.Kind == NativeEntryKind.Directory ||
+               stat.HardLinks > 1 ||
+               followChild ||
+               trackSingleLinkFiles);
+
+    internal static bool ShouldExcludeChild(
+        DuOptions options,
+        ReadOnlySpan<byte> parentDisplayPath,
+        ReadOnlySpan<byte> childName,
+        ref byte[] pathScratch)
+    {
+        if (options.Excludes.MatchBasenameOnly)
+            return options.Excludes.IsExcludedChildBasename(childName);
+
+        int len = WriteChildPathInto(parentDisplayPath, childName, ref pathScratch);
+        return options.Excludes.IsExcluded(pathScratch.AsSpan(0, len));
+    }
+
+    internal static bool ShouldIgnoreBsdChild(
+        in NativeStat stat,
+        DuOptions options,
+        ReadOnlySpan<byte> parentDisplayPath,
+        ReadOnlySpan<byte> childName,
+        ref byte[] pathScratch)
+    {
+        if (options.Dialect != DuDialect.Bsd)
+            return false;
+
+        if (options.IgnoreNoDump && stat.HasNoDumpFlag)
+            return true;
+
+        if (stat.Kind == NativeEntryKind.Directory && NativeIo.IsMacOS && childName.SequenceEqual("fd"u8))
+        {
+            int len = WriteChildPathInto(parentDisplayPath, childName, ref pathScratch, appendNul: true);
+            return NativeIo.IsMacOsDevFdDirectory(pathScratch.AsSpan(0, len + 1), childName);
+        }
+
+        return false;
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static FileTimestamp ExtractTimestamp(in NativeStat stat, DuOptions options)
@@ -92,6 +185,82 @@ internal static unsafe class DuAccounting
         }
 
         return statErrno;
+    }
+
+    internal static bool TryStatPathWithPolicy(
+        ReadOnlySpan<byte> nullTermPath,
+        bool followSymlinks,
+        DuOptions options,
+        byte* statBuffer,
+        out NativeStat stat,
+        out int errno,
+        out bool isBsdFatalSymlinkLoop)
+    {
+        if (followSymlinks)
+            return TryStatFollowed(nullTermPath, options, statBuffer, out stat, out errno, out isBsdFatalSymlinkLoop);
+
+        isBsdFatalSymlinkLoop = false;
+        return NativeIo.TryStatPath(nullTermPath, followSymlinks: false, new Span<byte>(statBuffer, NativeIo.StatBufferSize), out stat, out errno);
+    }
+
+    internal static bool TryStatChildEntry(
+        int dirFd,
+        ReadOnlySpan<byte> parentDisplayPath,
+        ReadOnlySpan<byte> childName,
+        byte* nullTermChildNamePtr,
+        bool followChild,
+        DuOptions options,
+        byte* statBuffer,
+        ref byte[] pathScratch,
+        out NativeStat childStat,
+        out int statErrno,
+        out bool isBsdFatalSymlinkLoop)
+    {
+        if (followChild)
+        {
+            int len = WriteChildPathInto(parentDisplayPath, childName, ref pathScratch, appendNul: true);
+            return TryStatFollowed(pathScratch.AsSpan(0, len + 1), options, statBuffer, out childStat, out statErrno, out isBsdFatalSymlinkLoop);
+        }
+
+        isBsdFatalSymlinkLoop = false;
+        return NativeIo.TryStatAt(dirFd, nullTermChildNamePtr, followSymlinks: false, statBuffer, out childStat, out statErrno);
+    }
+
+    internal static bool TryStatFollowed(
+        ReadOnlySpan<byte> nullTermPath,
+        DuOptions options,
+        byte* statBuffer,
+        out NativeStat stat,
+        out int errno,
+        out bool isBsdFatalSymlinkLoop)
+    {
+        isBsdFatalSymlinkLoop = false;
+        Span<byte> statSpan = new(statBuffer, NativeIo.StatBufferSize);
+        if (NativeIo.TryStatPath(nullTermPath, followSymlinks: true, statSpan, out stat, out errno))
+            return true;
+
+        if (options.Dialect == DuDialect.Bsd)
+        {
+            if (NativeIo.TryStatPath(nullTermPath, followSymlinks: false, statSpan, out NativeStat lstatStat, out _) &&
+                lstatStat.Kind == NativeEntryKind.Symlink)
+            {
+                if (errno == NativeIo.EloopErrno)
+                {
+                    // Apple du.c (unix2003) calls errx(1, "Too many symlinks at %s") on FTS_SLNONE + ELOOP.
+                    isBsdFatalSymlinkLoop = true;
+                    return false;
+                }
+
+                stat = lstatStat;
+                errno = 0;
+                return true;
+            }
+
+            return false;
+        }
+
+        errno = NormalizeDanglingSymlinkErrno(nullTermPath, errno, statBuffer);
+        return false;
     }
 
     internal static void OpenRootDirectory(
@@ -297,8 +466,27 @@ internal sealed class DuOutputWriter : IDisposable
     public void EmitLine(ulong bytes, in FileTimestamp time, ReadOnlySpan<byte> pathBytes)
     {
         Span<byte> sizeBuf = stackalloc byte[128];
-        if (!HumanFormat.TryFormatBytes(bytes, _options.BlockSizeSpec, in _numericLocale, sizeBuf, out int sizeLen))
+        int sizeLen;
+        if (_options.Dialect == DuDialect.Bsd)
+        {
+            if (_options.BlockSizeSpec.Mode is HumanMode.BsdBinary or HumanMode.BsdSi)
+            {
+                UInt128 rawBytes = (UInt128)bytes * _options.BsdCountBytesPerUnit;
+                ulong totalBytes = rawBytes > ulong.MaxValue ? ulong.MaxValue : (ulong)rawBytes;
+                if (!HumanFormat.TryFormatBytes(totalBytes, _options.BlockSizeSpec, in _numericLocale, sizeBuf, out sizeLen))
+                    return;
+            }
+            else
+            {
+                ulong blocks = _options.ComputeBsdDisplayBlocks(bytes);
+                if (!HumanFormat.TryFormatBytes(blocks, BlockSizeSpec.Bytes, in _numericLocale, sizeBuf, out sizeLen))
+                    return;
+            }
+        }
+        else if (!HumanFormat.TryFormatBytes(bytes, _options.BlockSizeSpec, in _numericLocale, sizeBuf, out sizeLen))
+        {
             return;
+        }
 
         ReadOnlySpan<byte> timeBytes = _timeFormatter != null ? _timeFormatter.Format(in time) : [];
         bool includeTime = _timeFormatter != null;
@@ -330,7 +518,26 @@ internal sealed class DuOutputWriter : IDisposable
     public void WritePosixError(string action, ReadOnlySpan<byte> path, int errno)
     {
         Flush();
-        Messages.WritePosixError(_stderr, _programName, action, path, errno);
+        if (_options.Dialect == DuDialect.Bsd)
+            Messages.WriteBsdPosixError(_stderr, _programName, path, errno);
+        else
+            Messages.WritePosixError(_stderr, _programName, action, path, errno);
+        HasError = true;
+    }
+
+    public void WriteBsdTooManySymlinksError(ReadOnlySpan<byte> path)
+    {
+        Flush();
+        Messages.WriteBsdTooManySymlinksError(_stderr, _programName, path);
+        _stderr.Flush();
+        HasError = true;
+    }
+
+    public void WriteBsdSymlinkCycleError(ReadOnlySpan<byte> path, ReadOnlySpan<byte> cyclePath)
+    {
+        Flush();
+        Messages.WriteBsdSymlinkCycleError(_stderr, _programName, path, cyclePath);
+        _stderr.Flush();
         HasError = true;
     }
 
@@ -373,5 +580,41 @@ internal sealed class DuOutputWriter : IDisposable
     {
         _timeFormatter?.Dispose();
         _timeFormatter = null;
+    }
+}
+
+/// <summary>
+/// Tracks seen file/directory identities for hard-link deduplication.
+/// GNU keeps every seen identity permanently; Apple/BSD linkchk counts down
+/// <c>st_nlink - 1</c> and evicts the entry once all links have been visited.
+/// </summary>
+internal sealed class DuIdentityTracker
+{
+    private readonly DuDialect _dialect;
+    private HashSet<FileIdentity>? _gnuSeen;
+    private Dictionary<FileIdentity, ulong>? _bsdRemaining;
+
+    public DuIdentityTracker(DuDialect dialect)
+    {
+        _dialect = dialect;
+    }
+
+    public bool TryClaim(FileIdentity identity, ulong hardLinks)
+    {
+        if (_dialect == DuDialect.Gnu)
+            return (_gnuSeen ??= []).Add(identity);
+
+        if (_bsdRemaining != null && _bsdRemaining.TryGetValue(identity, out ulong remaining))
+        {
+            if (remaining <= 1)
+                _bsdRemaining.Remove(identity);
+            else
+                _bsdRemaining[identity] = remaining - 1;
+            return false;
+        }
+
+        if (hardLinks > 1)
+            (_bsdRemaining ??= [])[identity] = hardLinks - 1;
+        return true;
     }
 }
