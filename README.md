@@ -106,18 +106,38 @@ Save that as `~/.local/bin/du` and run `chmod +x ~/.local/bin/du`. Use the Nativ
 ## Usage
 
 ```bash
-hyperdu [path] [options]
+hyperdu [option]... [path]
 ```
 
-`path` defaults to the current directory.
+`path` defaults to the current directory. Short flags align with GNU `du`.
 
 | Option | Description | Default |
 |---|---|---|
-| `-t, --threads <N>` | Number of scanner threads. | CPU cores; `max(32, 2 x cores)` on network mounts; 1 on HDDs |
-| `-e, --exclude <path>` | Skip a path. Repeat for more than one. | None |
+| `-j, --threads <N>` | Number of scanner worker threads. | CPU cores; `max(32, 2 x cores)` on network mounts; 1 on HDDs |
+| `--apparent-size` | Count apparent file sizes instead of allocated 512-byte disk blocks. | Off (allocated blocks) |
+| `-b, --bytes` | Count apparent sizes and display exact byte counts. | Off |
+| `-h, --human-readable` | Format sizes in binary multiples of 1024. | On (in explorer UI) |
+| `--si` | Format sizes in SI powers of 1000. | Off |
+| `-t, --threshold <SIZE>` | Hide entries smaller than `SIZE` (`+SIZE` / `SIZE`) or greater than `SIZE` (`-SIZE`). | None |
+| `-l, --count-links` | Count hard-linked files multiple times. | Off (deduplicated) |
+| `-x, --one-file-system` | Skip directories and targets on different filesystems. | Off |
+| `-L, --dereference` | Follow symbolic links. | Off |
+| `--exclude <PATTERN>` | Skip files and directories matching glob `PATTERN`. Repeatable. | None |
+| `-X, --exclude-from <FILE>` | Read exclude glob patterns from `FILE` (one per line, `-` for stdin). | None |
 | `--skip-hidden` | Skip hidden and system files. | Off |
-| `-v, --version` | Print the version. | |
-| `-h, --help` | Print help. | |
+| `-V, --version` | Print the version and exit. | |
+| `--help` | Print help and exit. | |
+
+### Migrating legacy TUI flags
+
+`hyperdu` aligned its short flags with `du`:
+
+| Legacy flag | New flag | Notes |
+|---|---|---|
+| `-t <N>` | `-j <N>` / `--threads <N>` | `-t` now means `--threshold <SIZE>`. |
+| `-v` | `-V` / `--version` | Emits a migration error with exit status `1`. |
+| `-e <path>` | `--exclude=<pattern>` / `-X <file>` | Uses `du`-style globs across both files and directories. |
+| `-h` | `--help` | `-h` now means `--human-readable`. |
 
 Set `HYPERDU_NATIVE_IO=0` to use the .NET file enumerator instead of direct libc calls on Linux and macOS. It is slower and cannot open names that are not valid UTF-8.
 
@@ -157,7 +177,7 @@ Requires the [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10
 ```bash
 git clone https://github.com/jav76/hyperdu.git
 cd hyperdu
-dotnet run --project hyperdu.Cli -- [path] [options]
+dotnet run --project hyperdu.Cli -- [option]... [path]
 ```
 
 `./publish.sh` builds self-contained single-file binaries for `linux-x64`, `linux-arm64`, `win-x64`, `win-x86`, `osx-x64` and `osx-arm64` into `publish/`.

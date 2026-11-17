@@ -30,6 +30,47 @@ public sealed class ExcludeMatcher
         _patterns.Add(pattern.ToArray());
     }
 
+    internal void CopyFrom(ExcludeMatcher source)
+    {
+        foreach (byte[] pattern in source._patterns)
+            _patterns.Add((byte[])pattern.Clone());
+    }
+
+    internal bool IsExcludedManagedPath(string path) =>
+        IsExcludedManagedParts(path, []);
+
+    internal bool IsExcludedManagedParts(ReadOnlySpan<char> directory, ReadOnlySpan<char> fileName)
+    {
+        if (IsEmpty || (directory.IsEmpty && fileName.IsEmpty))
+            return false;
+
+        bool needsSep = !directory.IsEmpty && !fileName.IsEmpty &&
+                        directory[^1] != Path.DirectorySeparatorChar &&
+                        directory[^1] != Path.AltDirectorySeparatorChar;
+        int maxBytes = Encoding.UTF8.GetMaxByteCount(directory.Length) +
+                       (needsSep ? 1 : 0) +
+                       Encoding.UTF8.GetMaxByteCount(fileName.Length);
+
+        byte[]? rented = maxBytes > 512 ? ArrayPool<byte>.Shared.Rent(maxBytes) : null;
+        Span<byte> buf = rented ?? stackalloc byte[512];
+        try
+        {
+            int pos = !directory.IsEmpty ? Encoding.UTF8.GetBytes(directory, buf) : 0;
+            if (needsSep)
+                buf[pos++] = (byte)'/';
+            if (!fileName.IsEmpty)
+                pos += Encoding.UTF8.GetBytes(fileName, buf[pos..]);
+            if (OperatingSystem.IsWindows())
+                buf[..pos].Replace((byte)'\\', (byte)'/');
+            return IsExcluded(buf[..pos]);
+        }
+        finally
+        {
+            if (rented != null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
     internal bool TryAddFromFile(string filePath, Stream stdin, string programName, Stream stderr)
     {
         if (!TryReadPatternFile(filePath, stdin, out byte[] data, out int errno))

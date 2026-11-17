@@ -1,6 +1,8 @@
+using System.Globalization;
 using System.Reflection;
 using System.Text;
 using hyperdu.Cli.UI;
+using hyperdu.Core.Du;
 using hyperdu.Core.Scanning;
 using Spectre.Console;
 
@@ -8,7 +10,42 @@ namespace hyperdu.Cli;
 
 public static class Program
 {
-    private sealed record CommandLineOptions(
+    private const int OptApparentSize = 256;
+    private const int OptExclude = 257;
+    private const int OptSi = 258;
+    private const int OptSkipHidden = 259;
+    private const int OptHelp = 260;
+
+    private const string ShortOptions = "j:t:hbLlxVve:X:";
+
+    private const string LegacyVersionMigrationMessage =
+        "'-v' was renamed to '-V' (or '--version'); use '-V' to print version";
+
+    private const string LegacyThreadsMigrationNote =
+        "Note: worker thread count moved from '-t <N>' to '-j <N>' (or '--threads <N>').\n";
+
+    private const string LegacyExcludeMigrationMessage =
+        "'-e' was replaced by glob '--exclude=PATTERN' (or '-X FILE'); migrate '-e <path>' to '--exclude=<pattern>'";
+
+    private static readonly LongOption[] LongOptions =
+    [
+        new("apparent-size", ArgumentRequirement.NoArgument, OptApparentSize),
+        new("bytes", ArgumentRequirement.NoArgument, 'b'),
+        new("count-links", ArgumentRequirement.NoArgument, 'l'),
+        new("dereference", ArgumentRequirement.NoArgument, 'L'),
+        new("exclude", ArgumentRequirement.RequiredArgument, OptExclude),
+        new("exclude-from", ArgumentRequirement.RequiredArgument, 'X'),
+        new("help", ArgumentRequirement.NoArgument, OptHelp),
+        new("human-readable", ArgumentRequirement.NoArgument, 'h'),
+        new("one-file-system", ArgumentRequirement.NoArgument, 'x'),
+        new("si", ArgumentRequirement.NoArgument, OptSi),
+        new("skip-hidden", ArgumentRequirement.NoArgument, OptSkipHidden),
+        new("threads", ArgumentRequirement.RequiredArgument, 'j'),
+        new("threshold", ArgumentRequirement.RequiredArgument, 't'),
+        new("version", ArgumentRequirement.NoArgument, 'V')
+    ];
+
+    internal sealed record TuiCliOptions(
         string TargetPath,
         int? CustomThreads,
         bool SkipHidden,
@@ -16,84 +53,193 @@ public static class Program
         bool CountLinks,
         bool OneFileSystem,
         bool FollowSymlinks,
-        List<string> CustomExcludes,
-        bool ShowHelp,
-        bool ShowVersion
-    );
-
-    private static CommandLineOptions ParseArguments(string[] args)
+        ThresholdSpec? Threshold,
+        BlockSizeSpec DisplayBlockSize,
+        bool HasExplicitHumanUnit,
+        ExcludeMatcher Excludes,
+        List<string> ExcludeSummary
+    )
     {
-        string targetPath = Directory.GetCurrentDirectory();
+        internal ScanOptions CreateScanOptions(int workerCount, bool useNativeIo)
+        {
+            ScanOptions scan = new()
+            {
+                WorkerCount = workerCount,
+                SkipHidden = SkipHidden,
+                ApparentSize = ApparentSize,
+                CountLinks = CountLinks,
+                OneFileSystem = OneFileSystem,
+                FollowSymlinks = FollowSymlinks,
+                Threshold = Threshold,
+                DisplayBlockSize = DisplayBlockSize,
+                UseNativeIo = useNativeIo
+            };
+            scan.ExcludeMatcher.CopyFrom(Excludes);
+            return scan;
+        }
+    }
+
+    internal static DuParseOutcome ParseArguments(
+        string[] args,
+        string programName,
+        string version,
+        Stream stdin,
+        Stream stdout,
+        Stream stderr,
+        out TuiCliOptions? options)
+    {
+        options = null;
+
+        using MemoryStream getoptErr = new();
+        if (!GetoptLong.TryParse(args, ShortOptions, LongOptions, programName, getoptErr, out List<ParsedOption> opts, out List<string> operands))
+        {
+            byte[] errBytes = getoptErr.ToArray();
+            stderr.Write(errBytes);
+            AppendLegacyMigrationHint(errBytes, stderr);
+            Messages.WriteTryHelp(stderr, programName);
+            return DuParseOutcome.ExitFailure;
+        }
+
         int? customThreads = null;
         bool skipHidden = false;
         bool apparentSize = false;
         bool countLinks = false;
         bool oneFileSystem = false;
         bool followSymlinks = false;
-        List<string> customExcludes = new();
-        bool showHelp = false;
-        bool showVersion = false;
+        ThresholdSpec? threshold = null;
+        bool? humanOverride = null;
+        bool hasExplicitBytes = false;
+        ExcludeMatcher excludes = new();
+        List<string> excludeSummary = new();
 
-        int i = 0;
-        while (i < args.Length)
+        foreach (ParsedOption opt in opts)
         {
-            string arg = args[i];
-            if (arg == "-h" || arg == "--help")
+            switch (opt.Value)
             {
-                showHelp = true;
-                i++;
-            }
-            else if (arg == "-v" || arg == "--version")
-            {
-                showVersion = true;
-                i++;
-            }
-            else if ((arg == "-t" || arg == "--threads") && i + 1 < args.Length)
-            {
-                if (int.TryParse(args[i + 1], out int threads))
+                case OptHelp:
+                    Messages.WriteUtf8(stdout, FormatHelp(programName));
+                    stdout.Flush();
+                    return DuParseOutcome.ExitSuccess;
+
+                case 'V':
+                    Messages.WriteUtf8(stdout, $"{programName} {version}\n");
+                    stdout.Flush();
+                    return DuParseOutcome.ExitSuccess;
+
+                case 'v':
+                    Messages.WriteError(stderr, programName, LegacyVersionMigrationMessage);
+                    Messages.WriteTryHelp(stderr, programName);
+                    return DuParseOutcome.ExitFailure;
+
+                case 'e':
+                    Messages.WriteError(stderr, programName, LegacyExcludeMigrationMessage);
+                    Messages.WriteTryHelp(stderr, programName);
+                    return DuParseOutcome.ExitFailure;
+
+                case 'j':
                 {
-                    customThreads = threads;
+                    string rawThreads = opt.Argument ?? string.Empty;
+                    if (!int.TryParse(rawThreads, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsedThreads) ||
+                        parsedThreads < 1)
+                    {
+                        string optLabel = opt.LongName != null ? $"--{opt.LongName}" : "-j";
+                        Messages.WriteError(stderr, programName, $"invalid {optLabel} argument {Messages.QuoteAscii(rawThreads)}");
+                        Messages.WriteTryHelp(stderr, programName);
+                        return DuParseOutcome.ExitFailure;
+                    }
+
+                    customThreads = parsedThreads;
+                    break;
                 }
-                i += 2;
-            }
-            else if ((arg == "-e" || arg == "--exclude") && i + 1 < args.Length)
-            {
-                customExcludes.Add(args[i + 1]);
-                i += 2;
-            }
-            else if (arg == "--skip-hidden")
-            {
-                skipHidden = true;
-                i++;
-            }
-            else if (arg == "--apparent-size")
-            {
-                apparentSize = true;
-                i++;
-            }
-            else if (arg == "-l" || arg == "--count-links")
-            {
-                countLinks = true;
-                i++;
-            }
-            else if (arg == "-x" || arg == "--one-file-system")
-            {
-                oneFileSystem = true;
-                i++;
-            }
-            else if (arg == "-L" || arg == "--dereference")
-            {
-                followSymlinks = true;
-                i++;
-            }
-            else
-            {
-                targetPath = arg;
-                i++;
+
+                case 't':
+                {
+                    string rawThreshold = opt.Argument ?? string.Empty;
+                    if (!BlockSize.TryParseThreshold(rawThreshold, out ThresholdSpec parsedThreshold, out BlockSizeParseStatus status))
+                    {
+                        string optLabel = opt.LongName != null ? $"--{opt.LongName}" : "-t";
+                        Messages.WriteError(stderr, programName, BlockSize.FormatErrorMessage(optLabel, rawThreshold, status));
+                        if (opt.LongName == null)
+                            Messages.WriteUtf8(stderr, LegacyThreadsMigrationNote);
+                        Messages.WriteTryHelp(stderr, programName);
+                        return DuParseOutcome.ExitFailure;
+                    }
+
+                    threshold = parsedThreshold;
+                    break;
+                }
+
+                case 'h':
+                    humanOverride = true;
+                    hasExplicitBytes = false;
+                    break;
+
+                case OptSi:
+                    humanOverride = false;
+                    hasExplicitBytes = false;
+                    break;
+
+                case 'b':
+                    apparentSize = true;
+                    hasExplicitBytes = true;
+                    humanOverride = null;
+                    break;
+
+                case OptApparentSize:
+                    apparentSize = true;
+                    break;
+
+                case 'l':
+                    countLinks = true;
+                    break;
+
+                case 'x':
+                    oneFileSystem = true;
+                    break;
+
+                case 'L':
+                    followSymlinks = true;
+                    break;
+
+                case OptSkipHidden:
+                    skipHidden = true;
+                    break;
+
+                case OptExclude:
+                {
+                    string pattern = opt.Argument ?? string.Empty;
+                    excludes.AddPattern(pattern);
+                    excludeSummary.Add(pattern);
+                    break;
+                }
+
+                case 'X':
+                {
+                    string file = opt.Argument ?? string.Empty;
+                    if (!excludes.TryAddFromFile(file, stdin, programName, stderr))
+                        return DuParseOutcome.ExitFailure;
+
+                    excludeSummary.Add($"@{file}");
+                    break;
+                }
             }
         }
 
-        return new CommandLineOptions(
+        if (operands.Count > 1)
+        {
+            Messages.WriteError(stderr, programName, $"extra operand {Messages.QuoteAscii(operands[1])}");
+            Messages.WriteTryHelp(stderr, programName);
+            return DuParseOutcome.ExitFailure;
+        }
+
+        string targetPath = operands.Count == 1 ? operands[0] : Directory.GetCurrentDirectory();
+        BlockSizeSpec displayBlockSize = hasExplicitBytes
+            ? BlockSizeSpec.Bytes
+            : humanOverride == false
+                ? BlockSizeSpec.HumanSi
+                : BlockSizeSpec.HumanBinary;
+
+        options = new TuiCliOptions(
             targetPath,
             customThreads,
             skipHidden,
@@ -101,14 +247,38 @@ public static class Program
             countLinks,
             oneFileSystem,
             followSymlinks,
-            customExcludes,
-            showHelp,
-            showVersion);
+            threshold,
+            displayBlockSize,
+            humanOverride.HasValue,
+            excludes,
+            excludeSummary);
+        return DuParseOutcome.Run;
     }
 
-    private static void PrintScannerConfig(ScanOptions options, bool isNetwork, bool isRotational, bool isCustomThreads)
+    private static void AppendLegacyMigrationHint(byte[] errBytes, Stream stderr)
     {
-        if (!isCustomThreads)
+        string errText = Encoding.UTF8.GetString(errBytes);
+        if (errText.Contains("-- 'v'", StringComparison.Ordinal))
+        {
+            Messages.WriteUtf8(stderr, $"Note: {LegacyVersionMigrationMessage}.\n");
+            return;
+        }
+
+        if (errText.Contains("-- 'e'", StringComparison.Ordinal))
+        {
+            Messages.WriteUtf8(stderr, $"Note: {LegacyExcludeMigrationMessage}.\n");
+            return;
+        }
+
+        if (errText.Contains("-- 't'", StringComparison.Ordinal))
+        {
+            Messages.WriteUtf8(stderr, LegacyThreadsMigrationNote);
+        }
+    }
+
+    private static void PrintScannerConfig(TuiCliOptions parsed, ScanOptions options, bool isNetwork, bool isRotational)
+    {
+        if (!parsed.CustomThreads.HasValue)
         {
             if (isNetwork)
             {
@@ -122,15 +292,28 @@ public static class Program
             }
         }
 
+        string unitLabel = options.DisplayBlockSize.Mode switch
+        {
+            HumanMode.Si => "SI (powers of 1000)",
+            HumanMode.None => "Bytes (-b)",
+            _ => "Human binary (powers of 1024)"
+        };
+        string thresholdLabel = options.Threshold is ThresholdSpec t
+            ? $"{(t.IsNegative ? "<=" : ">=")} {ExplorerRenderer.FormatSize(t.Value, options.DisplayBlockSize)}"
+            : "None";
+
         AnsiConsole.MarkupLine($"Scanner Workers:  [green]{options.WorkerCount}[/]");
+        AnsiConsole.MarkupLine($"Accounting:       [green]{(options.ApparentSize ? "Apparent Bytes" : "Allocated Blocks")}[/]");
+        AnsiConsole.MarkupLine($"Display Units:    [green]{unitLabel}[/]");
+        AnsiConsole.MarkupLine($"Threshold:        [green]{thresholdLabel}[/]");
         AnsiConsole.MarkupLine($"Skip Hidden:      [green]{options.SkipHidden}[/]");
         AnsiConsole.MarkupLine(
-            $"Excluded Paths:   [green]{(options.ExcludedPaths.Count > 0 ? string.Join(", ", options.ExcludedPaths) : "None")}[/]");
+            $"Excluded:         [green]{(parsed.ExcludeSummary.Count > 0 ? Markup.Escape(string.Join(", ", parsed.ExcludeSummary)) : "None")}[/]");
         AnsiConsole.MarkupLine("Press [yellow]Ctrl+C[/] to cancel scan at any time.\n");
     }
 
     private static (ScanOptions Options, bool IsNetwork, bool IsRotational) BuildScanContext(
-        CommandLineOptions parsed,
+        TuiCliOptions parsed,
         string targetPath)
     {
         int finalWorkers = MountHeuristics.ResolveWorkerBudget(
@@ -139,20 +322,9 @@ public static class Program
             out bool isNetwork,
             out bool isRotational);
 
-        ScanOptions options = new ScanOptions
-        {
-            WorkerCount = finalWorkers,
-            SkipHidden = parsed.SkipHidden,
-            ApparentSize = parsed.ApparentSize,
-            CountLinks = parsed.CountLinks,
-            OneFileSystem = parsed.OneFileSystem,
-            FollowSymlinks = parsed.FollowSymlinks,
-            UseNativeIo = Environment.GetEnvironmentVariable("HYPERDU_NATIVE_IO") != "0"
-        };
-        if (parsed.CustomExcludes.Count > 0)
-        {
-            options.ExcludedPaths = parsed.CustomExcludes;
-        }
+        ScanOptions options = parsed.CreateScanOptions(
+            finalWorkers,
+            Environment.GetEnvironmentVariable("HYPERDU_NATIVE_IO") != "0");
 
         return (options, isNetwork, isRotational);
     }
@@ -165,12 +337,15 @@ public static class Program
         ThreadPool.SetMinThreads(Math.Max(workerCount, Environment.ProcessorCount), minCompletionPortThreads);
     }
 
-    private static async Task<int> RunHeadlessScanAsync(CommandLineOptions parsed)
+    private static async Task<int> RunHeadlessScanAsync(TuiCliOptions parsed, string programName)
     {
+        if (parsed.Excludes.IsExcludedManagedPath(parsed.TargetPath))
+            return 0;
+
         string targetPath = parsed.TargetPath;
         if (!ParallelScanner.DirectoryExistsPathSafe(targetPath))
         {
-            Console.Error.WriteLine($"Error: Target directory does not exist: {targetPath}");
+            Console.Error.WriteLine($"{programName}: target directory does not exist: {targetPath}");
             return 1;
         }
 
@@ -180,7 +355,17 @@ public static class Program
 
         ParallelScanner scanner = new ParallelScanner(options);
         var rootNode = await scanner.ScanAsync(targetPath, null, CancellationToken.None);
-        Console.WriteLine($"{rootNode.TotalSize}\t{targetPath}");
+        if (scanner.LastScanExcludedRoot)
+            return 0;
+
+        ulong totalUnsigned = (ulong)Math.Max(0L, rootNode.TotalSize);
+        if (options.Threshold is ThresholdSpec t && !t.Matches(totalUnsigned))
+            return 0;
+
+        string formattedTotal = parsed.HasExplicitHumanUnit
+            ? HumanFormat.Format(totalUnsigned, options.DisplayBlockSize)
+            : rootNode.TotalSize.ToString(CultureInfo.InvariantCulture);
+        Console.WriteLine($"{formattedTotal}\t{targetPath}");
         return 0;
     }
 
@@ -244,27 +429,31 @@ public static class Program
         }
 
         Console.OutputEncoding = Encoding.UTF8;
-        CommandLineOptions parsed = ParseArguments(args);
+        const string programName = "hyperdu";
+        string version = GetDisplayVersion();
 
-        if (parsed.ShowVersion)
+        DuParseOutcome outcome;
+        TuiCliOptions? parsed;
+        using (Stream stdin = Console.OpenStandardInput())
+        using (Stream stdout = Console.OpenStandardOutput())
+        using (Stream stderr = Console.OpenStandardError())
         {
-            PrintVersion();
-            return 0;
+            outcome = ParseArguments(args, programName, version, stdin, stdout, stderr, out parsed);
         }
 
-        if (parsed.ShowHelp)
-        {
-            PrintHelp();
+        if (outcome == DuParseOutcome.ExitSuccess)
             return 0;
-        }
+
+        if (outcome != DuParseOutcome.Run || parsed == null)
+            return 1;
 
         if (Environment.GetEnvironmentVariable("HYPERDU_NO_UI") == "1")
         {
-            return await RunHeadlessScanAsync(parsed);
+            return await RunHeadlessScanAsync(parsed, programName);
         }
 
         AnsiConsole.Write(new FigletText("hyperdu").Color(Color.DeepSkyBlue4));
-        AnsiConsole.Write(new Markup($"[bold teal]High-Performance Directory Space Analyzer v{Markup.Escape(GetDisplayVersion())}[/]\n\n"));
+        AnsiConsole.Write(new Markup($"[bold teal]High-Performance Directory Space Analyzer v{Markup.Escape(version)}[/]\n\n"));
 
         string targetPath = parsed.TargetPath;
 
@@ -280,7 +469,7 @@ public static class Program
 
         (ScanOptions options, bool isNetwork, bool isRotational) = BuildScanContext(parsed, targetPath);
 
-        PrintScannerConfig(options, isNetwork, isRotational, parsed.CustomThreads.HasValue);
+        PrintScannerConfig(parsed, options, isNetwork, isRotational);
 
         ConfigureThreadPool(options.WorkerCount);
 
@@ -324,29 +513,35 @@ public static class Program
         return 0;
     }
 
-    private static void PrintHelp()
-    {
-        AnsiConsole.MarkupLine("[bold]Usage:[/] hyperdu [[path]] [[options]]");
-        AnsiConsole.MarkupLine("");
-        AnsiConsole.MarkupLine("[bold]Options:[/]");
-        AnsiConsole.MarkupLine("  [cyan]-h, --help[/]         Show this help text");
-        AnsiConsole.MarkupLine("  [cyan]-v, --version[/]      Show version information");
-        AnsiConsole.MarkupLine(
-            "  [cyan]-t, --threads <N>[/]  Set the number of concurrent worker threads (default: CPU logical cores)");
-        AnsiConsole.MarkupLine(
-            "  [cyan]-e, --exclude <path>[/] Add a path to the exclusion list (can be specified multiple times. default: None)");
-        AnsiConsole.MarkupLine("  [cyan]--skip-hidden[/]       Skip hidden and system files/folders");
-        AnsiConsole.MarkupLine("  [cyan]--apparent-size[/]     Count apparent byte sizes rather than allocated disk blocks");
-        AnsiConsole.MarkupLine("  [cyan]-l, --count-links[/]   Count hard-linked files multiple times");
-        AnsiConsole.MarkupLine("  [cyan]-x, --one-file-system[/] Skip directories on different filesystems");
-        AnsiConsole.MarkupLine("  [cyan]-L, --dereference[/]   Follow symbolic links");
-    }
+    internal static string FormatHelp(string programName) =>
+        $"""
+        Usage: {programName} [OPTION]... [PATH]
+          or:  {programName} du [OPTION]... [FILE]...
+        Launch the interactive disk usage explorer on PATH (default: current directory).
 
-    // Plain Console output so package-manager smoke tests and scripts get one unwrapped line.
-    private static void PrintVersion()
-    {
-        Console.WriteLine($"hyperdu {GetDisplayVersion()}");
-    }
+        Options:
+          -j, --threads=N         Number of concurrent scanner threads (default: auto)
+              --apparent-size     Count apparent byte sizes rather than allocated disk blocks
+          -b, --bytes             Equivalent to '--apparent-size' with exact byte display
+          -h, --human-readable    Format sizes using powers of 1024 (default in explorer)
+              --si                Format sizes using powers of 1000
+          -t, --threshold=SIZE    Hide items smaller than SIZE if positive, or greater if negative
+          -l, --count-links       Count hard-linked files multiple times
+          -x, --one-file-system   Skip directories and targets on other filesystems
+          -L, --dereference       Follow symbolic links
+              --exclude=PATTERN   Skip files and directories matching glob PATTERN (repeatable)
+          -X, --exclude-from=FILE Read exclude glob patterns from FILE (one per line)
+              --skip-hidden       Skip hidden and system files/folders
+          -V, --version           Output version information and exit
+              --help              Display this help and exit
+
+        Legacy flag migration:
+          -t <N> -> -j <N>   (-t now sets --threshold; thread count moved to -j/--threads)
+          -v     -> -V       (or --version)
+          -e     -> --exclude=PATTERN / -X FILE
+          -h     -> --help   (-h now selects binary human-readable units)
+
+        """;
 
     /// <summary>
     /// Formats "1.2.0+&lt;full sha&gt;" (SourceLink appends the commit) as "1.2.0 (abc1234)".

@@ -6,15 +6,28 @@ namespace hyperdu.Core.Scanning;
 
 public class LightweightFileSystemEnumerator : FileSystemEnumerator<LightweightEntry>
 {
+    internal delegate bool EntryExcludePredicate(ReadOnlySpan<char> directory, ReadOnlySpan<char> fileName);
+
+    private readonly EntryExcludePredicate? _isExcluded;
+
     public LightweightFileSystemEnumerator(string directory, EnumerationOptions options)
+        : this(directory, options, null)
+    {
+    }
+
+    internal LightweightFileSystemEnumerator(
+        string directory,
+        EnumerationOptions options,
+        EntryExcludePredicate? isExcluded)
         : base(directory, options)
     {
+        _isExcluded = isExcluded;
     }
 
     protected override bool ShouldIncludeEntry(ref FileSystemEntry entry)
     {
         // FileSystemEnumerator handles AttributesToSkip and "." / ".." automatically.
-        return true;
+        return _isExcluded == null || !_isExcluded(entry.Directory, entry.FileName);
     }
 
     protected override bool ShouldRecurseIntoEntry(ref FileSystemEntry entry)
