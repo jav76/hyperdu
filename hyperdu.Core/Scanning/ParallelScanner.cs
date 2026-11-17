@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Unicode;
@@ -11,20 +12,32 @@ namespace hyperdu.Core.Scanning;
 public class ParallelScanner
 {
     private const int SeenStripeCount = 64;
+    private const int FanOutThreshold = 2;
+    private static readonly int MaxPreopenedFds = OperatingSystem.IsMacOS() ? 48 : 128;
 
     private readonly ScanOptions _options;
     private long _activeWorkers;
-    private string _currentDirectory = string.Empty;
+    private DirectoryNode? _currentDirectoryNode;
 
     private long _directoriesScanned;
     private long _filesScanned;
     private bool _hasExcludes;
-    private HashSet<string> _normalizedExcludedPaths = new();
-    private List<string> _normalizedExcludedPrefixes = new();
+    private HashSet<string>? _normalizedExcludedPaths;
+    private List<string>? _normalizedExcludedPrefixes;
     private long _totalBytesFound;
     private long _pendingCount;
     private bool _useNativeIo;
+    private bool _trackSeen;
+    private bool _workersSpawned;
+    private bool _queueTouched;
+    private int _preopenedFdCount;
     private ulong _rootDevice;
+
+    private bool _inlineHasRootIdentity;
+    private FileIdentity _inlineRootIdentity;
+    private HashSet<FileIdentity>? _inlineSeenSet;
+    private HashSet<FileIdentity>? _inlineActiveAncestors;
+
     private Lock[]? _seenLocks;
     private HashSet<FileIdentity>[]? _seenSets;
 
@@ -65,7 +78,7 @@ public class ParallelScanner
     public long DirectoriesScanned => Volatile.Read(ref _directoriesScanned);
     public long FilesScanned => Volatile.Read(ref _filesScanned);
     public long TotalBytesFound => Volatile.Read(ref _totalBytesFound);
-    public string CurrentDirectory => Volatile.Read(ref _currentDirectory);
+    public string CurrentDirectory => Volatile.Read(ref _currentDirectoryNode)?.Path ?? string.Empty;
     public long ActiveWorkers => Volatile.Read(ref _activeWorkers);
 
     /// <summary>Whether the current or last scan used the native libc reader.</summary>
@@ -133,7 +146,6 @@ public class ParallelScanner
     private async Task<DirectoryNode> ScanCoreAsync(DirectoryNode rootNode, IProgress<ScanProgress>? progress,
         CancellationToken cancellationToken)
     {
-        string rootPath = rootNode.Path;
         RootNode = rootNode;
         IsScanning = true;
         IsPaused = false;
@@ -141,42 +153,39 @@ public class ParallelScanner
 
         try
         {
-            Queue.Clear();
+            if (_queueTouched)
+            {
+                Queue.Clear();
+                _queueTouched = false;
+            }
 
             _useNativeIo = _options.UseNativeIo && NativeIo.IsSupported;
+            _trackSeen = _useNativeIo && !_options.CountLinks;
+            _workersSpawned = false;
+            _preopenedFdCount = 0;
             _rootDevice = 0;
-            if (_useNativeIo && !_options.CountLinks)
-            {
-                _seenLocks = new Lock[SeenStripeCount];
-                _seenSets = new HashSet<FileIdentity>[SeenStripeCount];
-                for (int i = 0; i < SeenStripeCount; i++)
-                {
-                    _seenLocks[i] = new Lock();
-                    _seenSets[i] = new HashSet<FileIdentity>();
-                }
-            }
-            else
-            {
-                _seenLocks = null;
-                _seenSets = null;
-            }
+            _inlineHasRootIdentity = false;
+            _inlineRootIdentity = default;
+            _inlineSeenSet = null;
+            _inlineActiveAncestors = null;
+            _seenLocks = null;
+            _seenSets = null;
 
             _directoriesScanned = 0;
             _filesScanned = 0;
             _totalBytesFound = 0;
-            _currentDirectory = rootPath;
+            _currentDirectoryNode = rootNode;
 
-            _pendingCount = 1;
+            _pendingCount = 0;
             _activeWorkers = 0;
 
             PrepareLegacyExcludes(
                 _options.ExcludedPaths,
-                out HashSet<string>? exactExcludes,
-                out List<string>? prefixExcludes);
-            _normalizedExcludedPaths = exactExcludes ?? [];
-            _normalizedExcludedPrefixes = prefixExcludes ?? [];
+                out _normalizedExcludedPaths,
+                out _normalizedExcludedPrefixes);
 
-            _hasExcludes = _normalizedExcludedPaths.Count > 0 || !_options.ExcludeMatcher.IsEmpty;
+            _hasExcludes = (_normalizedExcludedPaths != null && _normalizedExcludedPaths.Count > 0) ||
+                           !_options.ExcludeMatcher.IsEmpty;
             LastScanExcludedRoot = false;
             if (_hasExcludes && IsRootExcluded(rootNode))
             {
@@ -187,22 +196,7 @@ public class ParallelScanner
                 return rootNode;
             }
 
-            Queue.Enqueue(rootNode);
-
-            using Timer progressTimer = new Timer(_ =>
-            {
-                if (progress != null)
-                    progress.Report(new ScanProgress(
-                        Volatile.Read(ref _directoriesScanned),
-                        Volatile.Read(ref _filesScanned),
-                        Volatile.Read(ref _totalBytesFound),
-                        Volatile.Read(ref _currentDirectory),
-                        Volatile.Read(ref _activeWorkers)
-                    ));
-            }, null, 0, 100);
-
-            List<Task> workerTasks = new List<Task>();
-            int workerCount = Math.Max(1, _options.WorkerCount);
+            cancellationToken.ThrowIfCancellationRequested();
 
             EnumerationOptions enumerationOptions = new EnumerationOptions
             {
@@ -211,48 +205,432 @@ public class ParallelScanner
                 AttributesToSkip = _options.SkipHidden ? FileAttributes.Hidden | FileAttributes.System : 0
             };
 
-            for (int i = 0; i < workerCount; i++)
+            using Timer? progressTimer = progress != null
+                ? new Timer(_ =>
+                {
+                    progress.Report(new ScanProgress(
+                        Volatile.Read(ref _directoriesScanned),
+                        Volatile.Read(ref _filesScanned),
+                        Volatile.Read(ref _totalBytesFound),
+                        CurrentDirectory,
+                        Volatile.Read(ref _activeWorkers)
+                    ));
+                }, null, 0, 100)
+                : null;
+
+            await RunInlineOrFanOutAsync(rootNode, enumerationOptions, cancellationToken);
+
+            if (progressTimer != null)
             {
-                workerTasks.Add(Task.Run(async () => await ScanWorkerLoopAsync(enumerationOptions, cancellationToken), cancellationToken));
+                progressTimer.Change(Timeout.Infinite, Timeout.Infinite);
+                progress!.Report(new ScanProgress(
+                    Volatile.Read(ref _directoriesScanned),
+                    Volatile.Read(ref _filesScanned),
+                    Volatile.Read(ref _totalBytesFound),
+                    CurrentDirectory,
+                    0
+                ));
             }
 
-            await Task.WhenAll(workerTasks);
+            if (_workersSpawned)
+                ComputeTotalSizesUnlocked(rootNode);
 
-            progressTimer.Change(Timeout.Infinite, Timeout.Infinite);
-            progress?.Report(new ScanProgress(
-                Volatile.Read(ref _directoriesScanned),
-                Volatile.Read(ref _filesScanned),
-                Volatile.Read(ref _totalBytesFound),
-                Volatile.Read(ref _currentDirectory),
-                0
-            ));
-
-            ComputeTotalSizes(rootNode);
-
-            rootNode.Compact();
+            if (!_options.Headless)
+                rootNode.Compact();
 
             return rootNode;
         }
         finally
         {
+            if (_queueTouched)
+            {
+                Queue.Clear();
+                _queueTouched = false;
+            }
+
             IsScanning = false;
             IsPaused = false;
             _seenLocks = null;
             _seenSets = null;
+            _inlineSeenSet = null;
+            _inlineActiveAncestors = null;
+            _preopenedFdCount = 0;
+            _workersSpawned = false;
             _pauseEvent.Set();
         }
     }
 
-    private async Task ScanWorkerLoopAsync(EnumerationOptions enumerationOptions, CancellationToken cancellationToken)
+    private struct InlineFrame
     {
-        Stack<DirectoryNode> localQueue = new Stack<DirectoryNode>();
+        public DirectoryNode Node;
+        public List<DirectoryNode>? ExtraChildren;
+        public int NextExtraIndex;
+        public long PendingSize;
+        public int PendingSubdirs;
+        public int PendingFiles;
+    }
+
+    private async Task RunInlineOrFanOutAsync(
+        DirectoryNode rootNode,
+        EnumerationOptions enumerationOptions,
+        CancellationToken cancellationToken)
+    {
+        List<InlineFrame>? activeFrames = null;
+        int pendingUnstartedCount = 0;
+        bool canCheckFanOut = _options.AutoDetectWorkerCount || _options.WorkerCount > 1;
+        int inlineSinceFlush = 0;
+        long lastFlushTick = _options.Headless ? 0 : Stopwatch.GetTimestamp();
+
+        DirectoryNode? current = rootNode;
+        if (!_options.Headless)
+            Volatile.Write(ref _activeWorkers, 1);
+
+        try
+        {
+            while (current != null)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                _pauseEvent.Wait(cancellationToken);
+
+                Volatile.Write(ref _currentDirectoryNode, current);
+
+                DirectoryNode? firstSubdir = null;
+                List<DirectoryNode>? extraSubdirs = null;
+                long selfSize = 0;
+                int selfFiles = 0;
+                long subdirSelfSize = 0;
+                int subdirCount = 0;
+
+                if (current.TryClaimForScan())
+                {
+                    string? error = ScanSingleDirectory(
+                        current,
+                        enumerationOptions,
+                        cancellationToken,
+                        out firstSubdir,
+                        out extraSubdirs,
+                        out selfSize,
+                        out selfFiles,
+                        out subdirSelfSize,
+                        out subdirCount);
+
+                    if (error != null)
+                    {
+                        MarkNodeFailed(current, error);
+                    }
+                    else
+                    {
+                        RecordDirectoryCompleted(current, selfSize, selfFiles);
+                    }
+                }
+                else
+                {
+                    current.DisposePreopenedDirectory();
+                    selfSize = 0;
+                    selfFiles = 0;
+                }
+
+                long framePendingSize = selfSize + subdirSelfSize;
+                int framePendingSubdirs = subdirCount;
+                int framePendingFiles = selfFiles;
+
+                int newChildrenCount = (firstSubdir != null ? 1 : 0) + (extraSubdirs?.Count ?? 0);
+                int totalPending = pendingUnstartedCount + newChildrenCount;
+
+                if (canCheckFanOut && totalPending >= FanOutThreshold)
+                {
+                    int workerCount = ResolveEffectiveWorkerCount(rootNode.Path);
+                    if (workerCount > 1)
+                    {
+                        activeFrames ??= new List<InlineFrame>(1);
+                        activeFrames.Add(new InlineFrame
+                        {
+                            Node = current,
+                            ExtraChildren = extraSubdirs,
+                            NextExtraIndex = 0,
+                            PendingSize = framePendingSize,
+                            PendingSubdirs = framePendingSubdirs,
+                            PendingFiles = framePendingFiles
+                        });
+                        current = null;
+
+                        FlushInlineFrames(activeFrames);
+                        await TransitionToWorkersAndRunAsync(
+                            activeFrames,
+                            firstSubdir,
+                            workerCount,
+                            enumerationOptions,
+                            cancellationToken);
+                        return;
+                    }
+
+                    canCheckFanOut = false;
+                }
+
+                if (firstSubdir != null)
+                {
+                    activeFrames ??= new List<InlineFrame>(16);
+                    activeFrames.Add(new InlineFrame
+                    {
+                        Node = current,
+                        ExtraChildren = extraSubdirs,
+                        NextExtraIndex = 0,
+                        PendingSize = framePendingSize,
+                        PendingSubdirs = framePendingSubdirs,
+                        PendingFiles = framePendingFiles
+                    });
+                    if (extraSubdirs != null)
+                        pendingUnstartedCount += extraSubdirs.Count;
+
+                    if (!_options.Headless && (++inlineSinceFlush & 255) == 0)
+                    {
+                        long now = Stopwatch.GetTimestamp();
+                        if (Stopwatch.GetElapsedTime(lastFlushTick, now).TotalMilliseconds >= 50)
+                        {
+                            FlushInlineFrames(activeFrames);
+                            lastFlushTick = now;
+                        }
+                    }
+
+                    current = firstSubdir;
+                    if (_inlineActiveAncestors != null && current.Identity.Inode != 0 && current.Identity.Inode != ulong.MaxValue)
+                        _inlineActiveAncestors.Add(current.Identity);
+                    continue;
+                }
+
+                current.ApplyInlineDelta(framePendingSize, framePendingSubdirs, framePendingFiles);
+                if (activeFrames == null || activeFrames.Count == 0)
+                {
+                    current = null;
+                    break;
+                }
+
+                int topIdx = activeFrames.Count - 1;
+                InlineFrame parentFrame = activeFrames[topIdx];
+                parentFrame.PendingSize += framePendingSize;
+                parentFrame.PendingSubdirs += framePendingSubdirs;
+                parentFrame.PendingFiles += framePendingFiles;
+                activeFrames[topIdx] = parentFrame;
+
+                if (_inlineActiveAncestors != null && current.Identity.Inode != 0 && current.Identity.Inode != ulong.MaxValue)
+                    _inlineActiveAncestors.Remove(current.Identity);
+
+                current = null;
+                while (activeFrames.Count > 0)
+                {
+                    topIdx = activeFrames.Count - 1;
+                    InlineFrame top = activeFrames[topIdx];
+                    if (top.ExtraChildren != null && top.NextExtraIndex < top.ExtraChildren.Count)
+                    {
+                        DirectoryNode nextSibling = top.ExtraChildren[top.NextExtraIndex++];
+                        activeFrames[topIdx] = top;
+                        pendingUnstartedCount--;
+                        current = nextSibling;
+                        if (_inlineActiveAncestors != null && current.Identity.Inode != 0 && current.Identity.Inode != ulong.MaxValue)
+                            _inlineActiveAncestors.Add(current.Identity);
+                        break;
+                    }
+
+                    activeFrames.RemoveAt(topIdx);
+                    top.Node.ApplyInlineDelta(top.PendingSize, top.PendingSubdirs, top.PendingFiles);
+                    if (activeFrames.Count > 0)
+                    {
+                        int pIdx = activeFrames.Count - 1;
+                        InlineFrame grandParent = activeFrames[pIdx];
+                        grandParent.PendingSize += top.PendingSize;
+                        grandParent.PendingSubdirs += top.PendingSubdirs;
+                        grandParent.PendingFiles += top.PendingFiles;
+                        activeFrames[pIdx] = grandParent;
+                    }
+
+                    if (_inlineActiveAncestors != null && top.Node.Identity.Inode != 0 && top.Node.Identity.Inode != ulong.MaxValue)
+                        _inlineActiveAncestors.Remove(top.Node.Identity);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Expected when scan is canceled; cleanup runs in finally.
+        }
+        finally
+        {
+            if (!_workersSpawned)
+            {
+                current?.DisposePreopenedDirectory();
+
+                if (activeFrames != null)
+                {
+                    FlushInlineFrames(activeFrames);
+                    for (int i = 0; i < activeFrames.Count; i++)
+                    {
+                        InlineFrame frame = activeFrames[i];
+                        if (frame.ExtraChildren != null)
+                        {
+                            for (int j = frame.NextExtraIndex; j < frame.ExtraChildren.Count; j++)
+                                frame.ExtraChildren[j].DisposePreopenedDirectory();
+                        }
+                    }
+                }
+
+                Volatile.Write(ref _activeWorkers, 0);
+            }
+        }
+    }
+
+    private int ResolveEffectiveWorkerCount(string rootPath)
+    {
+        if (!_options.AutoDetectWorkerCount)
+            return Math.Max(1, _options.WorkerCount);
+
+        return MountHeuristics.ResolveWorkerBudget(null, rootPath, out _, out _);
+    }
+
+    private static void EnsureThreadPoolMinThreads(int workerCount)
+    {
+        ThreadPool.GetMinThreads(out int minWorkerThreads, out int minCompletionPortThreads);
+        int target = Math.Max(workerCount, Environment.ProcessorCount);
+        if (minWorkerThreads < target)
+            ThreadPool.SetMinThreads(target, minCompletionPortThreads);
+    }
+
+    private static void FlushInlineFrames(List<InlineFrame> activeFrames)
+    {
+        for (int i = activeFrames.Count - 1; i >= 0; i--)
+        {
+            InlineFrame frame = activeFrames[i];
+            if (frame.PendingSize == 0 && frame.PendingSubdirs == 0 && frame.PendingFiles == 0)
+                continue;
+
+            frame.Node.ApplyInlineDelta(frame.PendingSize, frame.PendingSubdirs, frame.PendingFiles);
+            if (i > 0)
+            {
+                InlineFrame parent = activeFrames[i - 1];
+                parent.PendingSize += frame.PendingSize;
+                parent.PendingSubdirs += frame.PendingSubdirs;
+                parent.PendingFiles += frame.PendingFiles;
+                activeFrames[i - 1] = parent;
+            }
+
+            frame.PendingSize = 0;
+            frame.PendingSubdirs = 0;
+            frame.PendingFiles = 0;
+            activeFrames[i] = frame;
+        }
+    }
+
+    private async Task TransitionToWorkersAndRunAsync(
+        List<InlineFrame> activeFrames,
+        DirectoryNode? firstSubdir,
+        int workerCount,
+        EnumerationOptions enumerationOptions,
+        CancellationToken cancellationToken)
+    {
+        Stack<DirectoryNode> callingLocalQueue = new Stack<DirectoryNode>();
+        int queuedCount = 0;
+        _queueTouched = true;
+
+        try
+        {
+            for (int i = 0; i < activeFrames.Count; i++)
+            {
+                InlineFrame frame = activeFrames[i];
+                if (frame.ExtraChildren == null)
+                    continue;
+
+                for (int j = frame.NextExtraIndex; j < frame.ExtraChildren.Count; j++)
+                {
+                    Queue.Enqueue(frame.ExtraChildren[j]);
+                    queuedCount++;
+                }
+
+                frame.NextExtraIndex = frame.ExtraChildren.Count;
+                activeFrames[i] = frame;
+            }
+
+            if (firstSubdir != null)
+            {
+                callingLocalQueue.Push(firstSubdir);
+                queuedCount++;
+            }
+
+            if (queuedCount == 0)
+            {
+                Queue.Complete();
+                Volatile.Write(ref _activeWorkers, 0);
+                return;
+            }
+
+            _pendingCount = queuedCount;
+            Volatile.Write(ref _activeWorkers, 0);
+            MigrateSeenToStriped();
+            _inlineActiveAncestors = null;
+            _workersSpawned = true;
+        }
+        catch
+        {
+            firstSubdir?.DisposePreopenedDirectory();
+            throw;
+        }
+
+        EnsureThreadPoolMinThreads(workerCount);
+
+        Task[] workerTasks = new Task[workerCount];
+        workerTasks[0] = Task.Run(
+            () => ScanWorkerLoopAsync(callingLocalQueue, enumerationOptions, cancellationToken),
+            CancellationToken.None);
+        for (int i = 1; i < workerTasks.Length; i++)
+        {
+            workerTasks[i] = Task.Run(
+                () => ScanWorkerLoopAsync(new Stack<DirectoryNode>(), enumerationOptions, cancellationToken),
+                CancellationToken.None);
+        }
+
+        await Task.WhenAll(workerTasks);
+    }
+
+    private void MigrateSeenToStriped()
+    {
+        if (!_trackSeen)
+            return;
+
+        _seenLocks = new Lock[SeenStripeCount];
+        _seenSets = new HashSet<FileIdentity>[SeenStripeCount];
+        for (int i = 0; i < SeenStripeCount; i++)
+        {
+            _seenLocks[i] = new Lock();
+            _seenSets[i] = new HashSet<FileIdentity>();
+        }
+
+        if (_inlineSeenSet != null)
+        {
+            foreach (FileIdentity id in _inlineSeenSet)
+            {
+                int stripe = (int)((uint)id.GetHashCode() & (SeenStripeCount - 1));
+                _seenSets[stripe].Add(id);
+            }
+
+            _inlineSeenSet = null;
+        }
+        else if (_inlineHasRootIdentity)
+        {
+            int stripe = (int)((uint)_inlineRootIdentity.GetHashCode() & (SeenStripeCount - 1));
+            _seenSets[stripe].Add(_inlineRootIdentity);
+        }
+    }
+
+    private async Task ScanWorkerLoopAsync(
+        Stack<DirectoryNode> localQueue,
+        EnumerationOptions enumerationOptions,
+        CancellationToken cancellationToken)
+    {
         Dictionary<DirectoryNode, NodeDelta> localUpdates = new Dictionary<DirectoryNode, NodeDelta>();
+        List<DirectoryNode> flushScratch = new List<DirectoryNode>();
 
         async Task<(bool Success, DirectoryNode? Node)> DequeueWorkAsync()
         {
             if (localQueue.Count > 0) return (true, localQueue.Pop());
 
-            FlushLocalUpdates(localUpdates);
+            FlushLocalUpdates(localUpdates, flushScratch);
 
             return await Queue.DequeueAsync(cancellationToken);
         }
@@ -266,11 +644,15 @@ public class ParallelScanner
                 if (!success || node == null) break;
 
                 Interlocked.Increment(ref _activeWorkers);
-                Volatile.Write(ref _currentDirectory, node.Path);
+                Volatile.Write(ref _currentDirectoryNode, node);
 
                 try
                 {
-                    await ProcessDirectoryNodeAsync(node, localQueue, localUpdates, enumerationOptions, cancellationToken);
+                    ProcessDirectoryNodeWorker(node, localQueue, localUpdates, flushScratch, enumerationOptions, cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
                 }
                 catch (UnauthorizedAccessException)
                 {
@@ -300,84 +682,199 @@ public class ParallelScanner
         }
         finally
         {
-            FlushLocalUpdates(localUpdates);
+            while (localQueue.Count > 0)
+                localQueue.Pop().DisposePreopenedDirectory();
+
+            FlushLocalUpdates(localUpdates, flushScratch);
         }
     }
 
-    private async Task ProcessDirectoryNodeAsync(DirectoryNode node, Stack<DirectoryNode> localQueue,
-        Dictionary<DirectoryNode, NodeDelta> localUpdates, EnumerationOptions enumerationOptions, CancellationToken cancellationToken)
+    private string? ScanSingleDirectory(
+        DirectoryNode node,
+        EnumerationOptions enumerationOptions,
+        CancellationToken cancellationToken,
+        out DirectoryNode? firstSubdir,
+        out List<DirectoryNode>? extraSubdirs,
+        out long selfSize,
+        out int selfFiles,
+        out long subdirSelfSize,
+        out int subdirCount)
     {
-        if (!node.TryClaimForScan()) return;
+        if (!_options.Headless)
+            node.StartTicks = DateTime.UtcNow.Ticks;
 
-        node.StartTicks = DateTime.UtcNow.Ticks;
-
-        long localSelfSize = 0;
-        int localFilesCount = 0;
-        List<DirectoryNode>? subdirsToQueue = null;
+        firstSubdir = null;
+        extraSubdirs = null;
+        selfSize = 0;
+        selfFiles = 0;
+        subdirSelfSize = 0;
+        subdirCount = 0;
+        string? error = null;
 
         try
         {
-            string? error = null;
             if (_useNativeIo)
-                error = ReadDirectoryNative(node, ref localSelfSize, ref localFilesCount, ref subdirsToQueue, localUpdates, cancellationToken);
-            else
-                ReadDirectoryManaged(node, ref localSelfSize, ref localFilesCount, ref subdirsToQueue, localUpdates, enumerationOptions, cancellationToken);
-
-            if (error != null)
             {
-                MarkNodeFailed(node, error);
-                return;
+                error = ReadDirectoryNative(
+                    node,
+                    ref selfSize,
+                    ref selfFiles,
+                    ref firstSubdir,
+                    ref extraSubdirs,
+                    ref subdirSelfSize,
+                    ref subdirCount,
+                    cancellationToken);
             }
+            else
+            {
+                ReadDirectoryManaged(
+                    node,
+                    ref selfSize,
+                    ref selfFiles,
+                    ref firstSubdir,
+                    ref extraSubdirs,
+                    ref subdirSelfSize,
+                    ref subdirCount,
+                    enumerationOptions,
+                    cancellationToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            DisposeSubdirs(firstSubdir, extraSubdirs);
+            throw;
         }
         catch (UnauthorizedAccessException)
         {
-            MarkNodeFailed(node, "Access Denied");
-            return;
+            error = "Access Denied";
         }
         catch (DirectoryNotFoundException)
         {
-            MarkNodeFailed(node, "Directory Not Found");
-            return;
+            error = "Directory Not Found";
         }
         catch (Exception ex)
         {
-            MarkNodeFailed(node, ex.Message);
+            error = ex.Message;
+        }
+
+        if (error != null)
+        {
+            DisposeSubdirs(firstSubdir, extraSubdirs);
+            firstSubdir = null;
+            extraSubdirs = null;
+            selfSize = 0;
+            selfFiles = 0;
+        }
+
+        return error;
+    }
+
+    private void RecordDirectoryCompleted(DirectoryNode node, long selfSize, int selfFiles)
+    {
+        node.SelfSize += selfSize;
+        node.SelfFileCount = selfFiles;
+        if (!_options.Headless)
+            node.EndTicks = DateTime.UtcNow.Ticks;
+        node.IsScanned = true;
+
+        if (!_workersSpawned)
+        {
+            if (_options.Headless)
+            {
+                _directoriesScanned++;
+                if (selfFiles > 0) _filesScanned += selfFiles;
+                if (selfSize > 0) _totalBytesFound += selfSize;
+            }
+            else
+            {
+                Volatile.Write(ref _directoriesScanned, _directoriesScanned + 1);
+                if (selfFiles > 0) Volatile.Write(ref _filesScanned, _filesScanned + selfFiles);
+                if (selfSize > 0) Volatile.Write(ref _totalBytesFound, _totalBytesFound + selfSize);
+            }
+        }
+        else
+        {
+            Interlocked.Increment(ref _directoriesScanned);
+            if (selfFiles > 0) Interlocked.Add(ref _filesScanned, selfFiles);
+            if (selfSize > 0) Interlocked.Add(ref _totalBytesFound, selfSize);
+        }
+    }
+
+    private void ProcessDirectoryNodeWorker(
+        DirectoryNode node,
+        Stack<DirectoryNode> localQueue,
+        Dictionary<DirectoryNode, NodeDelta> localUpdates,
+        List<DirectoryNode> flushScratch,
+        EnumerationOptions enumerationOptions,
+        CancellationToken cancellationToken)
+    {
+        if (!node.TryClaimForScan())
+        {
+            node.DisposePreopenedDirectory();
             return;
         }
 
-        node.SelfSize += localSelfSize;
-        node.SelfFileCount = localFilesCount;
-        Interlocked.Increment(ref _directoriesScanned);
-        node.EndTicks = DateTime.UtcNow.Ticks;
-        node.IsScanned = true;
+        string? error = ScanSingleDirectory(
+            node,
+            enumerationOptions,
+            cancellationToken,
+            out DirectoryNode? firstSubdir,
+            out List<DirectoryNode>? extraSubdirs,
+            out long localSelfSize,
+            out int localFilesCount,
+            out long subdirSelfSize,
+            out int subdirCount);
 
-        QueueLocalUpdate(localUpdates, node, localSelfSize, 0, localFilesCount);
+        if (error != null)
+        {
+            if (subdirCount > 0 || subdirSelfSize > 0)
+                QueueLocalUpdate(localUpdates, node, subdirSelfSize, subdirCount, 0);
+            MarkNodeFailed(node, error);
+            return;
+        }
 
-        if (localFilesCount > 0) Interlocked.Add(ref _filesScanned, localFilesCount);
-        if (localSelfSize > 0) Interlocked.Add(ref _totalBytesFound, localSelfSize);
+        RecordDirectoryCompleted(node, localSelfSize, localFilesCount);
+        QueueLocalUpdate(localUpdates, node, localSelfSize + subdirSelfSize, subdirCount, localFilesCount);
 
-        EnqueueSubdirectories(subdirsToQueue, localQueue);
+        EnqueueSubdirectories(firstSubdir, extraSubdirs, localQueue);
 
-        if (localUpdates.Count >= 50) FlushLocalUpdates(localUpdates);
+        if (localUpdates.Count >= 50) FlushLocalUpdates(localUpdates, flushScratch);
     }
 
-    private void EnqueueSubdirectories(List<DirectoryNode>? subdirsToQueue, Stack<DirectoryNode> localQueue)
+    private void EnqueueSubdirectories(DirectoryNode? firstSubdir, List<DirectoryNode>? extraSubdirs, Stack<DirectoryNode> localQueue)
     {
-        if (subdirsToQueue == null || subdirsToQueue.Count == 0) return;
+        if (firstSubdir == null) return;
 
-        Interlocked.Add(ref _pendingCount, subdirsToQueue.Count);
-        foreach (DirectoryNode sub in subdirsToQueue)
+        if (extraSubdirs == null)
         {
-            localQueue.Push(sub);
+            Interlocked.Increment(ref _pendingCount);
+            localQueue.Push(firstSubdir);
+        }
+        else
+        {
+            Interlocked.Add(ref _pendingCount, 1 + extraSubdirs.Count);
+            foreach (DirectoryNode sub in extraSubdirs)
+                localQueue.Push(sub);
+            localQueue.Push(firstSubdir);
         }
 
         if (localQueue.Count > 4)
         {
-            while (localQueue.Count > 2)
-            {
+            DirectoryNode keepTop = localQueue.Pop();
+            while (localQueue.Count > 1)
                 Queue.Enqueue(localQueue.Pop());
-            }
+            localQueue.Push(keepTop);
         }
+    }
+
+    private static void DisposeSubdirs(DirectoryNode? firstSubdir, List<DirectoryNode>? extraSubdirs)
+    {
+        firstSubdir?.DisposePreopenedDirectory();
+        if (extraSubdirs == null)
+            return;
+
+        for (int i = 0; i < extraSubdirs.Count; i++)
+            extraSubdirs[i].DisposePreopenedDirectory();
     }
 
     private static string? ResolveLinkTargetSafely(string path)
@@ -401,9 +898,16 @@ public class ParallelScanner
         }
     }
 
-    private void ReadDirectoryManaged(DirectoryNode node, ref long localSelfSize, ref int localFilesCount,
-        ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates,
-        EnumerationOptions enumerationOptions, CancellationToken cancellationToken)
+    private void ReadDirectoryManaged(
+        DirectoryNode node,
+        ref long localSelfSize,
+        ref int localFilesCount,
+        ref DirectoryNode? firstSubdir,
+        ref List<DirectoryNode>? extraSubdirs,
+        ref long subdirSelfSize,
+        ref int subdirCount,
+        EnumerationOptions enumerationOptions,
+        CancellationToken cancellationToken)
     {
         LightweightFileSystemEnumerator.EntryExcludePredicate? excludePredicate =
             _hasExcludes ? IsExcludedManagedSpan : null;
@@ -418,7 +922,7 @@ public class ParallelScanner
 
             if (entry.IsDirectory)
             {
-                ProcessDirectoryEntry(entry, node, isSymlink, ref subdirsToQueue, localUpdates);
+                ProcessDirectoryEntry(entry, node, isSymlink, ref firstSubdir, ref extraSubdirs, ref subdirSelfSize, ref subdirCount);
             }
             else
             {
@@ -428,30 +932,50 @@ public class ParallelScanner
     }
 
     /// <summary>
-    /// Reads one directory with libc: names stay raw bytes and every stat is relative to the open directory,
-    /// so the kernel never re-walks the full path per entry. Returns an error message when the directory cannot be read.
+    /// Reads one directory with libc/NtQuery: names stay raw bytes, every stat is relative to the open directory,
+    /// and subdirectories are pre-opened via openat within a bounded FD budget to avoid O(D^2) path re-walking.
     /// </summary>
-    private string? ReadDirectoryNative(DirectoryNode node, ref long localSelfSize, ref int localFilesCount,
-        ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates,
+    private string? ReadDirectoryNative(
+        DirectoryNode node,
+        ref long localSelfSize,
+        ref int localFilesCount,
+        ref DirectoryNode? firstSubdir,
+        ref List<DirectoryNode>? extraSubdirs,
+        ref long subdirSelfSize,
+        ref int subdirCount,
         CancellationToken cancellationToken)
     {
-        Span<byte> statBuffer = stackalloc byte[NativeIo.StatBufferSize];
-        bool checkDotHidden = _options.SkipHidden && !NativeIo.IsWindows;
-        bool checkHiddenFlag = _options.SkipHidden && (NativeIo.IsMacOS || NativeIo.IsWindows);
-
-        byte[]? parentNativePath = _hasExcludes ? node.GetNativePath(nullTerminated: false) : null;
-        byte[]? excludeScratch = _hasExcludes && !_options.ExcludeMatcher.IsEmpty
-            ? ArrayPool<byte>.Shared.Rent(Math.Max(1024, parentNativePath!.Length + 256))
-            : null;
-
-        try
+        NativeDirectory? directory = node.TakePreopenedDirectory();
+        if (directory != null)
         {
-            NativeDirectory? directory = NativeDirectory.OpenPathSafe(
+            Interlocked.Decrement(ref _preopenedFdCount);
+        }
+        else
+        {
+            if (node.PreopenError != 0)
+                return NativeIo.DescribeError(node.PreopenError);
+
+            directory = NativeDirectory.OpenPathSafe(
                 node.GetNativePath(),
                 out int openError,
                 followSymlinks: node.Parent == null || _options.FollowSymlinks);
             if (directory == null) return NativeIo.DescribeError(openError);
+        }
 
+        Span<byte> statBuffer = stackalloc byte[NativeIo.StatBufferSize];
+        bool checkDotHidden = _options.SkipHidden && !NativeIo.IsWindows;
+        bool checkHiddenFlag = _options.SkipHidden && (NativeIo.IsMacOS || NativeIo.IsWindows);
+
+        byte[]? parentNativePath = _hasExcludes && !_options.ExcludeMatcher.IsEmpty
+            ? node.GetNativePath(nullTerminated: false)
+            : null;
+        byte[]? excludeScratch = parentNativePath != null
+            ? ArrayPool<byte>.Shared.Rent(Math.Max(1024, parentNativePath.Length + 256))
+            : null;
+        bool hitFdLimit = false;
+
+        try
+        {
             using (directory)
             {
                 if (node.Parent == null && directory.TryStatSelf(statBuffer, out NativeStat rootStat))
@@ -459,6 +983,8 @@ public class ParallelScanner
                     _rootDevice = rootStat.Device;
                     node.Identity = new FileIdentity(rootStat.Device, rootStat.Inode);
                     _ = TryMarkSeen(in rootStat);
+                    if (!_workersSpawned && _options.FollowSymlinks && _options.CountLinks && rootStat.HasValidFileId)
+                        (_inlineActiveAncestors ??= new HashSet<FileIdentity>()).Add(node.Identity);
                     localSelfSize += NativeIo.ComputeEntryByteSize(in rootStat, _options.ApparentSize);
                 }
 
@@ -469,7 +995,7 @@ public class ParallelScanner
 
                     ReadOnlySpan<byte> name = directory.CurrentName;
                     if (checkDotHidden && name[0] == (byte)'.') continue;
-                    if (_hasExcludes && IsExcludedNativeEntry(parentNativePath!, node.Path, name, ref excludeScratch))
+                    if (_hasExcludes && IsExcludedNativeEntry(parentNativePath, node, name, ref excludeScratch))
                         continue;
                     if (!directory.TryStatCurrent(false, statBuffer, out NativeStat linkStat)) continue;
                     if (checkHiddenFlag && linkStat.HasHiddenFlag) continue;
@@ -477,7 +1003,17 @@ public class ParallelScanner
                     switch (linkStat.Kind)
                     {
                         case NativeEntryKind.Directory:
-                            TryAddNativeDirectory(node, name, in linkStat, ref subdirsToQueue, localUpdates);
+                            TryAddNativeDirectory(
+                                directory,
+                                isSymlink: false,
+                                node,
+                                name,
+                                in linkStat,
+                                ref hitFdLimit,
+                                ref firstSubdir,
+                                ref extraSubdirs,
+                                ref subdirSelfSize,
+                                ref subdirCount);
                             break;
 
                         case NativeEntryKind.Symlink:
@@ -486,9 +1022,23 @@ public class ParallelScanner
                                 if (directory.TryStatCurrent(true, statBuffer, out NativeStat targetStat))
                                 {
                                     if (targetStat.Kind == NativeEntryKind.Directory)
-                                        TryAddNativeDirectory(node, name, in targetStat, ref subdirsToQueue, localUpdates);
+                                    {
+                                        TryAddNativeDirectory(
+                                            directory,
+                                            isSymlink: true,
+                                            node,
+                                            name,
+                                            in targetStat,
+                                            ref hitFdLimit,
+                                            ref firstSubdir,
+                                            ref extraSubdirs,
+                                            ref subdirSelfSize,
+                                            ref subdirCount);
+                                    }
                                     else
+                                    {
                                         TryRecordNativeFile(in targetStat, ref localSelfSize, ref localFilesCount);
+                                    }
                                 }
                                 else
                                 {
@@ -502,7 +1052,7 @@ public class ParallelScanner
                                 long linkOwnBytes = TryMarkSeen(in linkStat)
                                     ? NativeIo.ComputeEntryByteSize(in linkStat, _options.ApparentSize)
                                     : 0;
-                                ProcessUnfollowedDirectorySymlink(name, node, linkOwnBytes, localUpdates);
+                                ProcessUnfollowedDirectorySymlink(name, node, linkOwnBytes, ref subdirSelfSize, ref subdirCount);
                             }
 
                             break;
@@ -523,18 +1073,93 @@ public class ParallelScanner
         }
     }
 
-    private void TryAddNativeDirectory(DirectoryNode parent, ReadOnlySpan<byte> name, in NativeStat dirStat,
-        ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    private void TryAddNativeDirectory(
+        NativeDirectory parentDir,
+        bool isSymlink,
+        DirectoryNode parent,
+        ReadOnlySpan<byte> name,
+        in NativeStat dirStat,
+        ref bool hitFdLimit,
+        ref DirectoryNode? firstSubdir,
+        ref List<DirectoryNode>? extraSubdirs,
+        ref long subdirSelfSize,
+        ref int subdirCount)
     {
         if (_options.OneFileSystem && _rootDevice != 0 && dirStat.Device != _rootDevice)
             return;
 
-        FileIdentity dirId = new(dirStat.Device, dirStat.Inode);
-        if ((_options.FollowSymlinks && HasAncestorIdentity(parent, dirId)) || !TryMarkSeen(in dirStat))
+        if (IsNativeDirectoryCycleOrSeen(parent, in dirStat, out FileIdentity dirId))
             return;
 
+        byte[]? exactName = Utf8.IsValid(name) ? null : name.ToArray();
+        DirectoryNode? childNode = CreateChildNode(parent, Encoding.UTF8.GetString(name), exactName);
+        if (childNode == null) return;
+
         long dirOwnBytes = NativeIo.ComputeEntryByteSize(in dirStat, _options.ApparentSize);
-        ProcessNativeDirectoryEntry(name, parent, dirId, dirOwnBytes, ref subdirsToQueue, localUpdates);
+        childNode.Identity = dirId;
+        childNode.SelfSize = dirOwnBytes;
+        childNode.TotalSize = dirOwnBytes;
+
+        // Pre-open only the first subdirectory (which this worker/inline loop descends into next via openat),
+        // keeping open FDs strictly bounded and avoiding sequential openat bursts on wide fan-out directories.
+        if (firstSubdir == null)
+            TryPreopenChildDirectory(parentDir, isSymlink, childNode, ref hitFdLimit);
+        AddSubdirectory(parent, childNode, ref firstSubdir, ref extraSubdirs, ref subdirSelfSize, ref subdirCount);
+    }
+
+    private void TryPreopenChildDirectory(NativeDirectory parentDir, bool isSymlink, DirectoryNode childNode, ref bool hitFdLimit)
+    {
+        if (hitFdLimit || (isSymlink && NativeIo.IsWindows))
+            return;
+
+        if (Volatile.Read(ref _preopenedFdCount) >= MaxPreopenedFds)
+            return;
+
+        if (Interlocked.Increment(ref _preopenedFdCount) > MaxPreopenedFds)
+        {
+            Interlocked.Decrement(ref _preopenedFdCount);
+            return;
+        }
+
+        NativeDirectory? childDir = parentDir.OpenCurrentDirectory(out int openError, followSymlinks: _options.FollowSymlinks);
+        if (childDir != null)
+        {
+            childNode.SetPreopenedDirectory(childDir);
+            return;
+        }
+
+        Interlocked.Decrement(ref _preopenedFdCount);
+        if (NativeDirectory.IsTooManyOpenFilesError(openError))
+        {
+            hitFdLimit = true;
+            return;
+        }
+
+        // For real POSIX directories when not following symlinks, cache non-EMFILE open errors so
+        // processing does not re-walk long paths only to observe the same failure.
+        if (!isSymlink && !_options.FollowSymlinks && !NativeIo.IsWindows)
+            childNode.PreopenError = openError;
+    }
+
+    private bool IsNativeDirectoryCycleOrSeen(DirectoryNode parent, in NativeStat dirStat, out FileIdentity dirId)
+    {
+        dirId = new FileIdentity(dirStat.Device, dirStat.Inode);
+
+        if (_trackSeen)
+        {
+            if (!dirStat.HasValidFileId)
+                return false;
+
+            return !TryMarkSeen(in dirStat);
+        }
+
+        if (!_options.FollowSymlinks || !dirStat.HasValidFileId)
+            return false;
+
+        if (!_workersSpawned)
+            return _inlineActiveAncestors != null && _inlineActiveAncestors.Contains(dirId);
+
+        return HasAncestorIdentity(parent, dirId);
     }
 
     private void TryRecordNativeFile(in NativeStat fileStat, ref long localSelfSize, ref int localFilesCount)
@@ -551,7 +1176,7 @@ public class ParallelScanner
 
     private bool TryMarkSeen(in NativeStat stat)
     {
-        if (_seenSets == null || _seenLocks == null || !stat.HasValidFileId)
+        if (!_trackSeen || !stat.HasValidFileId)
             return true;
 
         bool shouldTrack = stat.Kind == NativeEntryKind.Directory ||
@@ -561,10 +1186,31 @@ public class ParallelScanner
             return true;
 
         FileIdentity id = new(stat.Device, stat.Inode);
-        int stripe = (int)((uint)id.GetHashCode() & (SeenStripeCount - 1));
-        lock (_seenLocks[stripe])
+        if (!_workersSpawned)
         {
-            return _seenSets[stripe].Add(id);
+            if (!_inlineHasRootIdentity)
+            {
+                _inlineRootIdentity = id;
+                _inlineHasRootIdentity = true;
+                return true;
+            }
+
+            if (_inlineSeenSet == null)
+            {
+                if (id == _inlineRootIdentity)
+                    return false;
+
+                _inlineSeenSet = new HashSet<FileIdentity>(4) { _inlineRootIdentity, id };
+                return true;
+            }
+
+            return _inlineSeenSet.Add(id);
+        }
+
+        int stripe = (int)((uint)id.GetHashCode() & (SeenStripeCount - 1));
+        lock (_seenLocks![stripe])
+        {
+            return _seenSets![stripe].Add(id);
         }
     }
 
@@ -583,37 +1229,41 @@ public class ParallelScanner
         return false;
     }
 
-    private void ProcessNativeDirectoryEntry(ReadOnlySpan<byte> nativeName, DirectoryNode node, FileIdentity dirId,
-        long dirOwnBytes, ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    private void ProcessUnfollowedDirectorySymlink(
+        ReadOnlySpan<byte> nativeName,
+        DirectoryNode node,
+        long linkOwnBytes,
+        ref long subdirSelfSize,
+        ref int subdirCount)
     {
         byte[]? exactName = Utf8.IsValid(nativeName) ? null : nativeName.ToArray();
         DirectoryNode? childNode = CreateChildNode(node, Encoding.UTF8.GetString(nativeName), exactName);
         if (childNode == null) return;
 
-        childNode.Identity = dirId;
-        childNode.SelfSize = dirOwnBytes;
-        childNode.TotalSize = dirOwnBytes;
-        AddSubdirectory(node, childNode, ref subdirsToQueue, localUpdates);
+        ProcessDirectorySymlink(node, childNode, linkOwnBytes, ref subdirSelfSize, ref subdirCount);
     }
 
-    private void ProcessUnfollowedDirectorySymlink(ReadOnlySpan<byte> nativeName, DirectoryNode node, long linkOwnBytes,
-        Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    private static DirectoryNode? CreateChildNode(DirectoryNode parent, string name, byte[]? nativeName)
     {
-        byte[]? exactName = Utf8.IsValid(nativeName) ? null : nativeName.ToArray();
-        DirectoryNode? childNode = CreateChildNode(node, Encoding.UTF8.GetString(nativeName), exactName);
-        if (childNode == null) return;
+        if (!OperatingSystem.IsWindows() &&
+            parent.Depth == 0 &&
+            ((parent.Path == "/" && name is "proc" or "sys" or "dev" or "run") ||
+             IsVirtualOrSystemPath(parent.Path)))
+        {
+            return null;
+        }
 
-        ProcessDirectorySymlink(node, childNode, linkOwnBytes, localUpdates);
+        return new DirectoryNode(parent, name, nativeName);
     }
 
-    private DirectoryNode? CreateChildNode(DirectoryNode node, string name, byte[]? nativeName)
-    {
-        string subPath = Path.Combine(node.Path, name);
-        if (IsVirtualOrSystemPath(subPath)) return null;
-        return new DirectoryNode(subPath, node, nativeName, null);
-    }
-
-    private void ProcessDirectoryEntry(LightweightEntry entry, DirectoryNode node, bool isSymlink, ref List<DirectoryNode>? subdirsToQueue, Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    private void ProcessDirectoryEntry(
+        LightweightEntry entry,
+        DirectoryNode node,
+        bool isSymlink,
+        ref DirectoryNode? firstSubdir,
+        ref List<DirectoryNode>? extraSubdirs,
+        ref long subdirSelfSize,
+        ref int subdirCount)
     {
         DirectoryNode? childNode = CreateChildNode(node, entry.Name, null);
         if (childNode == null) return;
@@ -623,7 +1273,7 @@ public class ParallelScanner
             if (!_options.FollowSymlinks)
             {
                 string? linkTarget = ResolveLinkTargetSafely(childNode.Path);
-                ProcessDirectorySymlink(node, childNode, linkTarget?.Length ?? 0, localUpdates);
+                ProcessDirectorySymlink(node, childNode, linkTarget?.Length ?? 0, ref subdirSelfSize, ref subdirCount);
                 return;
             }
 
@@ -631,7 +1281,7 @@ public class ParallelScanner
                 return;
         }
 
-        AddSubdirectory(node, childNode, ref subdirsToQueue, localUpdates);
+        AddSubdirectory(node, childNode, ref firstSubdir, ref extraSubdirs, ref subdirSelfSize, ref subdirCount);
     }
 
     private static bool IsManagedSymlinkCycle(DirectoryNode node, string symlinkPath)
@@ -669,18 +1319,43 @@ public class ParallelScanner
         return false;
     }
 
-    private void AddSubdirectory(DirectoryNode node, DirectoryNode childNode, ref List<DirectoryNode>? subdirsToQueue,
-        Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    private void AddSubdirectory(
+        DirectoryNode node,
+        DirectoryNode childNode,
+        ref DirectoryNode? firstSubdir,
+        ref List<DirectoryNode>? extraSubdirs,
+        ref long subdirSelfSize,
+        ref int subdirCount)
     {
-        subdirsToQueue ??= new List<DirectoryNode>(4);
-        subdirsToQueue.Add(childNode);
-        lock (node.Subdirectories)
+        if (firstSubdir == null)
         {
-            node.Subdirectories.Add(childNode);
+            firstSubdir = childNode;
+        }
+        else
+        {
+            extraSubdirs ??= new List<DirectoryNode>(4);
+            extraSubdirs.Add(childNode);
         }
 
-        QueueLocalUpdate(localUpdates, node, childNode.SelfSize, 1, 0);
-        if (childNode.SelfSize > 0) Interlocked.Add(ref _totalBytesFound, childNode.SelfSize);
+        if (_options.Headless && !_workersSpawned)
+        {
+            node.Subdirectories.Add(childNode);
+            if (childNode.SelfSize > 0)
+                _totalBytesFound += childNode.SelfSize;
+        }
+        else
+        {
+            lock (node.Subdirectories)
+            {
+                node.Subdirectories.Add(childNode);
+            }
+
+            if (childNode.SelfSize > 0)
+                Interlocked.Add(ref _totalBytesFound, childNode.SelfSize);
+        }
+
+        subdirSelfSize += childNode.SelfSize;
+        subdirCount++;
     }
 
     private void ProcessFileEntry(LightweightEntry entry, bool isSymlink, ref long localSelfSize, ref int localFilesCount)
@@ -691,28 +1366,47 @@ public class ParallelScanner
         localFilesCount++;
     }
 
-    private void ProcessDirectorySymlink(DirectoryNode node, DirectoryNode childNode, long targetLength, Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    private void ProcessDirectorySymlink(
+        DirectoryNode node,
+        DirectoryNode childNode,
+        long targetLength,
+        ref long subdirSelfSize,
+        ref int subdirCount)
     {
         childNode.SelfSize = targetLength;
         childNode.TotalSize = targetLength;
         childNode.IsScanned = true;
-        lock (node.Subdirectories)
+
+        if (_options.Headless && !_workersSpawned)
         {
             node.Subdirectories.Add(childNode);
+            _directoriesScanned++;
+        }
+        else
+        {
+            lock (node.Subdirectories)
+            {
+                node.Subdirectories.Add(childNode);
+            }
+
+            Interlocked.Increment(ref _directoriesScanned);
         }
 
-        Interlocked.Increment(ref _directoriesScanned);
-
-        QueueLocalUpdate(localUpdates, node, targetLength, 1, 0);
+        subdirSelfSize += targetLength;
+        subdirCount++;
     }
 
     private void MarkNodeFailed(DirectoryNode node, string errorMessage)
     {
         node.ErrorMessage = errorMessage;
-        node.EndTicks = DateTime.UtcNow.Ticks;
+        if (!_options.Headless)
+            node.EndTicks = DateTime.UtcNow.Ticks;
         node.IsScanned = true;
 
-        Interlocked.Increment(ref _directoriesScanned);
+        if (_options.Headless && !_workersSpawned)
+            _directoriesScanned++;
+        else
+            Interlocked.Increment(ref _directoriesScanned);
     }
 
     private static void QueueLocalUpdate(Dictionary<DirectoryNode, NodeDelta> localUpdates, DirectoryNode node,
@@ -725,39 +1419,39 @@ public class ParallelScanner
         delta.FilesDelta += filesDelta;
     }
 
-    private static void FlushLocalUpdates(Dictionary<DirectoryNode, NodeDelta> localUpdates)
+    private static void FlushLocalUpdates(Dictionary<DirectoryNode, NodeDelta> localUpdates, List<DirectoryNode> nodes)
     {
         if (localUpdates.Count == 0) return;
 
-        EnsureParentHierarchyExists(localUpdates, new List<DirectoryNode>(localUpdates.Keys));
-
-        List<DirectoryNode> nodes = new List<DirectoryNode>(localUpdates.Keys);
-        nodes.Sort((a, b) => b.Path.Length.CompareTo(a.Path.Length));
-
-        foreach (DirectoryNode node in nodes)
+        nodes.Clear();
+        nodes.AddRange(localUpdates.Keys);
+        for (int i = 0; i < nodes.Count; i++)
         {
-            ApplyNodeDelta(node, localUpdates[node]);
+            DirectoryNode? current = nodes[i].Parent;
+            while (current != null && !localUpdates.ContainsKey(current))
+            {
+                localUpdates[current] = default;
+                nodes.Add(current);
+                current = current.Parent;
+            }
+        }
+
+        nodes.Sort(static (a, b) => b.Depth.CompareTo(a.Depth));
+
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            DirectoryNode node = nodes[i];
+            NodeDelta delta = localUpdates[node];
+            ApplyNodeDelta(node, delta);
 
             if (node.Parent != null)
             {
-                PropagateDeltaToParent(node.Parent, localUpdates[node], localUpdates);
+                PropagateDeltaToParent(node.Parent, delta, localUpdates);
             }
         }
 
         localUpdates.Clear();
-    }
-
-    private static void EnsureParentHierarchyExists(Dictionary<DirectoryNode, NodeDelta> localUpdates, IEnumerable<DirectoryNode> nodes)
-    {
-        foreach (DirectoryNode? parent in nodes.Select(node => node.Parent))
-        {
-            DirectoryNode? current = parent;
-            while (current != null && !localUpdates.ContainsKey(current))
-            {
-                localUpdates[current] = default;
-                current = current.Parent;
-            }
-        }
+        nodes.Clear();
     }
 
     private static void ApplyNodeDelta(DirectoryNode node, NodeDelta delta)
@@ -777,22 +1471,81 @@ public class ParallelScanner
 
     public static long ComputeTotalSizes(DirectoryNode node)
     {
-        long total = node.SelfSize;
-        DirectoryNode[] subs;
-        lock (node.Subdirectories)
+        Stack<(DirectoryNode Node, bool ChildrenVisited)> stack = new Stack<(DirectoryNode, bool)>();
+        stack.Push((node, false));
+
+        while (stack.Count > 0)
         {
-            subs = node.Subdirectories.ToArray();
+            (DirectoryNode current, bool visited) = stack.Pop();
+            if (!visited)
+            {
+                DirectoryNode[] subs;
+                lock (current.Subdirectories)
+                {
+                    if (current.Subdirectories.Count == 0)
+                    {
+                        current.TotalSize = current.SelfSize;
+                        continue;
+                    }
+
+                    subs = current.Subdirectories.ToArray();
+                }
+
+                stack.Push((current, true));
+                for (int i = subs.Length - 1; i >= 0; i--)
+                    stack.Push((subs[i], false));
+            }
+            else
+            {
+                long total = current.SelfSize;
+                lock (current.Subdirectories)
+                {
+                    for (int i = 0; i < current.Subdirectories.Count; i++)
+                        total += current.Subdirectories[i].TotalSize;
+                }
+
+                current.TotalSize = total;
+            }
         }
 
-        foreach (DirectoryNode sub in subs) total += ComputeTotalSizes(sub);
+        return node.TotalSize;
+    }
 
-        node.TotalSize = total;
-        return total;
+    private static void ComputeTotalSizesUnlocked(DirectoryNode node)
+    {
+        Stack<(DirectoryNode Node, bool ChildrenVisited)> stack = new Stack<(DirectoryNode, bool)>();
+        stack.Push((node, false));
+
+        while (stack.Count > 0)
+        {
+            (DirectoryNode current, bool visited) = stack.Pop();
+            List<DirectoryNode> subs = current.Subdirectories;
+            if (!visited)
+            {
+                if (subs.Count == 0)
+                {
+                    current.TotalSize = current.SelfSize;
+                    continue;
+                }
+
+                stack.Push((current, true));
+                for (int i = subs.Count - 1; i >= 0; i--)
+                    stack.Push((subs[i], false));
+            }
+            else
+            {
+                long total = current.SelfSize;
+                for (int i = 0; i < subs.Count; i++)
+                    total += subs[i].TotalSize;
+
+                current.TotalSize = total;
+            }
+        }
     }
 
     private bool IsRootExcluded(DirectoryNode rootNode)
     {
-        if (_normalizedExcludedPaths.Count > 0 && IsExcludedPath(rootNode.Path))
+        if (_normalizedExcludedPaths != null && _normalizedExcludedPaths.Count > 0 && IsExcludedPath(rootNode.Path))
             return true;
 
         if (_options.ExcludeMatcher.IsEmpty)
@@ -804,18 +1557,18 @@ public class ParallelScanner
         return _options.ExcludeMatcher.IsExcludedManagedPath(rootNode.Path);
     }
 
-    private bool IsExcludedNativeEntry(byte[] parentNativePath, string parentPath, ReadOnlySpan<byte> name, ref byte[]? scratch)
+    private bool IsExcludedNativeEntry(byte[]? parentNativePath, DirectoryNode parentNode, ReadOnlySpan<byte> name, ref byte[]? scratch)
     {
-        if (!_options.ExcludeMatcher.IsEmpty && scratch != null)
+        if (!_options.ExcludeMatcher.IsEmpty && parentNativePath != null && scratch != null)
         {
             int len = DuAccounting.WriteChildPathIntoPooled(parentNativePath, name, ref scratch);
             if (_options.ExcludeMatcher.IsExcluded(scratch.AsSpan(0, len)))
                 return true;
         }
 
-        if (_normalizedExcludedPaths.Count > 0)
+        if (_normalizedExcludedPaths != null && _normalizedExcludedPaths.Count > 0)
         {
-            string subPath = Path.Combine(parentPath, Encoding.UTF8.GetString(name));
+            string subPath = Path.Combine(parentNode.Path, Encoding.UTF8.GetString(name));
             if (IsExcludedPath(subPath))
                 return true;
         }
@@ -828,7 +1581,7 @@ public class ParallelScanner
         if (!_options.ExcludeMatcher.IsEmpty && _options.ExcludeMatcher.IsExcludedManagedParts(directory, fileName))
             return true;
 
-        if (_normalizedExcludedPaths.Count > 0)
+        if (_normalizedExcludedPaths != null && _normalizedExcludedPaths.Count > 0)
         {
             string fullPath = Path.Join(directory, fileName);
             if (IsExcludedPath(fullPath))

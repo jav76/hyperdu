@@ -19,4 +19,7 @@ public class ScanOptions
     /// Use direct libc calls on Linux and macOS. Falls back to the managed enumerator when unsupported.
     /// </summary>
     public bool UseNativeIo { get; set; } = true;
+
+    internal bool AutoDetectWorkerCount { get; set; }
+    internal bool Headless { get; set; }
 }
