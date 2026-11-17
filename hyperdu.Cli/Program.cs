@@ -16,6 +16,7 @@ public static class Program
     private const int OptSi = 258;
     private const int OptSkipHidden = 259;
     private const int OptHelp = 260;
+    private const int OptNoUi = 261;
 
     private const string ShortOptions = "j:t:hbLlxVve:X:";
 
@@ -38,6 +39,7 @@ public static class Program
         new("exclude-from", ArgumentRequirement.RequiredArgument, 'X'),
         new("help", ArgumentRequirement.NoArgument, OptHelp),
         new("human-readable", ArgumentRequirement.NoArgument, 'h'),
+        new("no-ui", ArgumentRequirement.NoArgument, OptNoUi),
         new("one-file-system", ArgumentRequirement.NoArgument, 'x'),
         new("si", ArgumentRequirement.NoArgument, OptSi),
         new("skip-hidden", ArgumentRequirement.NoArgument, OptSkipHidden),
@@ -58,7 +60,8 @@ public static class Program
         BlockSizeSpec DisplayBlockSize,
         bool HasExplicitHumanUnit,
         ExcludeMatcher Excludes,
-        List<string> ExcludeSummary
+        List<string> ExcludeSummary,
+        bool NoUi = false
     )
     {
         internal ScanOptions CreateScanOptions(int workerCount, bool useNativeIo)
@@ -112,6 +115,7 @@ public static class Program
         bool hasExplicitBytes = false;
         ExcludeMatcher excludes = new();
         List<string> excludeSummary = new();
+        bool noUi = false;
 
         foreach (ParsedOption opt in opts)
         {
@@ -206,6 +210,10 @@ public static class Program
                     skipHidden = true;
                     break;
 
+                case OptNoUi:
+                    noUi = true;
+                    break;
+
                 case OptExclude:
                 {
                     string pattern = opt.Argument ?? string.Empty;
@@ -252,7 +260,8 @@ public static class Program
             displayBlockSize,
             humanOverride.HasValue,
             excludes,
-            excludeSummary);
+            excludeSummary,
+            noUi);
         return DuParseOutcome.Run;
     }
 
@@ -462,7 +471,7 @@ public static class Program
         if (outcome != DuParseOutcome.Run || parsed == null)
             return 1;
 
-        if (Environment.GetEnvironmentVariable("HYPERDU_NO_UI") == "1")
+        if (parsed.NoUi || Environment.GetEnvironmentVariable("HYPERDU_NO_UI") == "1")
         {
             return await RunHeadlessScanAsync(parsed, programName);
         }
@@ -547,6 +556,7 @@ public static class Program
               --exclude=PATTERN   Skip files and directories matching glob PATTERN (repeatable)
           -X, --exclude-from=FILE Read exclude glob patterns from FILE (one per line)
               --skip-hidden       Skip hidden and system files/folders
+              --no-ui             Scan headlessly and print the summary total without TUI
           -V, --version           Output version information and exit
               --help              Display this help and exit
 

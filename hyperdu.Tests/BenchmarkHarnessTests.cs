@@ -39,6 +39,18 @@ public class BenchmarkHarnessTests
     }
 
     [Fact]
+    public void BenchmarkCliOptions_DefaultRunsFavorHigherPrecisionOnQuickAndStandard()
+    {
+        BenchmarkCliOptions quick = BenchmarkCliOptions.Parse(["--suite", "quick"]);
+        BenchmarkCliOptions standard = BenchmarkCliOptions.Parse([]);
+        BenchmarkCliOptions full = BenchmarkCliOptions.Parse(["--suite", "full"]);
+
+        Assert.Equal(10, quick.EffectiveRuns);
+        Assert.Equal(10, standard.EffectiveRuns);
+        Assert.Equal(3, full.EffectiveRuns);
+    }
+
+    [Fact]
     public void BenchmarkCliOptions_RejectsInvalidSuiteOrUnknownFlag()
     {
         Assert.Throws<ArgumentException>(() => BenchmarkCliOptions.Parse(["--suite", "ultra"]));
@@ -172,6 +184,48 @@ public class BenchmarkHarnessTests
             ComparatorRegistry.BuildScenarios(tools, [balanced], BenchmarkSuite.Quick, filter: "du-d1");
         Assert.Single(filtered);
         Assert.Equal("balanced-tree/du-d1", filtered[0].Id);
+    }
+
+    [Fact]
+    public void ComparatorRegistry_NativeEngineMatchesApparentSizeAndSkipsDepthOne()
+    {
+        ToolSpec refDu = new("ref-du", "GNU du", ComparatorTier.Tier1Parity, "/usr/bin/du", new Dictionary<string, string>(), true, true);
+        ToolSpec native = new(
+            "hyperdu-native",
+            "hyperdu (native, auto-threads)",
+            ComparatorTier.Tier2Workload,
+            "/opt/hyperdu",
+            new Dictionary<string, string>(),
+            false,
+            false,
+            FixedPrefixArguments: ["--no-ui"]);
+
+        DiscoveredTools tools = new(
+            ReferenceDu: refDu,
+            ReferenceDuIsGnu: true,
+            ReferenceDuVersion: "9.7",
+            HyperduNoUi: native,
+            HyperduNoUiSingleThread: null,
+            HyperduNoUiManaged: null,
+            HyperduDuPersona: null,
+            HyperduDuSingleThread: null,
+            HyperduDuFourThreads: null,
+            UutilsDu: null,
+            UutilsSubcommandPrefix: null,
+            Dust: null,
+            GoGdu: null,
+            Ncdu: null,
+            HasDuPersona: false);
+
+        FixtureSpec balanced = new("balanced-tree", "/tmp/balanced", "test", 100, 10, true);
+        IReadOnlyList<ScenarioDefinition> scenarios = ComparatorRegistry.BuildScenarios(tools, [balanced], BenchmarkSuite.Quick, filter: null);
+
+        ScenarioDefinition apparent = Assert.Single(scenarios, s => s.Id == "balanced-tree/apparent-summarize");
+        CommandInvocation nativeApparent = Assert.Single(apparent.Invocations, i => i.Tool.Id == "hyperdu-native");
+        Assert.Equal(new[] { "--no-ui", "--apparent-size", "/tmp/balanced" }, nativeApparent.Arguments);
+
+        ScenarioDefinition depthOne = Assert.Single(scenarios, s => s.Id == "balanced-tree/depth-1");
+        Assert.DoesNotContain(depthOne.Invocations, i => i.Tool.Id == "hyperdu-native");
     }
 
     [UnixFact]
@@ -407,7 +461,60 @@ public class BenchmarkHarnessTests
             Assert.Contains("## Overall Benchmark Score", md);
             Assert.Contains("Score Index", md);
             Assert.Contains("200", md);
+            Assert.Contains("Time-Wtd Speedup", md);
+            Assert.Contains("Throughput (k/s)", md);
             Assert.DoesNotContain("\u2014", md); // No em-dashes
+        }
+        finally
+        {
+            if (Directory.Exists(outDir))
+                Directory.Delete(outDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ReportWriter_SeparatesStartupAndDeduplicatesDuPersonaHeadline()
+    {
+        BenchmarkEnvironment env = new(
+            "Linux Test", "X64", "Test CPU", 8, "du (GNU coreutils) 9.7",
+            true, false, "hyperfine", "abc1234", new DateTimeOffset(2026, 11, 16, 12, 0, 0, TimeSpan.Zero));
+
+        FixtureSpec tiny = new("tiny-startup", "/tmp/tiny", "1 dir, 5 files", 5, 1, true);
+        FixtureSpec balanced = new("balanced-tree", "/tmp/balanced", "500 dirs, 50,000 files", 50_000, 500, true);
+
+        ScenarioResult startupScenario = new(
+            "tiny-startup/apparent-summarize", "Startup", "tiny-startup", "/tmp/tiny", "Tier2Workload",
+            [
+                new BenchmarkEntryResult("ref-du", "GNU du", true, new TimingStats(1.0, 0.1, 1.0, 0.9, 1.1, 0.5, 0.5, 10, "hyperfine"), new ProbeResult(0, 1.0, 2048, 1, "a", "1", "", true, "baseline"), 1.0, false, null),
+                new BenchmarkEntryResult("hyperdu-du-auto", "hyperdu du", false, new TimingStats(4.0, 0.2, 4.0, 3.8, 4.2, 1.0, 1.0, 10, "hyperfine"), new ProbeResult(0, 4.0, 4096, 1, "a", "1", "", true, "exact match"), 0.25, false, null),
+                new BenchmarkEntryResult("hyperdu-native", "hyperdu native", false, new TimingStats(5.0, 0.2, 5.0, 4.8, 5.2, 1.0, 1.0, 10, "hyperfine"), new ProbeResult(0, 5.0, 4096, 1, "b", "1", "", true, "ok (exit 0)"), 0.20, false, null)
+            ],
+            null);
+
+        ScenarioResult workloadScenario = new(
+            "balanced-tree/summarize", "Summarize", "balanced-tree", "/tmp/balanced", "Tier2Workload",
+            [
+                new BenchmarkEntryResult("ref-du", "GNU du", true, new TimingStats(40.0, 1.0, 40.0, 38.0, 42.0, 10.0, 20.0, 10, "hyperfine"), new ProbeResult(0, 40.0, 4096, 1, "c", "1", "", true, "baseline"), 1.0, false, null),
+                new BenchmarkEntryResult("hyperdu-du-auto", "hyperdu du", false, new TimingStats(20.0, 0.5, 20.0, 19.0, 21.0, 15.0, 20.0, 10, "hyperfine"), new ProbeResult(0, 20.0, 8192, 1, "c", "1", "", true, "exact match"), 2.0, false, null),
+                new BenchmarkEntryResult("hyperdu-du-1t", "hyperdu du 1t", false, new TimingStats(30.0, 0.5, 30.0, 29.0, 31.0, 15.0, 15.0, 10, "hyperfine"), new ProbeResult(0, 30.0, 6144, 1, "c", "1", "", true, "exact match"), 1.33, false, null),
+                new BenchmarkEntryResult("hyperdu-native", "hyperdu native", false, new TimingStats(25.0, 0.5, 25.0, 24.0, 26.0, 15.0, 20.0, 10, "hyperfine"), new ProbeResult(0, 25.0, 12288, 1, "d", "1", "", true, "ok (exit 0)"), 1.6, false, null)
+            ],
+            null);
+
+        BenchmarkReport report = new(env, "standard", [tiny, balanced], [startupScenario, workloadScenario]);
+        string outDir = Path.Combine(Path.GetTempPath(), $"hyperdu-report-split-{Guid.NewGuid():N}");
+        try
+        {
+            (_, string mdPath) = await ReportWriter.WriteAsync(report, outDir);
+            string md = await File.ReadAllTextAsync(mdPath);
+
+            // Workload score excludes tiny-startup (0.25x), so Score Index is 200 rather than sqrt(0.25 * 2.0) * 100 = 71.
+            Assert.Contains("**200 / 100 baseline", md);
+            Assert.Contains("Startup Latency (`tiny-startup/apparent-summarize`)", md);
+            Assert.Contains("Parallel Scaling (`hyperdu du` 1-thread vs default)", md);
+            Assert.Contains("1.50x", md);
+            Assert.DoesNotContain("`hyperdu du` Persona", md);
+            Assert.DoesNotContain("\u2014", md);
         }
         finally
         {

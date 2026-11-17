@@ -79,6 +79,7 @@ public sealed class TuiCliPhase62Tests
         Assert.Contains("-j, --threads", outHelp);
         Assert.Contains("--apparent-size", outHelp);
         Assert.Contains("-t, --threshold", outHelp);
+        Assert.Contains("--no-ui", outHelp);
         Assert.Contains("--exclude=PATTERN", outHelp);
         Assert.Contains("-X, --exclude-from=FILE", outHelp);
         Assert.Contains("-V, --version", outHelp);
@@ -266,6 +267,11 @@ public sealed class TuiCliPhase62Tests
         (int rcMatch, string outMatch, _) = RunCli(["-b", "-t", "10K", tree.Root], headlessTui: true);
         Assert.Equal(0, rcMatch);
         Assert.Equal($"20480\t{tree.Root}\n", outMatch);
+
+        (int rcFlagNoUi, string outFlagNoUi, string errFlagNoUi) = RunCli(["--no-ui", "-b", tree.Root], headlessTui: false);
+        Assert.Equal(0, rcFlagNoUi);
+        Assert.Empty(errFlagNoUi);
+        Assert.Equal($"20480\t{tree.Root}\n", outFlagNoUi);
     }
 
     [Fact]

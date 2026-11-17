@@ -17,7 +17,7 @@ internal sealed class BenchmarkCliOptions
     public bool ShowHelp { get; init; }
 
     public int EffectiveWarmup => Warmup ?? (Suite == BenchmarkSuite.Full ? 1 : 2);
-    public int EffectiveRuns => Runs ?? (Suite == BenchmarkSuite.Full ? 3 : 5);
+    public int EffectiveRuns => Runs ?? (Suite == BenchmarkSuite.Full ? 3 : 10);
 
     /// <summary>Parses CLI arguments for the benchmark harness.</summary>
     public static BenchmarkCliOptions Parse(string[] args)

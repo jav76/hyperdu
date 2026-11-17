@@ -38,6 +38,11 @@ internal sealed class FixtureGenerator : IDisposable
             specs.Add(CreateDevMonorepo());
         }
 
+        if (suite == BenchmarkSuite.Standard)
+        {
+            specs.Add(CreateMillionFiles(dirCount: 250, filesPerDir: 1_000, name: "scale-250k"));
+        }
+
         if (suite == BenchmarkSuite.Full)
         {
             specs.Add(CreateMillionFiles(dirCount: 1_000, filesPerDir: 1_000));
