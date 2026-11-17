@@ -311,6 +311,22 @@ try:
         return b"".join(out_lines)
 
     bsd_cwd_map = bsd_cwd_overrides if active_dialect == "bsd" else {}
+    gnu_ver_match = re.search(r"GNU coreutils\)\s+(\d+)\.(\d+)", ref_version_line) if active_dialect == "gnu" else None
+    ref_gnu_version = (int(gnu_ver_match.group(1)), int(gnu_ver_match.group(2))) if gnu_ver_match else None
+
+    def normalize_ref_stderr(vec_id: str, raw: bytes) -> bytes:
+        # Coreutils >= 9.8 reformatted valid_args for --time-style (dropped single quotes and added +FORMAT);
+        # hyperdu matches the pinned 9.4 diagnostic while still asserting exit code and message prefix.
+        if (
+            vec_id == "p3-time-invalid-style-c"
+            and ref_gnu_version is not None
+            and ref_gnu_version >= (9, 8)
+        ):
+            raw = raw.replace(
+                b"  - full-iso\n  - long-iso\n  - iso\n  - +FORMAT (e.g., +%H:%M) for a 'date'-style format\n",
+                b"  - 'full-iso'\n  - 'long-iso'\n  - 'iso'\n",
+            )
+        return raw
 
     def run_one(exe: str, env_overrides: dict[str, str], vec_args: list[str], stdin_data: bytes | None, cwd_override: str | None = None):
         env = os.environ.copy()
@@ -336,6 +352,7 @@ try:
         vec_id, category, env_ov, vec_args, stdin_data = item
         cwd_ov = bsd_cwd_map.get(vec_id)
         ref_rc, ref_out, ref_err, ref_to = run_one(ref_du, env_ov, vec_args, stdin_data, cwd_ov)
+        ref_err = normalize_ref_stderr(vec_id, ref_err)
 
         thread_modes = [m.strip() for m in args.threads_matrix.split(",") if m.strip()] if args.threads_matrix else [None]
         mode_failures = []

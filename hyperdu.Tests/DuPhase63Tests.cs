@@ -504,27 +504,20 @@ public sealed partial class DuPhase63Tests
     [UnixFact]
     public void BsdWalker_DeepTreeBeyondPathMax_SucceedsWithoutTruncation()
     {
-        using TempTree tree = new();
-        // >1200 bytes total path exceeds macOS PATH_MAX (1024), verifying openat relative traversal in BSD mode.
-        string current = tree.Root;
-        for (int i = 0; i < 65; i++)
-        {
-            current = Path.Combine(current, $"seg_{i:D2}_1234567890abcdef");
-            Directory.CreateDirectory(current);
-        }
-
-        string leaf = Path.Combine(current, "leaf.bin");
-        File.WriteAllBytes(leaf, new byte[512]);
+        // FixtureGenerator creates and deletes chains fd-relatively via openat/mkdirat/unlinkat,
+        // avoiding .NET Directory.CreateDirectory's PATH_MAX (1024 on macOS) limit.
+        using hyperdu.Benchmarks.Cli.FixtureGenerator generator = new();
+        hyperdu.Benchmarks.Cli.FixtureSpec deep = generator.CreateDeepChain(depth: 100);
 
         foreach (bool parallel in new[] { false, true })
         {
-            (int rc, string stdout, string stderr) = RunBsdWalker(["-A", "-B", "1", "-s", tree.Root], parallel: parallel);
+            (int rc, string stdout, string stderr) = RunBsdWalker(["-A", "-B", "1", "-s", deep.RootPath], parallel: parallel);
             Assert.Equal(0, rc);
             Assert.Equal(string.Empty, stderr);
             string[] parts = stdout.TrimEnd('\n').Split('\t');
             Assert.Equal(2, parts.Length);
             Assert.True(ulong.Parse(parts[0]) >= 1UL);
-            Assert.Equal(tree.Root, parts[1]);
+            Assert.Equal(deep.RootPath, parts[1]);
         }
     }
 
