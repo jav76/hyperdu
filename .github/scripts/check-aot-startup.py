@@ -10,12 +10,38 @@ import time
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Measure Native AOT du startup latency on a single file.")
     parser.add_argument("--binary", required=True, help="Path to du symlink or hyperdu binary")
+    parser.add_argument("--ref-binary", help="Optional reference binary to measure baseline spawn+exec overhead")
     parser.add_argument("--target", required=True, help="Target file operand passed to du")
     parser.add_argument("--warmup", type=int, default=5, help="Warmup invocation count")
     parser.add_argument("--runs", type=int, default=30, help="Measured invocation count")
     parser.add_argument("--max-median-ms", type=float, default=5.0, help="Maximum allowed median latency in ms")
     parser.add_argument("--markdown", help="Optional Markdown summary output path")
     return parser.parse_args()
+
+
+def measure_binary(binary: str, target: str, warmup: int, runs: int) -> tuple[float, float, float, float]:
+    cmd = [binary, target]
+    for _ in range(warmup):
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if res.returncode != 0:
+            raise RuntimeError(f"Error during warmup ({res.returncode}): {res.stderr.decode(errors='replace')}")
+
+    samples_ms: list[float] = []
+    for _ in range(runs):
+        t0 = time.perf_counter_ns()
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        elapsed_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
+        if res.returncode != 0:
+            raise RuntimeError(f"Error during startup run ({res.returncode}): {res.stderr.decode(errors='replace')}")
+        samples_ms.append(elapsed_ms)
+
+    samples_ms.sort()
+    min_ms = samples_ms[0]
+    median_ms = statistics.median(samples_ms)
+    p95_idx = min(len(samples_ms) - 1, int(0.95 * (len(samples_ms) - 1)))
+    p95_ms = samples_ms[p95_idx]
+    max_ms = samples_ms[-1]
+    return min_ms, median_ms, p95_ms, max_ms
 
 
 def main() -> int:
@@ -30,35 +56,23 @@ def main() -> int:
         print(f"Error: target file not found: {target}", file=sys.stderr)
         return 2
 
-    cmd = [binary, target]
-    for _ in range(args.warmup):
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        if res.returncode != 0:
-            print(f"Error during warmup ({res.returncode}): {res.stderr.decode(errors='replace')}", file=sys.stderr)
-            return 1
-
-    samples_ms: list[float] = []
-    for _ in range(args.runs):
-        t0 = time.perf_counter_ns()
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        elapsed_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
-        if res.returncode != 0:
-            print(f"Error during startup run ({res.returncode}): {res.stderr.decode(errors='replace')}", file=sys.stderr)
-            return 1
-        samples_ms.append(elapsed_ms)
-
-    samples_ms.sort()
-    min_ms = samples_ms[0]
-    median_ms = statistics.median(samples_ms)
-    p95_idx = min(len(samples_ms) - 1, int(0.95 * (len(samples_ms) - 1)))
-    p95_ms = samples_ms[p95_idx]
-    max_ms = samples_ms[-1]
+    try:
+        min_ms, median_ms, p95_ms, max_ms = measure_binary(binary, target, args.warmup, args.runs)
+        ref_stats = measure_binary(args.ref_binary, target, args.warmup, args.runs) if args.ref_binary else None
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     print(
         f"AOT startup (`du FILE`, {args.runs} runs): "
         f"min={min_ms:.2f} ms, median={median_ms:.2f} ms, p95={p95_ms:.2f} ms, max={max_ms:.2f} ms "
         f"(limit <= {args.max_median_ms:.2f} ms)"
     )
+    if ref_stats is not None:
+        print(
+            f"Reference baseline ({args.ref_binary}, {args.runs} runs): "
+            f"min={ref_stats[0]:.2f} ms, median={ref_stats[1]:.2f} ms, p95={ref_stats[2]:.2f} ms, max={ref_stats[3]:.2f} ms"
+        )
 
     if args.markdown:
         os.makedirs(os.path.dirname(os.path.abspath(args.markdown)), exist_ok=True)
@@ -73,6 +87,8 @@ def main() -> int:
             f.write(f"| Median | {median_ms:.2f} |\n")
             f.write(f"| P95 | {p95_ms:.2f} |\n")
             f.write(f"| Max | {max_ms:.2f} |\n")
+            if ref_stats is not None:
+                f.write(f"\nReference `{args.ref_binary}` median: {ref_stats[1]:.2f} ms (delta: {median_ms - ref_stats[1]:.2f} ms)\n")
 
     if median_ms > args.max_median_ms:
         print(

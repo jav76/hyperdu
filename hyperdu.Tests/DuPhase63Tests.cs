@@ -357,32 +357,36 @@ public sealed partial class DuPhase63Tests
     public void MacOs_ApfsFirmlink_CrossDeviceBoundaryAndDevFdMatchSystemDu()
     {
         Span<byte> rootStatBuf = stackalloc byte[NativeIo.StatBufferSize];
+        Span<byte> devStatBuf = stackalloc byte[NativeIo.StatBufferSize];
         Span<byte> dataStatBuf = stackalloc byte[NativeIo.StatBufferSize];
         Span<byte> usersRootBuf = stackalloc byte[NativeIo.StatBufferSize];
         Span<byte> usersDataBuf = stackalloc byte[NativeIo.StatBufferSize];
 
         Assert.True(NativeIo.TryStatPath("/\0"u8, followSymlinks: false, rootStatBuf, out NativeStat rootStat, out _));
-        Assert.True(NativeIo.TryStatPath("/System/Volumes/Data\0"u8, followSymlinks: false, dataStatBuf, out NativeStat dataStat, out _));
-        Assert.NotEqual(rootStat.Device, dataStat.Device);
+        Assert.True(NativeIo.TryStatPath("/dev\0"u8, followSymlinks: false, devStatBuf, out NativeStat devStat, out _));
+        Assert.NotEqual(rootStat.Device, devStat.Device);
 
-        // APFS firmlinked /Users shares the same underlying Data volume (Device, Inode) as /System/Volumes/Data/Users.
-        if (NativeIo.TryStatPath("/Users\0"u8, followSymlinks: false, usersRootBuf, out NativeStat usersRoot, out _) &&
-            NativeIo.TryStatPath("/System/Volumes/Data/Users\0"u8, followSymlinks: false, usersDataBuf, out NativeStat usersData, out _))
+        // Split APFS volume-group hosts mount /System/Volumes/Data on a distinct st_dev and firmlink /Users there.
+        if (NativeIo.TryStatPath("/System/Volumes/Data\0"u8, followSymlinks: false, dataStatBuf, out NativeStat dataStat, out _) &&
+            dataStat.Device != rootStat.Device)
         {
-            Assert.Equal(dataStat.Device, usersRoot.Device);
-            Assert.Equal((usersRoot.Device, usersRoot.Inode), (usersData.Device, usersData.Inode));
-        }
+            if (NativeIo.TryStatPath("/Users\0"u8, followSymlinks: false, usersRootBuf, out NativeStat usersRoot, out _) &&
+                NativeIo.TryStatPath("/System/Volumes/Data/Users\0"u8, followSymlinks: false, usersDataBuf, out NativeStat usersData, out _))
+            {
+                Assert.Equal(dataStat.Device, usersRoot.Device);
+                Assert.Equal((usersRoot.Device, usersRoot.Inode), (usersData.Device, usersData.Inode));
+            }
 
-        // With -x on /System/Volumes, crossing into /System/Volumes/Data matches /usr/bin/du -x -d 1 without descending into Data children.
-        (int rcX, string outX, string errX) = RunBsdWalker(["-x", "-d", "1", "/System/Volumes"]);
-        (int sysRcX, string sysOutX, string sysErrX) = RunExternalProcess("/usr/bin/du", ["-x", "-d", "1", "/System/Volumes"]);
-        Assert.Contains("\t/System/Volumes/Data\n", outX, StringComparison.Ordinal);
-        Assert.DoesNotContain("/System/Volumes/Data/Users", outX, StringComparison.Ordinal);
-        if (sysRcX == 0)
-        {
-            Assert.Equal(0, rcX);
-            Assert.Equal(sysErrX, errX);
-            Assert.Equal(sysOutX, outX);
+            (int rcX, string outX, string errX) = RunBsdWalker(["-x", "-d", "1", "/System/Volumes"]);
+            (int sysRcX, string sysOutX, string sysErrX) = RunExternalProcess("/usr/bin/du", ["-x", "-d", "1", "/System/Volumes"]);
+            Assert.Contains("\t/System/Volumes/Data\n", outX, StringComparison.Ordinal);
+            Assert.DoesNotContain("/System/Volumes/Data/Users", outX, StringComparison.Ordinal);
+            if (sysRcX == 0)
+            {
+                Assert.Equal(0, rcX);
+                Assert.Equal(sysErrX, errX);
+                Assert.Equal(sysOutX, outX);
+            }
         }
 
         // /dev/fd on macOS devfs is automatically skipped to avoid re-entering open fds.
@@ -390,7 +394,7 @@ public sealed partial class DuPhase63Tests
         Assert.Equal(0, rcDevFd);
         Assert.DoesNotContain("/dev/fd", outDevFd, StringComparison.Ordinal);
 
-        // Hardlinked files deduplicate via (dev, ino) by default in BSD mode and GNU mode also deduplicates directory (dev, ino) across /tmp symlinked alias.
+        // Hardlinked files deduplicate via (dev, ino) by default in BSD mode.
         using TempTree tmpTree = new();
         string original = tmpTree.File("a.bin", 4096);
         string hardlink = Path.Combine(tmpTree.Root, "b.bin");

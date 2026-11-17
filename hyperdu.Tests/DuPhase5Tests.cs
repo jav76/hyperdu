@@ -6,8 +6,13 @@ using hyperdu.Core.Du;
 namespace hyperdu.Tests;
 
 [Collection("DuEnv")]
-public sealed class DuPhase5Tests
+public sealed class DuPhase5Tests : IDisposable
 {
+    private readonly string? _prevDialect = Environment.GetEnvironmentVariable("HYPERDU_DU_DIALECT");
+
+    public DuPhase5Tests() => Environment.SetEnvironmentVariable("HYPERDU_DU_DIALECT", "gnu");
+
+    public void Dispose() => Environment.SetEnvironmentVariable("HYPERDU_DU_DIALECT", _prevDialect);
     [Fact]
     public void DuCommand_BrokenPipeOnVersion_Returns141WithoutStderrNoise()
     {

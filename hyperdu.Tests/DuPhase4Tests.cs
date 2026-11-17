@@ -6,8 +6,13 @@ using hyperdu.Core.Scanning;
 namespace hyperdu.Tests;
 
 [Collection("DuEnv")]
-public sealed partial class DuPhase4Tests
+public sealed partial class DuPhase4Tests : IDisposable
 {
+    private readonly string? _prevDialect = Environment.GetEnvironmentVariable("HYPERDU_DU_DIALECT");
+
+    public DuPhase4Tests() => Environment.SetEnvironmentVariable("HYPERDU_DU_DIALECT", "gnu");
+
+    public void Dispose() => Environment.SetEnvironmentVariable("HYPERDU_DU_DIALECT", _prevDialect);
     [LibraryImport("libc", SetLastError = true)]
     private static partial int chmod(byte[] pathname, uint mode);
 

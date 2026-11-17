@@ -189,7 +189,7 @@ public sealed class TuiCliPhase62Tests
 
         if (!OperatingSystem.IsWindows())
         {
-            (int rcDu, string outDu, string errDu) = RunCli(["du", "-b", "-s", "--exclude=*.tmp", "--exclude=node_modules", "--exclude=.patterns", tree.Root], headlessTui: false);
+            (int rcDu, string outDu, string errDu) = RunCli(["gdu", "-b", "-s", "--exclude=*.tmp", "--exclude=node_modules", "--exclude=.patterns", tree.Root], headlessTui: false);
             (int rcTui, string outTui, string errTui) = RunCli(["-b", "--exclude=*.tmp", "--exclude=node_modules", "--exclude=.patterns", tree.Root], headlessTui: true);
             Assert.Equal(0, rcDu);
             Assert.Equal(0, rcTui);

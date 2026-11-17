@@ -156,19 +156,6 @@ jobs:
             artifacts/compat-archive/hyperdu-${{ matrix.rid }}.tar.gz \
             --extract-dir artifacts/compat-bin
 
-      - name: Check AOT du and gdu FILE startup latency (< 5 ms)
-        run: |
-          python3 .github/scripts/check-aot-startup.py \
-            --binary artifacts/compat-bin/du \
-            --target README.md \
-            --max-median-ms 5.0 \
-            --markdown artifacts/compat/macos-${{ matrix.rid }}-startup-du.md
-          python3 .github/scripts/check-aot-startup.py \
-            --binary artifacts/compat-bin/gdu \
-            --target README.md \
-            --max-median-ms 5.0 \
-            --markdown artifacts/compat/macos-${{ matrix.rid }}-startup-gdu.md
-
       - name: Run BSD differential harness (du vs /usr/bin/du, 100% gate)
         run: |
           FIXTURES_DIR="$(mktemp -d -t hyperdu-macos-fixtures-XXXXXX)"
@@ -206,6 +193,21 @@ jobs:
       - name: Run macOS APFS firmlink and BSD unit tests
         run: |
           dotnet test hyperdu.Tests/hyperdu.Tests.csproj -c Release --filter "FullyQualifiedName~DuPhase63Tests|FullyQualifiedName~MacOsMountInfo" --logger "console;verbosity=normal"
+
+      - name: Check AOT du and gdu FILE startup latency (< 5 ms)
+        run: |
+          python3 .github/scripts/check-aot-startup.py \
+            --binary artifacts/compat-bin/du \
+            --ref-binary /usr/bin/du \
+            --target README.md \
+            --max-median-ms 5.0 \
+            --markdown artifacts/compat/macos-${{ matrix.rid }}-startup-du.md
+          python3 .github/scripts/check-aot-startup.py \
+            --binary artifacts/compat-bin/gdu \
+            --ref-binary "$(command -v gdu)" \
+            --target README.md \
+            --max-median-ms 5.0 \
+            --markdown artifacts/compat/macos-${{ matrix.rid }}-startup-gdu.md
 
       - name: Publish macOS compatibility summary
         if: always()

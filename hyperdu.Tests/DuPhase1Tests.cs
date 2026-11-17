@@ -8,8 +8,13 @@ namespace hyperdu.Tests;
 public sealed class DuEnvCollection;
 
 [Collection("DuEnv")]
-public sealed partial class DuPhase1Tests
+public sealed partial class DuPhase1Tests : IDisposable
 {
+    private readonly string? _prevDialect = Environment.GetEnvironmentVariable("HYPERDU_DU_DIALECT");
+
+    public DuPhase1Tests() => Environment.SetEnvironmentVariable("HYPERDU_DU_DIALECT", "gnu");
+
+    public void Dispose() => Environment.SetEnvironmentVariable("HYPERDU_DU_DIALECT", _prevDialect);
     [LibraryImport("libc", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
     private static partial int link(string existingPath, string newPath);
     private static void WithEnv(Dictionary<string, string?> overrides, Action action)
