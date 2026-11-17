@@ -141,7 +141,23 @@ public static class Messages
     {
         string prefix = $"{BsdProgramName(programName)}: ";
         string suffix = errno == 0 ? "\n" : $": {NativeIo.DescribePosixError(errno)}\n";
-        WriteFormattedError(stderr, prefix, [], pathBytes, [], suffix);
+        WriteFormattedError(stderr, prefix, [], pathBytes, [], [], suffix);
+    }
+
+    internal static void WriteBsdTooManySymlinksError(Stream stderr, string programName, ReadOnlySpan<byte> pathBytes)
+    {
+        string prefix = $"{BsdProgramName(programName)}: Too many symlinks at ";
+        WriteFormattedError(stderr, prefix, [], pathBytes, [], [], "\n");
+    }
+
+    internal static void WriteBsdSymlinkCycleError(
+        Stream stderr,
+        string programName,
+        ReadOnlySpan<byte> pathBytes,
+        ReadOnlySpan<byte> cyclePathBytes)
+    {
+        string prefix = $"{BsdProgramName(programName)}: Can't follow symlink cycle from ";
+        WriteFormattedError(stderr, prefix, [], pathBytes, " to "u8, cyclePathBytes, "\n");
     }
 
     private static void WriteFormattedError(
@@ -150,11 +166,21 @@ public static class Messages
         ReadOnlySpan<byte> openQuote,
         ReadOnlySpan<byte> pathBytes,
         ReadOnlySpan<byte> closeQuote,
+        string suffix) =>
+        WriteFormattedError(stderr, prefix, openQuote, pathBytes, closeQuote, [], suffix);
+
+    private static void WriteFormattedError(
+        Stream stderr,
+        string prefix,
+        ReadOnlySpan<byte> openQuote,
+        ReadOnlySpan<byte> pathBytes,
+        ReadOnlySpan<byte> middle,
+        ReadOnlySpan<byte> secondPathBytes,
         string suffix)
     {
         int prefixLen = Encoding.UTF8.GetByteCount(prefix);
         int suffixLen = Encoding.UTF8.GetByteCount(suffix);
-        int totalLen = prefixLen + openQuote.Length + pathBytes.Length + closeQuote.Length + suffixLen;
+        int totalLen = prefixLen + openQuote.Length + pathBytes.Length + middle.Length + secondPathBytes.Length + suffixLen;
 
         byte[] rented = ArrayPool<byte>.Shared.Rent(totalLen);
         try
@@ -169,10 +195,16 @@ public static class Messages
 
             pathBytes.CopyTo(dest.Slice(pos));
             pos += pathBytes.Length;
-            if (!closeQuote.IsEmpty)
+            if (!middle.IsEmpty)
             {
-                closeQuote.CopyTo(dest.Slice(pos));
-                pos += closeQuote.Length;
+                middle.CopyTo(dest.Slice(pos));
+                pos += middle.Length;
+            }
+
+            if (!secondPathBytes.IsEmpty)
+            {
+                secondPathBytes.CopyTo(dest.Slice(pos));
+                pos += secondPathBytes.Length;
             }
 
             Encoding.UTF8.GetBytes(suffix, dest.Slice(pos));

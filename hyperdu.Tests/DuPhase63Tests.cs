@@ -405,6 +405,129 @@ public sealed partial class DuPhase63Tests
         Assert.Equal($"8\t{original}\n8\ttotal\n", outDedup);
     }
 
+    [UnixFact]
+    public void BsdWalker_HardlinkCountdown_DuplicateDirectoryOperandsAndExternalLink()
+    {
+        using TempTree tree = new();
+        string d = tree.Dir("d");
+        string f1 = tree.File("d/a/file1.bin", 4096);
+        string hlSub = Path.Combine(d, "a", "hl_sub.bin");
+        string hlCross = Path.Combine(tree.Dir("d/c"), "hl_cross.bin");
+        Assert.Equal(0, link(f1, hlSub));
+        Assert.Equal(0, link(f1, hlCross));
+
+        foreach (bool parallel in new[] { false, true })
+        {
+            // All 3 links are inside d: linkchk releases the inode after visiting the 3rd link,
+            // so a second 'd' operand counts the file again and emits matching totals.
+            (int rcSingle, string outSingle, string errSingle) = RunBsdWalker(["-A", "-B", "1", "-s", d], parallel: parallel);
+            Assert.Equal(0, rcSingle);
+            Assert.Equal(string.Empty, errSingle);
+            ulong singleBlocks = ulong.Parse(outSingle.Split('\t')[0]);
+
+            (int rc, string stdout, string stderr) = RunBsdWalker(["-A", "-B", "1", "-s", "-c", d, d], parallel: parallel);
+            Assert.Equal(0, rc);
+            Assert.Equal(string.Empty, stderr);
+            string[] lines = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            Assert.Equal(3, lines.Length);
+            Assert.Equal(lines[0], lines[1]);
+            Assert.Equal($"{singleBlocks}\t{d}", lines[0]);
+            ulong totalBlocks = ulong.Parse(lines[2].Split('\t')[0]);
+            // howmany() ceiling across unrounded directory apparent sizes means total(2*bytes) is either 2*single or 2*single - 1.
+            Assert.InRange(totalBlocks, singleBlocks * 2 - 1, singleBlocks * 2);
+            Assert.EndsWith("\ttotal", lines[2], StringComparison.Ordinal);
+        }
+
+        // With st_nlink == 2 and one link outside d_ext, remaining == 1 after the first 'd_ext',
+        // so the second 'd_ext' decrements remaining to 0 and skips the 4096-byte file (8 x 512-byte blocks).
+        string dExt = tree.Dir("d_ext");
+        string extInside = tree.File("d_ext/only_inside.bin", 4096);
+        string extOutside = Path.Combine(tree.Root, "external_hl.bin");
+        Assert.Equal(0, link(extInside, extOutside));
+        foreach (bool parallel in new[] { false, true })
+        {
+            (int rcExt, string outExt, string errExt) = RunBsdWalker(["-A", "-B", "1", "-s", "-c", dExt, dExt], parallel: parallel);
+            Assert.Equal(0, rcExt);
+            Assert.Equal(string.Empty, errExt);
+            string[] extLines = outExt.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            Assert.Equal(3, extLines.Length);
+            ulong firstBlocks = ulong.Parse(extLines[0].Split('\t')[0]);
+            ulong secondBlocks = ulong.Parse(extLines[1].Split('\t')[0]);
+            ulong totalBlocks = ulong.Parse(extLines[2].Split('\t')[0]);
+            Assert.Equal(8UL, firstBlocks - secondBlocks);
+            // ceiling(2 * dirBytes + fileBytes) / 512 is either firstBlocks + secondBlocks or 1 less.
+            Assert.InRange(totalBlocks, firstBlocks + secondBlocks - 1, firstBlocks + secondBlocks);
+        }
+    }
+
+    [UnixFact]
+    public void BsdWalker_SymlinkLoopsAndDirectoryCyclesWithFollow_FailFastLikeAppleDu()
+    {
+        using TempTree loopTree = new();
+        string loopA = Path.Combine(loopTree.Root, "loop_a");
+        string loopB = Path.Combine(loopTree.Root, "loop_b");
+        File.CreateSymbolicLink(loopA, "loop_b");
+        File.CreateSymbolicLink(loopB, "loop_a");
+
+        string d = loopTree.Dir("dir_loop");
+        File.CreateSymbolicLink(Path.Combine(d, "la"), "lb");
+        File.CreateSymbolicLink(Path.Combine(d, "lb"), "la");
+        string okDir = loopTree.Dir("ok_dir");
+        loopTree.File("ok_dir/keep.bin", 4096);
+
+        using TempTree cycleTree = new();
+        string sub = cycleTree.Dir("sub");
+        cycleTree.File("sub/keep.bin", 4096);
+        string cycleLink = Path.Combine(sub, "up");
+        File.CreateSymbolicLink(cycleLink, cycleTree.Root);
+
+        foreach (bool parallel in new[] { false, true })
+        {
+            // Operand ELOOP under -H / -L triggers fatal Apple unix2003 diagnostic.
+            (int rcOp, string outOp, string errOp) = RunBsdWalker(["-H", "-c", loopA, okDir], "/usr/bin/du", parallel: parallel);
+            Assert.Equal(1, rcOp);
+            Assert.Equal(string.Empty, outOp);
+            Assert.Equal($"du: Too many symlinks at {loopA}\n", errOp);
+
+            // Child ELOOP under -L aborts before continuing to later operands or total.
+            (int rcChild, _, string errChild) = RunBsdWalker(["-L", "-c", d, d], "/usr/bin/du", parallel: parallel);
+            Assert.Equal(1, rcChild);
+            Assert.StartsWith("du: Too many symlinks at ", errChild, StringComparison.Ordinal);
+
+            // Ancestor directory symlink cycle under -L triggers FTS_DC diagnostic.
+            (int rcCycle, _, string errCycle) = RunBsdWalker(["-L", cycleTree.Root], "/usr/bin/du", parallel: parallel);
+            Assert.Equal(1, rcCycle);
+            Assert.Equal($"du: Can't follow symlink cycle from {cycleLink} to {cycleTree.Root}\n", errCycle);
+        }
+    }
+
+    [UnixFact]
+    public void BsdWalker_DeepTreeBeyondPathMax_SucceedsWithoutTruncation()
+    {
+        using TempTree tree = new();
+        // >1200 bytes total path exceeds macOS PATH_MAX (1024), verifying openat relative traversal in BSD mode.
+        string current = tree.Root;
+        for (int i = 0; i < 65; i++)
+        {
+            current = Path.Combine(current, $"seg_{i:D2}_1234567890abcdef");
+            Directory.CreateDirectory(current);
+        }
+
+        string leaf = Path.Combine(current, "leaf.bin");
+        File.WriteAllBytes(leaf, new byte[512]);
+
+        foreach (bool parallel in new[] { false, true })
+        {
+            (int rc, string stdout, string stderr) = RunBsdWalker(["-A", "-B", "1", "-s", tree.Root], parallel: parallel);
+            Assert.Equal(0, rc);
+            Assert.Equal(string.Empty, stderr);
+            string[] parts = stdout.TrimEnd('\n').Split('\t');
+            Assert.Equal(2, parts.Length);
+            Assert.True(ulong.Parse(parts[0]) >= 1UL);
+            Assert.Equal(tree.Root, parts[1]);
+        }
+    }
+
     private static (int ExitCode, string Stdout, string Stderr) RunExternalProcess(string exe, string[] args)
     {
         using System.Diagnostics.Process proc = new();

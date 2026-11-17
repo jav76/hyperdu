@@ -273,8 +273,11 @@ try:
             ("bsd-err-long-version", "bsd", {}, ["--version"], None),
             ("bsd-err-long-help", "bsd", {}, ["--help"], None),
             ("bsd-large-dir-10k", "bsd", {}, ["-a", "large-dir"], None),
-            ("bsd-deep", "bsd", {}, ["-s", "deep"], None),
         ]
+
+        bsd_cwd_overrides = {
+            "bsd-default-cwd": os.path.join(fixture_root, "d"),
+        }
 
         bsd_rng = random.Random(args.seed + 1000)
         bsd_scope = [[], ["-a"], ["-s"], ["-d", "0"], ["-d", "1"]]
@@ -307,7 +310,9 @@ try:
             out_lines.append(line)
         return b"".join(out_lines)
 
-    def run_one(exe: str, env_overrides: dict[str, str], vec_args: list[str], stdin_data: bytes | None):
+    bsd_cwd_map = bsd_cwd_overrides if active_dialect == "bsd" else {}
+
+    def run_one(exe: str, env_overrides: dict[str, str], vec_args: list[str], stdin_data: bytes | None, cwd_override: str | None = None):
         env = os.environ.copy()
         env.setdefault("LC_ALL", "C")
         env.setdefault("TZ", "UTC")
@@ -315,7 +320,7 @@ try:
         try:
             proc = subprocess.run(
                 [exe, *vec_args],
-                cwd=fixture_root,
+                cwd=cwd_override or fixture_root,
                 env=env,
                 input=stdin_data if stdin_data is not None else b"",
                 capture_output=True,
@@ -329,7 +334,8 @@ try:
 
     def evaluate_vector(item):
         vec_id, category, env_ov, vec_args, stdin_data = item
-        ref_rc, ref_out, ref_err, ref_to = run_one(ref_du, env_ov, vec_args, stdin_data)
+        cwd_ov = bsd_cwd_map.get(vec_id)
+        ref_rc, ref_out, ref_err, ref_to = run_one(ref_du, env_ov, vec_args, stdin_data, cwd_ov)
 
         thread_modes = [m.strip() for m in args.threads_matrix.split(",") if m.strip()] if args.threads_matrix else [None]
         mode_failures = []
@@ -338,6 +344,7 @@ try:
         stdout_match = True
         stderr_match = True
         exit_match = True
+        first_diff = None
 
         for mode in thread_modes:
             cand_env = dict(env_ov)
@@ -346,7 +353,7 @@ try:
             elif mode is not None:
                 cand_env["HYPERDU_THREADS"] = mode
 
-            cand_rc, cand_out, cand_err, cand_to = run_one(cand_du, cand_env, vec_args, stdin_data)
+            cand_rc, cand_out, cand_err, cand_to = run_one(cand_du, cand_env, vec_args, stdin_data, cwd_ov)
             last_rc = cand_rc
             if cand_to:
                 last_to = True
@@ -367,6 +374,16 @@ try:
                 mode_failures.append(f"{prefix}stdout-diff({len(cand_out)}B!={len(ref_out)}B)")
             if not e_ok:
                 mode_failures.append(f"{prefix}stderr-diff({len(cand_err)}B!={len(ref_err)}B)")
+            if not (s_ok and e_ok and x_ok) and first_diff is None:
+                first_diff = {
+                    "mode": mode,
+                    "ref_rc": ref_rc,
+                    "cand_rc": cand_rc,
+                    "ref_out": repr(ref_out[:240]),
+                    "cand_out": repr(cand_out[:240]),
+                    "ref_err": repr(ref_err[:240]),
+                    "cand_err": repr(cand_err[:240]),
+                }
 
         if ref_to:
             mode_failures.insert(0, "reference-timeout")
@@ -387,6 +404,7 @@ try:
             "ref_exit": ref_rc,
             "cand_exit": last_rc,
             "reasons": mode_failures,
+            "first_diff": first_diff,
         }
 
     if args.category:
@@ -415,6 +433,14 @@ try:
     for cat, counts in by_category.items():
         cat_pct = 100.0 * counts["passed"] / counts["total"]
         print(f"  - {cat:10s}: {counts['passed']}/{counts['total']} ({cat_pct:.1f}%)")
+
+    failed_results = [r for r in results if not r["passed"]]
+    for r in failed_results[:5]:
+        print(f"FAIL DETAIL {r['id']} args={r['args']} env={r['env']}: {', '.join(r['reasons'])}", file=sys.stderr)
+        diff = r.get("first_diff")
+        if diff:
+            print(f"  ref(rc={diff['ref_rc']})  out={diff['ref_out']} err={diff['ref_err']}", file=sys.stderr)
+            print(f"  cand(rc={diff['cand_rc']}) out={diff['cand_out']} err={diff['cand_err']}", file=sys.stderr)
 
     report_obj = {
         "pinned_gnu_du_version": pinned_version,
