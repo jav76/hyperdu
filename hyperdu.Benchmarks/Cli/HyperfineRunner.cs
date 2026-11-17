@@ -15,6 +15,8 @@ internal static class HyperfineRunner
         PropertyNameCaseInsensitive = true
     };
 
+    private static readonly Lazy<bool> ShellNoneSupported = new(ProbeShellNoneSupport);
+
     public static bool IsHyperfineAvailable(BenchmarkCliOptions options) =>
         !options.NoHyperfine && ComparatorRegistry.FindOnPath("hyperfine") != null;
 
@@ -64,6 +66,58 @@ internal static class HyperfineRunner
         BenchmarkCliOptions options,
         CancellationToken cancellationToken)
     {
+        bool useShellNoneBatching = !options.ColdCache && ShellNoneSupported.Value;
+        if (!useShellNoneBatching)
+            return await ExecuteHyperfineBatchAsync(invocations, options, shellNone: false, cancellationToken);
+
+        List<int> directIndices = [];
+        List<CommandInvocation> directBatch = [];
+        List<int> envIndices = [];
+        List<CommandInvocation> envBatch = [];
+
+        for (int i = 0; i < invocations.Count; i++)
+        {
+            if (invocations[i].EnvironmentVariables.Count == 0)
+            {
+                directIndices.Add(i);
+                directBatch.Add(invocations[i]);
+            }
+            else
+            {
+                envIndices.Add(i);
+                envBatch.Add(invocations[i]);
+            }
+        }
+
+        if (directBatch.Count == 0 || envBatch.Count == 0)
+        {
+            return await ExecuteHyperfineBatchAsync(
+                invocations,
+                options,
+                shellNone: directBatch.Count > 0,
+                cancellationToken);
+        }
+
+        TimingStats[] ordered = new TimingStats[invocations.Count];
+        IReadOnlyList<TimingStats> directResults =
+            await ExecuteHyperfineBatchAsync(directBatch, options, shellNone: true, cancellationToken);
+        for (int i = 0; i < directIndices.Count && i < directResults.Count; i++)
+            ordered[directIndices[i]] = directResults[i];
+
+        IReadOnlyList<TimingStats> envResults =
+            await ExecuteHyperfineBatchAsync(envBatch, options, shellNone: false, cancellationToken);
+        for (int i = 0; i < envIndices.Count && i < envResults.Count; i++)
+            ordered[envIndices[i]] = envResults[i];
+
+        return ordered;
+    }
+
+    private static async Task<IReadOnlyList<TimingStats>> ExecuteHyperfineBatchAsync(
+        IReadOnlyList<CommandInvocation> invocations,
+        BenchmarkCliOptions options,
+        bool shellNone,
+        CancellationToken cancellationToken)
+    {
         string jsonFile = Path.Combine(Path.GetTempPath(), $"hyperdu-hyperfine-{Guid.NewGuid():N}.json");
         try
         {
@@ -75,6 +129,8 @@ internal static class HyperfineRunner
             };
 
             psi.ArgumentList.Add("--ignore-failure");
+            if (shellNone)
+                psi.ArgumentList.Add("--shell=none");
             psi.ArgumentList.Add("--warmup");
             psi.ArgumentList.Add(options.EffectiveWarmup.ToString());
             psi.ArgumentList.Add("--runs");
@@ -113,6 +169,31 @@ internal static class HyperfineRunner
         finally
         {
             try { if (File.Exists(jsonFile)) File.Delete(jsonFile); } catch { }
+        }
+    }
+
+    private static bool ProbeShellNoneSupport()
+    {
+        try
+        {
+            ProcessStartInfo psi = new("hyperfine")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false
+            };
+            psi.ArgumentList.Add("--help");
+            using Process? proc = Process.Start(psi);
+            if (proc == null)
+                return false;
+
+            string help = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit(3000);
+            return proc.ExitCode == 0 && help.Contains("--shell", StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
         }
     }
 

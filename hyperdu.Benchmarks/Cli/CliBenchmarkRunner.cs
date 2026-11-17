@@ -157,8 +157,8 @@ internal static class CliBenchmarkRunner
                     probe = probe with { PeakRssKb = hyperfineRssKb };
                 }
 
-                double? speedup = (refTiming != null && timing is { MeanMs: > 0 })
-                    ? refTiming.MeanMs / timing.MeanMs
+                double? speedup = (refTiming is { MedianMs: > 0 } && timing is { MedianMs: > 0 })
+                    ? refTiming.MedianMs / timing.MedianMs
                     : null;
 
                 entries.Add(new BenchmarkEntryResult(

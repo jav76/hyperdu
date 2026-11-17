@@ -51,36 +51,44 @@ internal static class ComparatorRegistry
 
         if (hyperduBin != null)
         {
+            bool supportsNoUiFlag = DetectNoUiFlag(hyperduBin);
+            IReadOnlyDictionary<string, string> noUiEnv = supportsNoUiFlag
+                ? EmptyEnv
+                : new Dictionary<string, string> { ["HYPERDU_NO_UI"] = "1" };
+            IReadOnlyList<string>? noUiPrefix = supportsNoUiFlag ? ["--no-ui"] : null;
+            Dictionary<string, string> managedEnv = supportsNoUiFlag
+                ? new Dictionary<string, string> { ["HYPERDU_NATIVE_IO"] = "0" }
+                : new Dictionary<string, string> { ["HYPERDU_NO_UI"] = "1", ["HYPERDU_NATIVE_IO"] = "0" };
+
             hyperduNative = new ToolSpec(
                 Id: "hyperdu-native",
                 DisplayName: "hyperdu (native, auto-threads)",
                 Tier: ComparatorTier.Tier2Workload,
                 Executable: hyperduBin,
-                BaseEnvironment: new Dictionary<string, string> { ["HYPERDU_NO_UI"] = "1" },
+                BaseEnvironment: noUiEnv,
                 IsReferenceDu: false,
-                SupportsDuFlags: false);
+                SupportsDuFlags: false,
+                FixedPrefixArguments: noUiPrefix);
 
             hyperduSingle = new ToolSpec(
                 Id: "hyperdu-1t",
                 DisplayName: "hyperdu (native, 1-thread)",
                 Tier: ComparatorTier.Tier2Workload,
                 Executable: hyperduBin,
-                BaseEnvironment: new Dictionary<string, string> { ["HYPERDU_NO_UI"] = "1" },
+                BaseEnvironment: noUiEnv,
                 IsReferenceDu: false,
-                SupportsDuFlags: false);
+                SupportsDuFlags: false,
+                FixedPrefixArguments: noUiPrefix);
 
             hyperduManaged = new ToolSpec(
                 Id: "hyperdu-managed",
                 DisplayName: "hyperdu (managed I/O fallback)",
                 Tier: ComparatorTier.Tier2Workload,
                 Executable: hyperduBin,
-                BaseEnvironment: new Dictionary<string, string>
-                {
-                    ["HYPERDU_NO_UI"] = "1",
-                    ["HYPERDU_NATIVE_IO"] = "0"
-                },
+                BaseEnvironment: managedEnv,
                 IsReferenceDu: false,
-                SupportsDuFlags: false);
+                SupportsDuFlags: false,
+                FixedPrefixArguments: noUiPrefix);
 
             hasDuPersona = DetectDuPersona(hyperduBin, out string duExecutable, out bool usesSubcommand);
             IReadOnlyList<string>? duPrefix = usesSubcommand ? ["du"] : null;
@@ -205,7 +213,7 @@ internal static class ComparatorRegistry
     private static ScenarioDefinition BuildApparentSummarizeScenario(DiscoveredTools tools, FixtureSpec fixture)
     {
         List<CommandInvocation> invocations = new();
-        AddHyperduNoUiInvocations(tools, fixture.RootPath, invocations);
+        AddHyperduNoUiInvocations(tools, fixture.RootPath, invocations, ["--apparent-size"]);
 
         string[] duArgs = tools.ReferenceDuIsGnu
             ? ["--apparent-size", "-B1", "-s", fixture.RootPath]
@@ -313,8 +321,6 @@ internal static class ComparatorRegistry
         {
             invocations.Add(new CommandInvocation(tools.GoGdu, ["-n", "-p", fixture.RootPath], tools.GoGdu.BaseEnvironment));
         }
-
-        AddHyperduNoUiInvocations(tools, fixture.RootPath, invocations);
 
         return new ScenarioDefinition(
             Id: $"{fixture.Name}/depth-1",
@@ -428,13 +434,13 @@ internal static class ComparatorRegistry
     {
         string[] prefix = extraArgs ?? [];
         if (tools.HyperduNoUi != null)
-            invocations.Add(new CommandInvocation(tools.HyperduNoUi, [.. prefix, targetPath], tools.HyperduNoUi.BaseEnvironment));
+            invocations.Add(new CommandInvocation(tools.HyperduNoUi, WithPrefix(tools.HyperduNoUi, [.. prefix, targetPath]), tools.HyperduNoUi.BaseEnvironment));
 
         if (tools.HyperduNoUiSingleThread != null)
-            invocations.Add(new CommandInvocation(tools.HyperduNoUiSingleThread, ["-j", "1", .. prefix, targetPath], tools.HyperduNoUiSingleThread.BaseEnvironment));
+            invocations.Add(new CommandInvocation(tools.HyperduNoUiSingleThread, WithPrefix(tools.HyperduNoUiSingleThread, ["-j", "1", .. prefix, targetPath]), tools.HyperduNoUiSingleThread.BaseEnvironment));
 
         if (tools.HyperduNoUiManaged != null)
-            invocations.Add(new CommandInvocation(tools.HyperduNoUiManaged, [.. prefix, targetPath], tools.HyperduNoUiManaged.BaseEnvironment));
+            invocations.Add(new CommandInvocation(tools.HyperduNoUiManaged, WithPrefix(tools.HyperduNoUiManaged, [.. prefix, targetPath]), tools.HyperduNoUiManaged.BaseEnvironment));
     }
 
     private static List<FixtureSpec> SelectParityFixtures(IReadOnlyList<FixtureSpec> fixtures, BenchmarkSuite suite)
@@ -572,6 +578,12 @@ internal static class ComparatorRegistry
         }
 
         return FindOnPath("hyperdu");
+    }
+
+    private static bool DetectNoUiFlag(string hyperduBin)
+    {
+        (string _, int exitCode) = RunProbeProcess(hyperduBin, ["--no-ui", "--version"]);
+        return exitCode == 0;
     }
 
     private static bool DetectDuPersona(string hyperduBin, out string duExecutable, out bool usesSubcommand)
