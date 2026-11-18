@@ -398,7 +398,18 @@ def issue_highest_rank(issue: dict[str, Any]) -> int:
 
 
 def should_include_issue_in_sarif(issue: dict[str, Any]) -> bool:
-    """Include issues that are Major/MEDIUM or higher (Reliability, Security, Maintainability)."""
+    """Include only Security issues (MQR SECURITY impact or legacy VULNERABILITY) in SARIF."""
+    if str(issue.get("type", "")).upper() == "VULNERABILITY":
+        return True
+    for impact in issue.get("impacts") or []:
+        if isinstance(impact, dict):
+            if str(impact.get("softwareQuality", "")).upper() == "SECURITY":
+                return True
+    return False
+
+
+def should_include_issue_in_report(issue: dict[str, Any]) -> bool:
+    """Include issues that are Major/MEDIUM or higher (all qualities) in public reports."""
     if str(issue.get("severity", "")).upper() in LEGACY_SARIF_SEVERITIES:
         return True
     for impact in issue.get("impacts") or []:
@@ -1017,7 +1028,7 @@ def build_markdown_summary(
 
     if include_top_findings:
         ranked_issues = sorted(
-            [it for it in issues if should_include_issue_in_sarif(it)],
+            [it for it in issues if should_include_issue_in_report(it)],
             key=lambda it: (-issue_highest_rank(it), str(it.get("rule") or "")),
         )[:25]
         if ranked_issues or hotspots:
@@ -1143,7 +1154,7 @@ def build_html_report(
     )
 
     ranked_issues = sorted(
-        [it for it in issues if should_include_issue_in_sarif(it)],
+        [it for it in issues if should_include_issue_in_report(it)],
         key=lambda it: (-issue_highest_rank(it), str(it.get("rule") or "")),
     )[:50]
     finding_rows = []

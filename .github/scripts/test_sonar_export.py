@@ -203,38 +203,41 @@ class SonarExportTests(unittest.TestCase):
         project_key = "jav76_hyperdu"
         issues = [
             {
-                "key": "issue-major",
+                "key": "issue-reliability-excluded",
                 "component": f"{project_key}:hyperdu.Cli/Program.cs",
                 "rule": "csharpsquid:S6966",
+                "type": "CODE_SMELL",
                 "severity": "MAJOR",
                 "impacts": [{"softwareQuality": "RELIABILITY", "severity": "MEDIUM"}],
-                "message": "Await WriteLineAsync instead of WriteLine on https://sonarqube.local.jav26122.net",
+                "message": "Await WriteLineAsync instead of WriteLine",
                 "textRange": {"startLine": 358, "endLine": 358, "startOffset": 8, "endOffset": 30},
             },
             {
-                "key": "issue-mqr-high",
+                "key": "issue-mqr-security",
                 "component": f"{project_key}:hyperdu.Core\\Native\\NativeMethods.cs",
                 "rule": "csharpsquid:S6640",
                 "severity": "MINOR",
                 "impacts": [{"softwareQuality": "SECURITY", "severity": "HIGH"}],
-                "message": "Unsafe code block",
-                "line": 12,
+                "message": "Unsafe code block on https://sonarqube.local.jav26122.net",
+                "textRange": {"startLine": 12, "endLine": 12, "startOffset": 8, "endOffset": 30},
             },
             {
-                "key": "issue-blocker",
+                "key": "issue-legacy-vuln",
                 "component": project_key,
-                "rule": "roslyn:CA1000",
-                "severity": "BLOCKER",
+                "rule": "roslyn:CA5350",
+                "type": "VULNERABILITY",
+                "severity": "MAJOR",
                 "impacts": [],
-                "message": "Project level blocker",
+                "message": "Project level weak crypto",
             },
             {
-                "key": "issue-minor-excluded",
+                "key": "issue-maint-excluded",
                 "component": f"{project_key}:hyperdu.Cli/Other.cs",
-                "rule": "csharpsquid:S1234",
-                "severity": "MINOR",
-                "impacts": [{"softwareQuality": "MAINTAINABILITY", "severity": "LOW"}],
-                "message": "Minor style issue",
+                "rule": "csharpsquid:S3776",
+                "type": "CODE_SMELL",
+                "severity": "CRITICAL",
+                "impacts": [{"softwareQuality": "MAINTAINABILITY", "severity": "HIGH"}],
+                "message": "Cognitive complexity 22 > 15",
                 "line": 5,
             },
         ]
@@ -264,7 +267,7 @@ class SonarExportTests(unittest.TestCase):
             f"{project_key}:hyperdu.Cli/Program.cs": {"path": "hyperdu.Cli/Program.cs"},
         }
         rules = {
-            "csharpsquid:S6966": {"key": "csharpsquid:S6966", "name": "Awaitable method should be used"},
+            "csharpsquid:S6640": {"key": "csharpsquid:S6640", "name": "Unsafe code blocks should not be used"},
         }
 
         sarif = se.build_sarif(
@@ -283,34 +286,35 @@ class SonarExportTests(unittest.TestCase):
         self.assertEqual(run["tool"]["driver"]["informationUri"], "https://github.com/jav76/hyperdu")
 
         results = run["results"]
-        self.assertEqual(len(results), 5)  # 3 qualifying issues + 2 hotspots; minor issue excluded
+        self.assertEqual(len(results), 4)  # 2 security issues + 2 hotspots; reliability & maintainability excluded
         fps = [r["partialFingerprints"]["sonarIssueKey"] for r in results]
-        self.assertEqual(fps, ["issue-major", "issue-mqr-high", "issue-blocker", "hs-1", "hs-2"])
+        self.assertEqual(fps, ["issue-mqr-security", "issue-legacy-vuln", "hs-1", "hs-2"])
 
-        self.assertEqual(results[0]["level"], "warning")
+        self.assertEqual(results[0]["level"], "error")
         self.assertEqual(
-            results[0]["locations"][0]["physicalLocation"]["region"],
-            {"startLine": 358, "endLine": 358, "startColumn": 9, "endColumn": 31},
-        )
-        self.assertEqual(results[1]["level"], "error")
-        self.assertEqual(
-            results[1]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
             "hyperdu.Core/Native/NativeMethods.cs",
         )
-        self.assertEqual(results[2]["level"], "error")
         self.assertEqual(
-            results[2]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            results[0]["locations"][0]["physicalLocation"]["region"],
+            {"startLine": 12, "endLine": 12, "startColumn": 9, "endColumn": 31},
+        )
+        self.assertEqual(results[1]["level"], "warning")
+        self.assertEqual(
+            results[1]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
             ".",
         )
-        self.assertEqual(results[3]["level"], "error")
-        self.assertEqual(results[4]["level"], "note")
+        self.assertEqual(results[2]["level"], "error")
+        self.assertEqual(results[3]["level"], "note")
 
         driver_rules = {r["id"]: r for r in run["tool"]["driver"]["rules"]}
         self.assertEqual(
-            driver_rules["csharpsquid:S6966"]["helpUri"],
-            "https://rules.sonarsource.com/csharp/RSPEC-6966/",
+            driver_rules["csharpsquid:S6640"]["helpUri"],
+            "https://rules.sonarsource.com/csharp/RSPEC-6640/",
         )
-        self.assertNotIn("helpUri", driver_rules["roslyn:CA1000"])
+        self.assertNotIn("helpUri", driver_rules["roslyn:CA5350"])
+        self.assertNotIn("csharpsquid:S3776", driver_rules)
+        self.assertNotIn("csharpsquid:S6966", driver_rules)
 
     def test_generate_badges_native_and_fallback(self) -> None:
         measures = {
@@ -534,6 +538,9 @@ class SonarExportTests(unittest.TestCase):
             summary_text = summary_out.read_text(encoding="utf-8")
             self.assertIn("https://jav76.github.io/hyperdu/", summary_text)
             self.assertIn("\\| pipe line2", summary_text)
+
+            sarif_data = json.loads(sarif_out.read_text(encoding="utf-8"))
+            self.assertEqual(sarif_data["runs"][0]["results"], [])
 
     def test_main_redacts_secrets_on_http_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
