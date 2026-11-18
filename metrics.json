@@ -1,0 +1,87 @@
+{
+  "projectKey": "jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f",
+  "generatedAt": "2026-11-18T19:26:21Z",
+  "qualityGate": {
+    "status": "OK",
+    "conditions": [
+      {
+        "status": "OK",
+        "metricKey": "new_coverage",
+        "comparator": "LT",
+        "errorThreshold": "50",
+        "actualValue": "61.4"
+      },
+      {
+        "status": "OK",
+        "metricKey": "new_duplicated_lines_density",
+        "comparator": "GT",
+        "errorThreshold": "5",
+        "actualValue": "0.44142"
+      },
+      {
+        "status": "OK",
+        "metricKey": "new_software_quality_reliability_rating",
+        "comparator": "GT",
+        "errorThreshold": "2",
+        "actualValue": "1"
+      },
+      {
+        "status": "OK",
+        "metricKey": "new_software_quality_security_rating",
+        "comparator": "GT",
+        "errorThreshold": "2",
+        "actualValue": "2"
+      }
+    ]
+  },
+  "measures": {
+    "coverage": "59.8",
+    "reliability_rating": "1.0",
+    "duplicated_lines_density": "0.6",
+    "code_smells": "98",
+    "software_quality_security_rating": "2.0",
+    "security_rating": "2.0",
+    "software_quality_security_issues": "1",
+    "software_quality_maintainability_remediation_effort": "448",
+    "security_hotspots": "0",
+    "sqale_index": "448",
+    "sqale_rating": "1.0",
+    "bugs": "0",
+    "alert_status": "OK",
+    "software_quality_reliability_issues": "0",
+    "ncloc": "14396",
+    "software_quality_reliability_rating": "1.0",
+    "software_quality_maintainability_issues": "98",
+    "vulnerabilities": "1",
+    "software_quality_maintainability_rating": "1.0"
+  },
+  "issueSummary": {
+    "totalOpenIssues": 99,
+    "openHotspots": 0,
+    "sarifResults": 55,
+    "bySoftwareQuality": {
+      "RELIABILITY": 0,
+      "SECURITY": 1,
+      "MAINTAINABILITY": 98
+    },
+    "byImpactSeverity": {
+      "BLOCKER": 0,
+      "HIGH": 52,
+      "MEDIUM": 3,
+      "LOW": 1,
+      "INFO": 43
+    },
+    "byLegacySeverity": {
+      "BLOCKER": 0,
+      "CRITICAL": 52,
+      "MAJOR": 3,
+      "MINOR": 1,
+      "INFO": 43
+    }
+  },
+  "totalsReported": {
+    "issues": 99,
+    "hotspots": 0
+  },
+  "repoUrl": "https://github.com/jav76/hyperdu"
+}
