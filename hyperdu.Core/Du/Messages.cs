@@ -21,8 +21,6 @@ public static class Messages
 
     private static readonly byte[] CQuoteOpen = [(byte)'\''];
     private static readonly byte[] CQuoteClose = [(byte)'\''];
-    private static readonly byte[] Utf8QuoteOpen = [0xE2, 0x80, 0x98]; // U+2018
-    private static readonly byte[] Utf8QuoteClose = [0xE2, 0x80, 0x99]; // U+2019
 
     private static volatile CachedNumericLocale? s_cachedNumericLocale;
 

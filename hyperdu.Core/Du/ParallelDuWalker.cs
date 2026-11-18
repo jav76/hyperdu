@@ -146,7 +146,6 @@ public sealed unsafe class ParallelDuWalker
         public readonly int DirFd;
         public readonly NativeDirectory? FallbackDir;
         public readonly RawDirEntry[] RawEntries;
-        public readonly int RawCount;
         public readonly byte[] RawNameArena;
         public readonly ChunkSpec[] Chunks;
         public readonly int FinalReadErrno;
@@ -158,7 +157,6 @@ public sealed unsafe class ParallelDuWalker
             int dirFd,
             NativeDirectory? fallbackDir,
             RawDirEntry[] rawEntries,
-            int rawCount,
             byte[] rawNameArena,
             ChunkSpec[] chunks,
             int finalReadErrno)
@@ -167,7 +165,6 @@ public sealed unsafe class ParallelDuWalker
             DirFd = dirFd;
             FallbackDir = fallbackDir;
             RawEntries = rawEntries;
-            RawCount = rawCount;
             RawNameArena = rawNameArena;
             Chunks = chunks;
             FinalReadErrno = finalReadErrno;
@@ -587,11 +584,8 @@ public sealed unsafe class ParallelDuWalker
                 if (frame.EntryIndex == 0 && node.SingleSubdir != null && entries == null)
                 {
                     frame.EntryIndex = 1;
-                    if (!TryDescendSubdir(node, node.SingleSubdir, isSiblingAfterFirst: false, inlineScratch))
-                    {
-                        if (_stoppedEarly)
-                            break;
-                    }
+                    if (!TryDescendSubdir(node, node.SingleSubdir, isSiblingAfterFirst: false, inlineScratch) && _stoppedEarly)
+                        break;
 
                     continue;
                 }
@@ -712,7 +706,7 @@ public sealed unsafe class ParallelDuWalker
                     break;
                 }
 
-                ref EmitFrame parentFrame = ref _emitStack![_emitStackDepth - 1];
+                ref EmitFrame parentFrame = ref _emitStack[_emitStackDepth - 1];
                 parentFrame.DirectSubdirReportedBytes += dirResult.ReportedToParent;
                 parentFrame.SubdirFullBytes += dirResult.FullBytes;
                 DuAccounting.AccumulateSubdirTime(
@@ -879,10 +873,11 @@ public sealed unsafe class ParallelDuWalker
 
     private void WaitForNodeCompletion(DirNode node)
     {
-        if (Volatile.Read(ref node.State) == StatePending && _queue != null)
+        if (Volatile.Read(ref node.State) == StatePending
+            && _queue != null
+            && Interlocked.Exchange(ref node.Promoted, 1) == 0)
         {
-            if (Interlocked.Exchange(ref node.Promoted, 1) == 0)
-                _queue.PromoteToHigh(WorkItem.ForDir(node));
+            _queue.PromoteToHigh(WorkItem.ForDir(node));
         }
 
         lock (_emitterSync)
@@ -895,10 +890,11 @@ public sealed unsafe class ParallelDuWalker
                     if (_cancellationToken.IsCancellationRequested)
                         throw new OperationCanceledException(_cancellationToken);
 
-                    if (Volatile.Read(ref node.State) == StatePending && _queue != null)
+                    if (Volatile.Read(ref node.State) == StatePending
+                        && _queue != null
+                        && Interlocked.Exchange(ref node.Promoted, 1) == 0)
                     {
-                        if (Interlocked.Exchange(ref node.Promoted, 1) == 0)
-                            _queue.PromoteToHigh(WorkItem.ForDir(node));
+                        _queue.PromoteToHigh(WorkItem.ForDir(node));
                     }
 
                     Monitor.Wait(_emitterSync, 2);
@@ -1253,10 +1249,11 @@ public sealed unsafe class ParallelDuWalker
         if (node.SubdirCount > 1)
         {
             _pendingInlineSiblings += node.SubdirCount - 1;
-            if (_canEverFanOut && _pendingInlineSiblings >= FanOutSiblingThreshold)
+            if (_canEverFanOut
+                && _pendingInlineSiblings >= FanOutSiblingThreshold
+                && TryActivateWorkersFromInline(node, scratch))
             {
-                if (TryActivateWorkersFromInline(node, scratch))
-                    return null;
+                return null;
             }
         }
 
@@ -1380,7 +1377,6 @@ public sealed unsafe class ParallelDuWalker
             dirFd,
             fallbackDir,
             rawEntries,
-            rawCount,
             rawNames,
             chunks,
             finalReadErrno);
@@ -1542,7 +1538,7 @@ public sealed unsafe class ParallelDuWalker
             FinalizeLargeDirBatch(batch);
     }
 
-    private void ReleaseBatchResources(LargeDirBatch batch)
+    private static void ReleaseBatchResources(LargeDirBatch batch)
     {
         if (Interlocked.Exchange(ref batch.ResourcesReleased, 1) != 0)
             return;
@@ -1722,7 +1718,7 @@ public sealed unsafe class ParallelDuWalker
             EnsureWorkersSpawned(Math.Min(_maxWorkerBudget, _spawnedWorkers + Math.Max(2, queueCount / 2)));
     }
 
-    private int ComputeSubdirPriority(DirNode child, int siblingIndex, bool parentOnFrontier, ulong frontierDepth)
+    private static int ComputeSubdirPriority(DirNode child, int siblingIndex, bool parentOnFrontier, ulong frontierDepth)
     {
         if (parentOnFrontier && siblingIndex == 0)
             return ScanTier.High;
@@ -2325,7 +2321,7 @@ public sealed unsafe class ParallelDuWalker
         }
     }
 
-    private int ReadEntriesGetdents64(int dirFd, WorkerScratch scratch, out int errno)
+    private static int ReadEntriesGetdents64(int dirFd, WorkerScratch scratch, out int errno)
     {
         int rawCount = 0;
         int order = 0;

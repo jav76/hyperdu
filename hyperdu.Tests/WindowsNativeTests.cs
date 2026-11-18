@@ -283,7 +283,7 @@ public sealed partial class WindowsNativeTests
                 using FileStream fs = new(handle, FileAccess.Write);
                 byte[] data = new byte[16_384];
                 data.AsSpan().Fill(0x42);
-                fs.Write(data);
+                await fs.WriteAsync(data);
                 fs.Flush(flushToDisk: true);
             }
 
@@ -349,7 +349,7 @@ public sealed partial class WindowsNativeTests
         using TempTree tree = new();
 
         // > 1,200 entries ensures NtQueryDirectoryFile spans multiple 64 KB buffer pages cleanly.
-        string bulkDir = tree.Dir("bulk");
+        tree.Dir("bulk");
         for (int i = 0; i < 1_200; i++)
             tree.File($"bulk/item_{i:D4}.dat", 64);
 

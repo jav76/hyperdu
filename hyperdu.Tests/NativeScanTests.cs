@@ -196,6 +196,7 @@ public class NativeScanTests
         }
         catch (UnauthorizedAccessException)
         {
+            // Expected for non-root users when the directory permissions are 000.
         }
 
         try
