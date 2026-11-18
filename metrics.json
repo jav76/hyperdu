@@ -1,6 +1,6 @@
 {
   "projectKey": "jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f",
-  "generatedAt": "2026-11-18T19:55:03Z",
+  "generatedAt": "2026-11-18T20:03:15Z",
   "qualityGate": {
     "status": "OK",
     "conditions": [
@@ -9,7 +9,7 @@
         "metricKey": "new_coverage",
         "comparator": "LT",
         "errorThreshold": "50",
-        "actualValue": "61.2"
+        "actualValue": "61.1"
       },
       {
         "status": "OK",
@@ -35,7 +35,7 @@
     ]
   },
   "measures": {
-    "coverage": "59.6",
+    "coverage": "59.5",
     "reliability_rating": "1.0",
     "duplicated_lines_density": "0.6",
     "code_smells": "69",
