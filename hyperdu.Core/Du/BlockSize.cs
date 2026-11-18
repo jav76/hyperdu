@@ -284,7 +284,6 @@ public static class BlockSize
         int i = 0;
         bool negative = SkipWhitespaceAndSign(raw, ref i);
 
-        int digitStart = i;
         ulong acc = 0;
         ulong limit = negative ? 0x8000000000000000UL : (ulong)long.MaxValue;
         while (i < raw.Length && char.IsAsciiDigit(raw[i]))
@@ -300,7 +299,7 @@ public static class BlockSize
             i++;
         }
 
-        endIdx = i == digitStart ? i : i;
+        endIdx = i;
         if (overflow)
             return negative ? long.MinValue : long.MaxValue;
 

@@ -283,7 +283,7 @@ public sealed partial class WindowsNativeTests
                 using FileStream fs = new(handle, FileAccess.Write);
                 byte[] data = new byte[16_384];
                 data.AsSpan().Fill(0x42);
-                fs.Write(data);
+                await fs.WriteAsync(data);
                 fs.Flush(flushToDisk: true);
             }
 

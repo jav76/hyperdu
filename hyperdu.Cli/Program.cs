@@ -355,7 +355,7 @@ public static class Program
         string targetPath = parsed.TargetPath;
         if (!ParallelScanner.DirectoryExistsPathSafe(targetPath))
         {
-            Console.Error.WriteLine($"{programName}: target directory does not exist: {targetPath}");
+            await Console.Error.WriteLineAsync($"{programName}: target directory does not exist: {targetPath}");
             return 1;
         }
 

@@ -335,7 +335,7 @@ public sealed partial class NativeDeepChainPerfTests
         // Also verify pre-canceled token throws OperationCanceledException without leaking FDs.
         using (CancellationTokenSource preCanceled = new())
         {
-            preCanceled.Cancel();
+            await preCanceled.CancelAsync();
             ParallelScanner preCancelScanner = new(new ScanOptions { WorkerCount = 4, UseNativeIo = true });
             await Assert.ThrowsAnyAsync<OperationCanceledException>(
                 () => preCancelScanner.ScanAsync(fixture.Root, null, preCanceled.Token));
@@ -392,7 +392,7 @@ public sealed partial class NativeDeepChainPerfTests
             Task<DirectoryNode> activeScanTask = activeCancelScanner.ScanAsync(fixture.Root, null, activeCts.Token);
             if (activeCancelScanner.IsScanning)
                 activeCancelScanner.Pause();
-            activeCts.Cancel();
+            await activeCts.CancelAsync();
             DirectoryNode canceledNode = await activeScanTask;
             Assert.NotNull(canceledNode);
             Assert.False(activeCancelScanner.IsScanning);

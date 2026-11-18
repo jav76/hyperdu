@@ -163,7 +163,7 @@ public sealed class TuiCliPhase62Tests
         tree.File("sub/node_modules/nested.bin", 16_384);
 
         string excludeFile = Path.Combine(tree.Root, ".patterns");
-        File.WriteAllText(excludeFile, "*.tmp\nnode_modules\n.patterns\n");
+        await File.WriteAllTextAsync(excludeFile, "*.tmp\nnode_modules\n.patterns\n");
 
         foreach (bool useNative in new[] { true, false })
         {
