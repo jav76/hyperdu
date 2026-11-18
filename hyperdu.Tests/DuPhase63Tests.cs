@@ -117,7 +117,7 @@ public sealed partial class DuPhase63Tests
         (DuParseOutcome okOutcome, DuOptions? okOpts, _, string okErr) = ParseArgs(["targetDir", "-s"]);
         Assert.Equal(DuParseOutcome.Run, okOutcome);
         Assert.NotNull(okOpts);
-        Assert.False(okOpts!.Summarize);
+        Assert.False(okOpts.Summarize);
         Assert.Equal(["targetDir", "-s"], okOpts.Operands);
         Assert.Equal(string.Empty, okErr);
 
@@ -171,7 +171,7 @@ public sealed partial class DuPhase63Tests
         (DuParseOutcome gOutcome, DuOptions? gOpts, _, _) = ParseArgs(["-A", "-g", "-n", "-r", "-l", "-I", "*.tmp", "root"]);
         Assert.Equal(DuParseOutcome.Run, gOutcome);
         Assert.NotNull(gOpts);
-        Assert.True(gOpts!.ApparentSize);
+        Assert.True(gOpts.ApparentSize);
         Assert.True(gOpts.IgnoreNoDump);
         Assert.True(gOpts.CountLinks);
         Assert.Equal(1073741824UL, gOpts.BlockSizeSpec.Scale);

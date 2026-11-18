@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 
 namespace hyperdu.Tests;
 
+[AttributeUsage(AttributeTargets.Method)]
 public sealed class UnixFactAttribute : FactAttribute
 {
     public UnixFactAttribute()
@@ -11,6 +12,7 @@ public sealed class UnixFactAttribute : FactAttribute
     }
 }
 
+[AttributeUsage(AttributeTargets.Method)]
 public sealed class WindowsFactAttribute : FactAttribute
 {
     public WindowsFactAttribute()
@@ -20,6 +22,7 @@ public sealed class WindowsFactAttribute : FactAttribute
     }
 }
 
+[AttributeUsage(AttributeTargets.Method)]
 public sealed class LinuxFactAttribute : FactAttribute
 {
     public LinuxFactAttribute(string reason)

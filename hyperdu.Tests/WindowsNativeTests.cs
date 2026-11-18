@@ -349,7 +349,7 @@ public sealed partial class WindowsNativeTests
         using TempTree tree = new();
 
         // > 1,200 entries ensures NtQueryDirectoryFile spans multiple 64 KB buffer pages cleanly.
-        string bulkDir = tree.Dir("bulk");
+        tree.Dir("bulk");
         for (int i = 0; i < 1_200; i++)
             tree.File($"bulk/item_{i:D4}.dat", 64);
 

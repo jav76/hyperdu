@@ -295,6 +295,26 @@ def poll_ce_task(
         sleep_fn(min(poll_interval, remaining))
 
 
+def _merge_search_metadata(
+    data: dict[str, Any],
+    components_by_key: dict[str, dict[str, Any]],
+    rules_by_key: dict[str, dict[str, Any]],
+) -> None:
+    for comp in data.get("components") or []:
+        if isinstance(comp, dict) and comp.get("key"):
+            components_by_key[str(comp["key"])] = comp
+    for rule in data.get("rules") or []:
+        if isinstance(rule, dict) and rule.get("key"):
+            rules_by_key[str(rule["key"])] = rule
+
+
+def _extract_reported_total(data: dict[str, Any], fallback: int) -> int:
+    paging = data.get("paging") or {}
+    if isinstance(paging, dict) and "total" in paging:
+        return int(paging["total"])
+    return fallback
+
+
 def fetch_paginated_items(
     client: SonarApiClient,
     path: str,
@@ -312,35 +332,27 @@ def fetch_paginated_items(
     page = 1
 
     while True:
-        params = dict(base_params)
-        params["ps"] = page_size
-        params["p"] = page
+        params = {**base_params, "ps": page_size, "p": page}
         data = client.get_json(path, params)
-
-        for comp in data.get("components") or []:
-            if isinstance(comp, dict) and comp.get("key"):
-                components_by_key[str(comp["key"])] = comp
-        for rule in data.get("rules") or []:
-            if isinstance(rule, dict) and rule.get("key"):
-                rules_by_key[str(rule["key"])] = rule
+        _merge_search_metadata(data, components_by_key, rules_by_key)
 
         items = [it for it in (data.get(items_key) or []) if isinstance(it, dict)]
         all_items.extend(items)
+        reported_total = _extract_reported_total(data, len(all_items))
 
-        paging = data.get("paging") or {}
-        if isinstance(paging, dict) and "total" in paging:
-            reported_total = int(paging["total"])
-        else:
-            reported_total = len(all_items)
-
-        if not items:
-            break
         effective_cap = min(reported_total, max_results)
-        if page * page_size >= effective_cap or len(all_items) >= max_results:
+        if not items or page * page_size >= effective_cap or len(all_items) >= max_results:
             break
         page += 1
 
     return all_items, components_by_key, rules_by_key, reported_total
+
+
+def _normalize_rel_path(raw: str) -> str:
+    cleaned = raw.replace("\\", "/").lstrip("/")
+    if cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    return cleaned
 
 
 def resolve_repo_relative_path(
@@ -350,16 +362,13 @@ def resolve_repo_relative_path(
 ) -> str:
     """Map a SonarQube component key to a clean repository-relative POSIX path."""
     comp = components_by_key.get(component_key)
-    if comp:
-        raw_path = comp.get("path") or ""
-        if raw_path:
-            cleaned = str(raw_path).replace("\\", "/").lstrip("/")
-            if cleaned.startswith("./"):
-                cleaned = cleaned[2:]
-            if cleaned:
-                return cleaned
+    raw_path = (comp or {}).get("path") or ""
+    if raw_path:
+        cleaned = _normalize_rel_path(str(raw_path))
+        if cleaned:
+            return cleaned
 
-    if component_key == project_key or not component_key:
+    if not component_key or component_key == project_key:
         return "."
 
     prefix = f"{project_key}:"
@@ -370,10 +379,7 @@ def resolve_repo_relative_path(
     else:
         rel = component_key
 
-    rel = rel.replace("\\", "/").lstrip("/")
-    if rel.startswith("./"):
-        rel = rel[2:]
-    return rel or "."
+    return _normalize_rel_path(rel) or "."
 
 
 def rule_help_uri(rule_key: str) -> str | None:
@@ -447,6 +453,113 @@ def build_region(item: dict[str, Any]) -> dict[str, int] | None:
     return None
 
 
+def _ensure_sarif_rule(
+    rule_descriptors: dict[str, dict[str, Any]],
+    rules_by_key: dict[str, dict[str, Any]],
+    rule_key: str,
+    host_url: str | None,
+    fallback_name: str | None = None,
+) -> None:
+    if rule_key in rule_descriptors:
+        return
+    meta = rules_by_key.get(rule_key, {})
+    name = str(meta.get("name") or fallback_name or rule_key)
+    desc: dict[str, Any] = {
+        "id": rule_key,
+        "name": name,
+        "shortDescription": {"text": sanitize_text(name, host_url=host_url)},
+    }
+    help_url = rule_help_uri(rule_key)
+    if help_url:
+        desc["helpUri"] = help_url
+    rule_descriptors[rule_key] = desc
+
+
+def _build_physical_location(
+    item: dict[str, Any],
+    project_key: str,
+    components_by_key: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    rel_path = resolve_repo_relative_path(
+        str(item.get("component") or ""),
+        project_key,
+        components_by_key,
+    )
+    physical_location: dict[str, Any] = {
+        "artifactLocation": {
+            "uri": rel_path,
+            "uriBaseId": "%SRCROOT%",
+        }
+    }
+    region = build_region(item)
+    if region:
+        physical_location["region"] = region
+    return physical_location
+
+
+def _issue_to_sarif_result(
+    issue: dict[str, Any],
+    *,
+    project_key: str,
+    components_by_key: dict[str, dict[str, Any]],
+    host_url: str | None,
+) -> dict[str, Any]:
+    rule_key = str(issue.get("rule") or "sonarqube:unknown")
+    physical_location = _build_physical_location(issue, project_key, components_by_key)
+    rank = issue_highest_rank(issue)
+    message_text = sanitize_text(str(issue.get("message") or rule_key), host_url=host_url)
+    impacts = [
+        f"{imp.get('softwareQuality')}:{imp.get('severity')}"
+        for imp in (issue.get("impacts") or [])
+        if isinstance(imp, dict)
+    ]
+    return {
+        "ruleId": rule_key,
+        "level": rank_to_sarif_level(rank),
+        "message": {"text": message_text},
+        "locations": [{"physicalLocation": physical_location}],
+        "partialFingerprints": {"sonarIssueKey": str(issue.get("key") or "")},
+        "properties": {
+            "kind": "issue",
+            "legacySeverity": str(issue.get("severity") or ""),
+            "impacts": impacts,
+            "issueStatus": str(issue.get("issueStatus") or issue.get("status") or ""),
+        },
+    }
+
+
+def _hotspot_to_sarif_result(
+    hotspot: dict[str, Any],
+    *,
+    project_key: str,
+    components_by_key: dict[str, dict[str, Any]],
+    host_url: str | None,
+) -> tuple[str, str, dict[str, Any]]:
+    rule_key = str(hotspot.get("ruleKey") or "sonarqube:security-hotspot")
+    category = str(hotspot.get("securityCategory") or "security-hotspot")
+    physical_location = _build_physical_location(hotspot, project_key, components_by_key)
+    prob = str(hotspot.get("vulnerabilityProbability") or "MEDIUM").upper()
+    rank = SEVERITY_RANK.get(prob, 3)
+    message_text = sanitize_text(
+        str(hotspot.get("message") or f"Security Hotspot ({category})"),
+        host_url=host_url,
+    )
+    result = {
+        "ruleId": rule_key,
+        "level": rank_to_sarif_level(rank),
+        "message": {"text": f"[Security Hotspot - {prob}] {message_text}"},
+        "locations": [{"physicalLocation": physical_location}],
+        "partialFingerprints": {"sonarIssueKey": str(hotspot.get("key") or "")},
+        "properties": {
+            "kind": "security_hotspot",
+            "securityCategory": category,
+            "vulnerabilityProbability": prob,
+            "status": str(hotspot.get("status") or "TO_REVIEW"),
+        },
+    }
+    return rule_key, category, result
+
+
 def build_sarif(
     *,
     project_key: str,
@@ -464,111 +577,35 @@ def build_sarif(
     rule_descriptors: dict[str, dict[str, Any]] = {}
     results: list[dict[str, Any]] = []
 
-    def ensure_rule(rule_key: str, fallback_name: str | None = None) -> None:
-        if rule_key in rule_descriptors:
-            return
-        meta = rules_by_key.get(rule_key, {})
-        name = str(meta.get("name") or fallback_name or rule_key)
-        desc: dict[str, Any] = {
-            "id": rule_key,
-            "name": name,
-            "shortDescription": {"text": sanitize_text(name, host_url=host_url)},
-        }
-        help_url = rule_help_uri(rule_key)
-        if help_url:
-            desc["helpUri"] = help_url
-        rule_descriptors[rule_key] = desc
-
     for issue in issues:
         if not should_include_issue_in_sarif(issue):
             continue
         rule_key = str(issue.get("rule") or "sonarqube:unknown")
-        ensure_rule(rule_key)
-        rel_path = resolve_repo_relative_path(
-            str(issue.get("component") or ""),
-            project_key,
-            components_by_key,
-        )
-        physical_location: dict[str, Any] = {
-            "artifactLocation": {
-                "uri": rel_path,
-                "uriBaseId": "%SRCROOT%",
-            }
-        }
-        region = build_region(issue)
-        if region:
-            physical_location["region"] = region
-
-        rank = issue_highest_rank(issue)
-        message_text = sanitize_text(
-            str(issue.get("message") or rule_key),
-            host_url=host_url,
-        )
-        impacts = [
-            f"{imp.get('softwareQuality')}:{imp.get('severity')}"
-            for imp in (issue.get("impacts") or [])
-            if isinstance(imp, dict)
-        ]
+        _ensure_sarif_rule(rule_descriptors, rules_by_key, rule_key, host_url)
         results.append(
-            {
-                "ruleId": rule_key,
-                "level": rank_to_sarif_level(rank),
-                "message": {"text": message_text},
-                "locations": [{"physicalLocation": physical_location}],
-                "partialFingerprints": {
-                    "sonarIssueKey": str(issue.get("key") or ""),
-                },
-                "properties": {
-                    "kind": "issue",
-                    "legacySeverity": str(issue.get("severity") or ""),
-                    "impacts": impacts,
-                    "issueStatus": str(issue.get("issueStatus") or issue.get("status") or ""),
-                },
-            }
+            _issue_to_sarif_result(
+                issue,
+                project_key=project_key,
+                components_by_key=components_by_key,
+                host_url=host_url,
+            )
         )
 
     for hotspot in hotspots:
-        rule_key = str(hotspot.get("ruleKey") or "sonarqube:security-hotspot")
-        category = str(hotspot.get("securityCategory") or "security-hotspot")
-        ensure_rule(rule_key, fallback_name=f"Security Hotspot ({category})")
-        rel_path = resolve_repo_relative_path(
-            str(hotspot.get("component") or ""),
-            project_key,
-            components_by_key,
-        )
-        physical_location = {
-            "artifactLocation": {
-                "uri": rel_path,
-                "uriBaseId": "%SRCROOT%",
-            }
-        }
-        region = build_region(hotspot)
-        if region:
-            physical_location["region"] = region
-
-        prob = str(hotspot.get("vulnerabilityProbability") or "MEDIUM").upper()
-        rank = SEVERITY_RANK.get(prob, 3)
-        message_text = sanitize_text(
-            str(hotspot.get("message") or f"Security Hotspot ({category})"),
+        rule_key, category, result = _hotspot_to_sarif_result(
+            hotspot,
+            project_key=project_key,
+            components_by_key=components_by_key,
             host_url=host_url,
         )
-        results.append(
-            {
-                "ruleId": rule_key,
-                "level": rank_to_sarif_level(rank),
-                "message": {"text": f"[Security Hotspot - {prob}] {message_text}"},
-                "locations": [{"physicalLocation": physical_location}],
-                "partialFingerprints": {
-                    "sonarIssueKey": str(hotspot.get("key") or ""),
-                },
-                "properties": {
-                    "kind": "security_hotspot",
-                    "securityCategory": category,
-                    "vulnerabilityProbability": prob,
-                    "status": str(hotspot.get("status") or "TO_REVIEW"),
-                },
-            }
+        _ensure_sarif_rule(
+            rule_descriptors,
+            rules_by_key,
+            rule_key,
+            host_url,
+            fallback_name=f"Security Hotspot ({category})",
         )
+        results.append(result)
 
     return {
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
@@ -701,6 +738,46 @@ def render_static_badge_svg(label: str, value: str, color: str) -> str:
     )
 
 
+_GATE_BADGE_MAP = {
+    "OK": ("passed", "#4c1"),
+    "WARN": ("warning", "#dfb317"),
+    "ERROR": ("failed", "#e05d44"),
+}
+
+
+def _fetch_remote_badge_svg(
+    client: SonarApiClient | None,
+    project_key: str,
+    badge_token: str | None,
+    kind: str,
+    metrics_to_try: list[str],
+) -> str | None:
+    if not client or not badge_token:
+        return None
+    if kind == "quality_gate":
+        try:
+            raw = client.get_bytes(
+                "/api/project_badges/quality_gate",
+                {"project": project_key, "token": badge_token},
+                authenticated=False,
+            ).decode("utf-8", errors="replace")
+            return raw if "<svg" in raw.lower() else None
+        except Exception:
+            return None
+    for metric in metrics_to_try:
+        try:
+            raw = client.get_bytes(
+                "/api/project_badges/measure",
+                {"project": project_key, "metric": metric, "token": badge_token},
+                authenticated=False,
+            ).decode("utf-8", errors="replace")
+            if "<svg" in raw.lower() and "invalid" not in raw.lower():
+                return raw
+        except Exception:
+            continue
+    return None
+
+
 def generate_badges(
     client: SonarApiClient | None,
     project_key: str,
@@ -710,14 +787,7 @@ def generate_badges(
 ) -> dict[str, str]:
     """Return {filename: svg_text} for the 7 public badges."""
     gate_upper = (gate_status or measures.get("alert_status") or "NONE").upper()
-    if gate_upper == "OK":
-        gate_label, gate_color = ("passed", "#4c1")
-    elif gate_upper == "WARN":
-        gate_label, gate_color = ("warning", "#dfb317")
-    elif gate_upper == "ERROR":
-        gate_label, gate_color = ("failed", "#e05d44")
-    else:
-        gate_label, gate_color = (gate_upper.lower(), "#9f9f9f")
+    gate_label, gate_color = _GATE_BADGE_MAP.get(gate_upper, (gate_upper.lower(), "#9f9f9f"))
 
     rel_grade, rel_color = format_rating(
         measures.get("software_quality_reliability_rating") or measures.get("reliability_rating")
@@ -767,35 +837,8 @@ def generate_badges(
 
     badges: dict[str, str] = {}
     for filename, kind, metrics_to_try, fallback in specs:
-        svg_text: str | None = None
-        if client and badge_token:
-            if kind == "quality_gate":
-                try:
-                    raw = client.get_bytes(
-                        "/api/project_badges/quality_gate",
-                        {"project": project_key, "token": badge_token},
-                        authenticated=False,
-                    ).decode("utf-8", errors="replace")
-                    if "<svg" in raw.lower():
-                        svg_text = raw
-                except Exception:
-                    svg_text = None
-            else:
-                for metric in metrics_to_try:
-                    try:
-                        raw = client.get_bytes(
-                            "/api/project_badges/measure",
-                            {"project": project_key, "metric": metric, "token": badge_token},
-                            authenticated=False,
-                        ).decode("utf-8", errors="replace")
-                        if "<svg" in raw.lower() and "invalid" not in raw.lower():
-                            svg_text = raw
-                            break
-                    except Exception:
-                        continue
-        if not svg_text:
-            svg_text = render_static_badge_svg(*fallback)
-        badges[filename] = svg_text
+        svg_text = _fetch_remote_badge_svg(client, project_key, badge_token, kind, metrics_to_try)
+        badges[filename] = svg_text or render_static_badge_svg(*fallback)
     return badges
 
 
@@ -853,6 +896,22 @@ def fetch_optional_cnes_reports(
     return extracted
 
 
+def _tally_issue_impacts(
+    issue: dict[str, Any],
+    by_quality: dict[str, int],
+    by_impact_severity: dict[str, int],
+) -> None:
+    for imp in issue.get("impacts") or []:
+        if not isinstance(imp, dict):
+            continue
+        sq = str(imp.get("softwareQuality") or "").upper()
+        sev = str(imp.get("severity") or "").upper()
+        if sq:
+            by_quality[sq] = by_quality.get(sq, 0) + 1
+        if sev:
+            by_impact_severity[sev] = by_impact_severity.get(sev, 0) + 1
+
+
 def summarize_issues(
     issues: list[dict[str, Any]],
     hotspots: list[dict[str, Any]],
@@ -870,16 +929,7 @@ def summarize_issues(
         leg = str(issue.get("severity") or "").upper()
         if leg:
             by_legacy_severity[leg] = by_legacy_severity.get(leg, 0) + 1
-        impacts = issue.get("impacts") or []
-        for imp in impacts:
-            if not isinstance(imp, dict):
-                continue
-            sq = str(imp.get("softwareQuality") or "").upper()
-            sev = str(imp.get("severity") or "").upper()
-            if sq:
-                by_quality[sq] = by_quality.get(sq, 0) + 1
-            if sev:
-                by_impact_severity[sev] = by_impact_severity.get(sev, 0) + 1
+        _tally_issue_impacts(issue, by_quality, by_impact_severity)
 
     return {
         "totalOpenIssues": len(issues),
@@ -937,6 +987,91 @@ def build_public_metrics_payload(
 
 def md_cell(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
+
+
+def _format_issue_sev_label(issue: dict[str, Any]) -> str:
+    sev = str(issue.get("severity") or "")
+    imp_sevs = [
+        str(i.get("severity"))
+        for i in (issue.get("impacts") or [])
+        if isinstance(i, dict) and i.get("severity")
+    ]
+    return "/".join([s for s in [sev, *imp_sevs] if s]) or "MEDIUM"
+
+
+def _format_item_location(
+    item: dict[str, Any],
+    project_key: str,
+    components_by_key: dict[str, dict[str, Any]],
+) -> tuple[str, Any, str]:
+    rel_path = resolve_repo_relative_path(
+        str(item.get("component") or ""),
+        project_key,
+        components_by_key,
+    )
+    line_no = item.get("line") or (item.get("textRange") or {}).get("startLine")
+    loc_text = f"{rel_path}:{line_no}" if line_no else rel_path
+    return rel_path, line_no, loc_text
+
+
+def _format_md_conditions(conditions: list[dict[str, Any]]) -> list[str]:
+    if not conditions:
+        return []
+    lines = [
+        "",
+        "### Quality Gate Conditions",
+        "",
+        "| Metric | Status | Actual | Threshold |",
+        "| :--- | :--- | :--- | :--- |",
+    ]
+    for cond in conditions:
+        thresh = cond.get("errorThreshold")
+        comp = cond.get("comparator") or ""
+        thresh_str = f"{comp} {thresh}".strip() if thresh is not None else "-"
+        lines.append(
+            f"| `{md_cell(cond.get('metricKey'))}` | {md_cell(cond.get('status'))} "
+            f"| {md_cell(cond.get('actualValue', '-'))} | {md_cell(thresh_str)} |"
+        )
+    return lines
+
+
+def _format_md_findings(
+    project_key: str,
+    issues: list[dict[str, Any]],
+    hotspots: list[dict[str, Any]],
+    components_by_key: dict[str, dict[str, Any]],
+    host_url: str | None,
+) -> list[str]:
+    ranked_issues = sorted(
+        [it for it in issues if should_include_issue_in_report(it)],
+        key=lambda it: (-issue_highest_rank(it), str(it.get("rule") or "")),
+    )[:25]
+    if not ranked_issues and not hotspots:
+        return []
+    lines = [
+        "",
+        "### Top Findings (Major / MEDIUM+ and Open Hotspots)",
+        "",
+        "| Kind | Severity | Rule | Location | Message |",
+        "| :--- | :--- | :--- | :--- | :--- |",
+    ]
+    for issue in ranked_issues:
+        _, _, loc = _format_item_location(issue, project_key, components_by_key)
+        sev_label = _format_issue_sev_label(issue)
+        msg = sanitize_text(str(issue.get("message") or ""), host_url=host_url)
+        lines.append(
+            f"| Issue | {md_cell(sev_label)} | `{md_cell(issue.get('rule'))}` "
+            f"| `{md_cell(loc)}` | {md_cell(msg)} |"
+        )
+    for hs in hotspots[:10]:
+        _, _, loc = _format_item_location(hs, project_key, components_by_key)
+        prob = str(hs.get("vulnerabilityProbability") or "MEDIUM")
+        msg = sanitize_text(str(hs.get("message") or ""), host_url=host_url)
+        lines.append(
+            f"| Hotspot | {md_cell(prob)} | `{md_cell(hs.get('ruleKey'))}` "
+            f"| `{md_cell(loc)}` | {md_cell(msg)} |"
+        )
+    return lines
 
 
 def build_markdown_summary(
@@ -1005,77 +1140,11 @@ def build_markdown_summary(
             f"| SARIF Exported Findings | {summary['sarifResults']} |",
         ]
     )
-
-    conditions = gate.get("conditions") or []
-    if conditions:
-        lines.extend(
-            [
-                "",
-                "### Quality Gate Conditions",
-                "",
-                "| Metric | Status | Actual | Threshold |",
-                "| :--- | :--- | :--- | :--- |",
-            ]
-        )
-        for cond in conditions:
-            thresh = cond.get("errorThreshold")
-            comp = cond.get("comparator") or ""
-            thresh_str = f"{comp} {thresh}".strip() if thresh is not None else "-"
-            lines.append(
-                f"| `{md_cell(cond.get('metricKey'))}` | {md_cell(cond.get('status'))} "
-                f"| {md_cell(cond.get('actualValue', '-'))} | {md_cell(thresh_str)} |"
-            )
-
+    lines.extend(_format_md_conditions(gate.get("conditions") or []))
     if include_top_findings:
-        ranked_issues = sorted(
-            [it for it in issues if should_include_issue_in_report(it)],
-            key=lambda it: (-issue_highest_rank(it), str(it.get("rule") or "")),
-        )[:25]
-        if ranked_issues or hotspots:
-            lines.extend(
-                [
-                    "",
-                    "### Top Findings (Major / MEDIUM+ and Open Hotspots)",
-                    "",
-                    "| Kind | Severity | Rule | Location | Message |",
-                    "| :--- | :--- | :--- | :--- | :--- |",
-                ]
-            )
-            for issue in ranked_issues:
-                rel_path = resolve_repo_relative_path(
-                    str(issue.get("component") or ""),
-                    project_key,
-                    components_by_key,
-                )
-                line_no = issue.get("line") or (issue.get("textRange") or {}).get("startLine")
-                loc = f"{rel_path}:{line_no}" if line_no else rel_path
-                sev = str(issue.get("severity") or "")
-                imp_sevs = [
-                    str(i.get("severity"))
-                    for i in (issue.get("impacts") or [])
-                    if isinstance(i, dict) and i.get("severity")
-                ]
-                sev_label = "/".join([s for s in [sev, *imp_sevs] if s]) or "MEDIUM"
-                msg = sanitize_text(str(issue.get("message") or ""), host_url=host_url)
-                lines.append(
-                    f"| Issue | {md_cell(sev_label)} | `{md_cell(issue.get('rule'))}` "
-                    f"| `{md_cell(loc)}` | {md_cell(msg)} |"
-                )
-            for hs in hotspots[:10]:
-                rel_path = resolve_repo_relative_path(
-                    str(hs.get("component") or ""),
-                    project_key,
-                    components_by_key,
-                )
-                line_no = hs.get("line")
-                loc = f"{rel_path}:{line_no}" if line_no else rel_path
-                prob = str(hs.get("vulnerabilityProbability") or "MEDIUM")
-                msg = sanitize_text(str(hs.get("message") or ""), host_url=host_url)
-                lines.append(
-                    f"| Hotspot | {md_cell(prob)} | `{md_cell(hs.get('ruleKey'))}` "
-                    f"| `{md_cell(loc)}` | {md_cell(msg)} |"
-                )
-
+        lines.extend(
+            _format_md_findings(project_key, issues, hotspots, components_by_key, host_url)
+        )
     if cnes_files:
         lines.extend(["", "### Additional Exports", ""])
         for fname in sorted(cnes_files):
@@ -1083,6 +1152,93 @@ def build_markdown_summary(
 
     lines.append("")
     return "\n".join(lines)
+
+
+def _format_html_conditions(conditions: list[dict[str, Any]]) -> str:
+    if not conditions:
+        return "<p>No Quality Gate conditions reported.</p>"
+    cond_rows = []
+    for cond in conditions:
+        c_status = html.escape(str(cond.get("status") or ""), quote=True)
+        c_metric = html.escape(str(cond.get("metricKey") or ""), quote=True)
+        c_actual = html.escape(str(cond.get("actualValue") or "-"), quote=True)
+        thresh = cond.get("errorThreshold")
+        comp = str(cond.get("comparator") or "")
+        thresh_str = html.escape(f"{comp} {thresh}".strip() if thresh is not None else "-", quote=True)
+        cond_rows.append(
+            f"<tr><td><code>{c_metric}</code></td><td>{c_status}</td>"
+            f"<td>{c_actual}</td><td>{thresh_str}</td></tr>"
+        )
+    return (
+        "<table><thead><tr><th>Metric</th><th>Status</th><th>Actual</th><th>Threshold</th></tr></thead>"
+        f"<tbody>{''.join(cond_rows)}</tbody></table>"
+    )
+
+
+def _format_html_loc_cell(
+    rel_path: str,
+    line_no: Any,
+    loc_text: str,
+    repo_url: str | None,
+) -> str:
+    safe_loc = html.escape(loc_text, quote=True)
+    if not repo_url or rel_path == ".":
+        return f"<code>{safe_loc}</code>"
+    encoded_path = "/".join(urllib.parse.quote(part) for part in rel_path.split("/"))
+    anchor = f"#L{int(line_no)}" if line_no else ""
+    href = html.escape(f"{repo_url}/blob/HEAD/{encoded_path}{anchor}", quote=True)
+    return f'<a href="{href}"><code>{safe_loc}</code></a>'
+
+
+def _format_html_findings(
+    project_key: str,
+    issues: list[dict[str, Any]],
+    hotspots: list[dict[str, Any]],
+    components_by_key: dict[str, dict[str, Any]],
+    *,
+    repo_url: str | None,
+    host_url: str | None,
+) -> str:
+    ranked_issues = sorted(
+        [it for it in issues if should_include_issue_in_report(it)],
+        key=lambda it: (-issue_highest_rank(it), str(it.get("rule") or "")),
+    )[:50]
+    finding_rows = []
+    for issue in ranked_issues:
+        rel_path, line_no, loc_text = _format_item_location(issue, project_key, components_by_key)
+        loc_cell = _format_html_loc_cell(rel_path, line_no, loc_text, repo_url)
+        rule_key = str(issue.get("rule") or "")
+        safe_rule = html.escape(rule_key, quote=True)
+        h_uri = rule_help_uri(rule_key)
+        rule_cell = (
+            f'<a href="{html.escape(h_uri, quote=True)}"><code>{safe_rule}</code></a>'
+            if h_uri
+            else f"<code>{safe_rule}</code>"
+        )
+        sev_label = html.escape(_format_issue_sev_label(issue), quote=True)
+        msg = html.escape(sanitize_text(str(issue.get("message") or ""), host_url=host_url), quote=True)
+        finding_rows.append(
+            f"<tr><td>Issue</td><td>{sev_label}</td><td>{rule_cell}</td>"
+            f"<td>{loc_cell}</td><td>{msg}</td></tr>"
+        )
+
+    for hs in hotspots[:20]:
+        _, _, loc_text = _format_item_location(hs, project_key, components_by_key)
+        safe_loc = html.escape(loc_text, quote=True)
+        rule_key = html.escape(str(hs.get("ruleKey") or ""), quote=True)
+        prob = html.escape(str(hs.get("vulnerabilityProbability") or "MEDIUM"), quote=True)
+        msg = html.escape(sanitize_text(str(hs.get("message") or ""), host_url=host_url), quote=True)
+        finding_rows.append(
+            f"<tr><td>Hotspot</td><td>{prob}</td><td><code>{rule_key}</code></td>"
+            f"<td><code>{safe_loc}</code></td><td>{msg}</td></tr>"
+        )
+
+    if not finding_rows:
+        return "<p>No Major/MEDIUM+ issues or open security hotspots found.</p>"
+    return (
+        "<table><thead><tr><th>Kind</th><th>Severity</th><th>Rule</th><th>Location</th><th>Message</th></tr></thead>"
+        f"<tbody>{''.join(finding_rows)}</tbody></table>"
+    )
 
 
 def build_html_report(
@@ -1095,12 +1251,13 @@ def build_html_report(
     cnes_files: list[str] | None = None,
 ) -> str:
     """Render a self-contained, HTML-escaped static report for GitHub Pages."""
-    project_key = html.escape(str(metrics_payload["projectKey"]), quote=True)
+    raw_project_key = str(metrics_payload["projectKey"])
+    project_key = html.escape(raw_project_key, quote=True)
     generated_at = html.escape(str(metrics_payload["generatedAt"]), quote=True)
     repo_url = validate_public_repo_url(metrics_payload.get("repoUrl"))
     gate = metrics_payload["qualityGate"]
     gate_status = str(gate["status"]).upper()
-    gate_badge_class = "ok" if gate_status == "OK" else ("warn" if gate_status == "WARN" else "err")
+    gate_badge_class = {"OK": "ok", "WARN": "warn"}.get(gate_status, "err")
     measures = metrics_payload["measures"]
     summary = metrics_payload["issueSummary"]
 
@@ -1134,96 +1291,14 @@ def build_html_report(
         for alt, src in badge_files
     )
 
-    cond_rows = []
-    for cond in gate.get("conditions") or []:
-        c_status = html.escape(str(cond.get("status") or ""), quote=True)
-        c_metric = html.escape(str(cond.get("metricKey") or ""), quote=True)
-        c_actual = html.escape(str(cond.get("actualValue") or "-"), quote=True)
-        thresh = cond.get("errorThreshold")
-        comp = str(cond.get("comparator") or "")
-        thresh_str = html.escape(f"{comp} {thresh}".strip() if thresh is not None else "-", quote=True)
-        cond_rows.append(
-            f"<tr><td><code>{c_metric}</code></td><td>{c_status}</td>"
-            f"<td>{c_actual}</td><td>{thresh_str}</td></tr>"
-        )
-    conditions_html = (
-        "<table><thead><tr><th>Metric</th><th>Status</th><th>Actual</th><th>Threshold</th></tr></thead>"
-        f"<tbody>{''.join(cond_rows)}</tbody></table>"
-        if cond_rows
-        else "<p>No Quality Gate conditions reported.</p>"
-    )
-
-    ranked_issues = sorted(
-        [it for it in issues if should_include_issue_in_report(it)],
-        key=lambda it: (-issue_highest_rank(it), str(it.get("rule") or "")),
-    )[:50]
-    finding_rows = []
-    for issue in ranked_issues:
-        rel_path = resolve_repo_relative_path(
-            str(issue.get("component") or ""),
-            str(metrics_payload["projectKey"]),
-            components_by_key,
-        )
-        line_no = issue.get("line") or (issue.get("textRange") or {}).get("startLine")
-        loc_text = f"{rel_path}:{line_no}" if line_no else rel_path
-        safe_loc = html.escape(loc_text, quote=True)
-        if repo_url and rel_path != ".":
-            encoded_path = "/".join(urllib.parse.quote(part) for part in rel_path.split("/"))
-            anchor = f"#L{int(line_no)}" if line_no else ""
-            href = html.escape(f"{repo_url}/blob/HEAD/{encoded_path}{anchor}", quote=True)
-            loc_cell = f'<a href="{href}"><code>{safe_loc}</code></a>'
-        else:
-            loc_cell = f"<code>{safe_loc}</code>"
-
-        rule_key = str(issue.get("rule") or "")
-        safe_rule = html.escape(rule_key, quote=True)
-        h_uri = rule_help_uri(rule_key)
-        rule_cell = (
-            f'<a href="{html.escape(h_uri, quote=True)}"><code>{safe_rule}</code></a>'
-            if h_uri
-            else f"<code>{safe_rule}</code>"
-        )
-        sev = str(issue.get("severity") or "")
-        imp_sevs = [
-            str(i.get("severity"))
-            for i in (issue.get("impacts") or [])
-            if isinstance(i, dict) and i.get("severity")
-        ]
-        sev_label = html.escape("/".join([s for s in [sev, *imp_sevs] if s]) or "MEDIUM", quote=True)
-        msg = html.escape(
-            sanitize_text(str(issue.get("message") or ""), host_url=host_url),
-            quote=True,
-        )
-        finding_rows.append(
-            f"<tr><td>Issue</td><td>{sev_label}</td><td>{rule_cell}</td>"
-            f"<td>{loc_cell}</td><td>{msg}</td></tr>"
-        )
-
-    for hs in hotspots[:20]:
-        rel_path = resolve_repo_relative_path(
-            str(hs.get("component") or ""),
-            str(metrics_payload["projectKey"]),
-            components_by_key,
-        )
-        line_no = hs.get("line")
-        loc_text = f"{rel_path}:{line_no}" if line_no else rel_path
-        safe_loc = html.escape(loc_text, quote=True)
-        rule_key = html.escape(str(hs.get("ruleKey") or ""), quote=True)
-        prob = html.escape(str(hs.get("vulnerabilityProbability") or "MEDIUM"), quote=True)
-        msg = html.escape(
-            sanitize_text(str(hs.get("message") or ""), host_url=host_url),
-            quote=True,
-        )
-        finding_rows.append(
-            f"<tr><td>Hotspot</td><td>{prob}</td><td><code>{rule_key}</code></td>"
-            f"<td><code>{safe_loc}</code></td><td>{msg}</td></tr>"
-        )
-
-    findings_html = (
-        "<table><thead><tr><th>Kind</th><th>Severity</th><th>Rule</th><th>Location</th><th>Message</th></tr></thead>"
-        f"<tbody>{''.join(finding_rows)}</tbody></table>"
-        if finding_rows
-        else "<p>No Major/MEDIUM+ issues or open security hotspots found.</p>"
+    conditions_html = _format_html_conditions(gate.get("conditions") or [])
+    findings_html = _format_html_findings(
+        raw_project_key,
+        issues,
+        hotspots,
+        components_by_key,
+        repo_url=repo_url,
+        host_url=host_url,
     )
 
     repo_link_html = (

@@ -237,7 +237,7 @@ public sealed partial class DuPhase4Tests : IDisposable
     public void ParallelWalker_LargeDirectoryChunkStatx_TriggersAndMatchesSequential()
     {
         using TempTree tree = new();
-        string hotDir = tree.Dir("hot");
+        tree.Dir("hot");
         for (int i = 0; i < 1600; i++)
             tree.File($"hot/f_{i:D4}.dat", (i % 7) * 256);
 

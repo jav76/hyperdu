@@ -331,7 +331,7 @@ public sealed partial class DuPhase2Tests : IDisposable
         using TempTree tree = new();
         string d = tree.Dir("d");
         string sub = tree.Dir("d/real");
-        string targetFile = tree.File("d/real/payload.bin", 1234);
+        tree.File("d/real/payload.bin", 1234);
         string dirLink = Path.Combine(d, "symdir");
         string fileLink = Path.Combine(d, "symfile");
         string danglingLink = Path.Combine(d, "dangling");
