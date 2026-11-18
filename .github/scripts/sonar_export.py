@@ -1324,7 +1324,7 @@ def run_export(
         api,
         "/api/hotspots/search",
         {
-            "projectKey": config.project_key,
+            "project": config.project_key,
             "status": "TO_REVIEW",
         },
         "hotspots",

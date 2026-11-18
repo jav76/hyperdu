@@ -460,6 +460,9 @@ class SonarExportTests(unittest.TestCase):
                     ).encode("utf-8")
                 )
             if parsed.path == "/api/hotspots/search":
+                qs = urllib.parse.parse_qs(parsed.query)
+                self.assertEqual(qs.get("project"), ["jav76_hyperdu"])
+                self.assertNotIn("projectKey", qs)
                 return FakeHttpResponse(
                     json.dumps(
                         {"paging": {"pageIndex": 1, "pageSize": 500, "total": 0}, "hotspots": []}
