@@ -30,6 +30,24 @@ You can browse while it scans. The folder you are looking at gets scanned first,
 
 ![hyperdu after finishing a scan of /usr](https://raw.githubusercontent.com/jav76/hyperdu/main/docs/images/complete.png)
 
+## Performance
+
+`hyperdu du` against GNU `du` 9.4 on a 4-core Ubuntu 24.04 runner (warm cache, [benchmark suite](tests/bench/)). Output matched `du` in all 64 scenarios.
+
+Median time for `du -s`:
+
+| Tree | GNU `du` | `hyperdu du` | Speedup |
+| :--- | ---: | ---: | ---: |
+| 250,000 files in 250 dirs | 290 ms | 120 ms | 2.4x |
+| 50,000 files in 500 dirs | 62 ms | 36 ms | 1.7x |
+| Dev monorepo (15,000 files, `node_modules`, `.git`) | 22 ms | 16 ms | 1.4x |
+| 20,000 files in one directory | 32 ms | 26 ms | 1.2x |
+| 251 nested dirs, 23 files | 2.3 ms | 3.9 ms | 0.6x |
+
+* **Overall:** 1.35x faster (geometric mean across 64 scenarios).
+* **Memory:** about 8 MiB peak RSS (GNU `du`: about 3 MiB).
+* **Where it's slower:** very small or deep, narrow trees, where process startup dominates (2.7 ms vs 0.7 ms on a 5-file directory).
+
 ## Install
 
 **WinGet** (Windows):
@@ -58,55 +76,25 @@ tar -xzf hyperdu-linux-x64.tar.gz
 
 ## Use as `du`
 
-When invoked as `du` or `gdu` (via symlink on a Native AOT binary), or via `hyperdu du` / `hyperdu gdu`, `hyperdu` runs in non-interactive `du` mode with identical output format and no TUI banner. Running `hyperdu` without a `du`/`gdu` subcommand still launches the interactive explorer.
+Invoked as `du` or `gdu` (a symlink to the Native AOT binary), or as `hyperdu du`, hyperdu runs as a non-interactive `du` with matching output. Plain `hyperdu` opens the explorer.
 
-* **Linux (and `gdu` on all platforms):** runs the **GNU `du` dialect** (1024-byte default blocks, `--apparent-size`, `-b`, `--block-size`, `--exclude`, `--files0-from`, `--inodes`, `--time`, `--max-depth`, and `du (hyperdu) <version>` for `--version`).
-* **macOS (`du` symlink / `hyperdu du` on Darwin):** runs the **BSD / macOS `/usr/bin/du` dialect** (512-byte default blocks, `BLOCKSIZE` env var, `-A` apparent blocks, `-B` blocksize, `-g` 1 GiB blocks, `-h` BSD `humanize_number` formatting, `-I` basename ignore mask repeatable, `-n` `UF_NODUMP` filter, `-r`, `-d depth`, `--si`, `-t threshold`, and BSD `usage:` errors). Use `gdu` (or `HYPERDU_DU_DIALECT=gnu`) on macOS when GNU `du` behavior is required.
-* **Dialect override (`HYPERDU_DU_DIALECT`):** set `HYPERDU_DU_DIALECT=bsd` or `HYPERDU_DU_DIALECT=gnu` to force a dialect in scripts regardless of symlink name or OS.
+* **GNU dialect** on Linux, and for `gdu` everywhere: 1024-byte blocks, `--apparent-size`, `-b`, `--block-size`, `--exclude`, `--files0-from`, `--inodes`, `--time`, `--max-depth` and more.
+* **BSD dialect** for `du` on macOS: 512-byte blocks, `BLOCKSIZE`, `-A`, `-B`, `-g`, `-I`, `-n`, `-r`, `-d` and BSD-style errors.
+* Force a dialect with `HYPERDU_DU_DIALECT=gnu` or `bsd`. Set worker threads with `HYPERDU_THREADS=<N>`.
 
-### Option A: System-wide install (`/usr/local/bin`, works with `sudo` and scripts)
+Install the binary and symlinks ahead of `/usr/bin` on `PATH`:
 
 ```bash
-sudo mkdir -p /usr/local/bin
+# System-wide (works with sudo, cron and scripts)
 sudo tar -xzf hyperdu-linux-x64.tar.gz -C /usr/local/bin hyperdu du gdu
-command -v du   # /usr/local/bin/du
-du --version
+
+# Current user only
+mkdir -p ~/.local/bin && tar -xzf hyperdu-linux-x64.tar.gz -C ~/.local/bin hyperdu du gdu
 ```
 
-On macOS, substitute `hyperdu-osx-arm64.tar.gz` (Apple Silicon) or `hyperdu-osx-x64.tar.gz` (Intel). Passing `hyperdu du gdu` extracts only the binary and symlinks cleanly into `/usr/local/bin` without writing `LICENSE` or `README.md` there (inspect those inside the archive if needed).
-
-### Option B: Current user only (`~/.local/bin`, no root)
-
-```bash
-mkdir -p ~/.local/bin
-tar -xzf hyperdu-linux-x64.tar.gz -C ~/.local/bin hyperdu du gdu
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup file (`~/.profile` or `~/.bash_profile` for login shells, `~/.bashrc` for interactive bash, `~/.zshrc` for zsh) so `~/.local/bin` appears ahead of `/usr/bin`. Verify precedence with `command -v du`. Note that `cron`, `make`, and standalone `#!/bin/sh` scripts typically use a minimal `PATH` (such as `/usr/bin:/bin`) and ignore interactive shell startup files, so use Option A (`/usr/local/bin`) if non-interactive system jobs should pick up `du`.
-
-### Placement rules and caveats
-
-* **Never overwrite `/usr/bin/du`.** `/usr/bin` is owned by your OS package manager (`apt`, `dnf`, `pacman`) or macOS SIP; OS updates will overwrite it or fail integrity checks. Putting `hyperdu`, `du`, and `gdu` in `/usr/local/bin` or `~/.local/bin` ahead of `/usr/bin` overrides `du` cleanly and is easy to remove (`rm -f /usr/local/bin/du /usr/local/bin/gdu /usr/local/bin/hyperdu`).
-* **`sudo` uses `secure_path`.** `sudo` resets `PATH` (typically omitting `~/.local/bin`). If `sudo du` or root/cron scripts must resolve to `hyperdu`, install into `/usr/local/bin`.
-* **Shell aliases do not affect scripts.** `alias du='hyperdu du'` only applies in interactive shells; scripts, `cron`, `make`, `xargs`, and `find -exec` bypass aliases. Use symlinks on `PATH` instead.
-* **Thread control (`HYPERDU_THREADS`).** `du` mode preserves native `du` flags, so override worker count with `HYPERDU_THREADS=<N>` when needed (by default it keeps tiny scans inline, limits rotational Linux HDDs to 1 worker, and scales up on SSDs and network mounts).
-
-### `.NET tool` limitations and wrapper script
-
-`dotnet tool install -g hyperdu` installs a framework-dependent **JIT** shim, so it is **not** a drop-in replacement for `du`:
-
-1. **JIT startup latency:** cold startup takes tens of milliseconds on each invocation, whereas the Native AOT binary starts in ~2-3 ms.
-2. **No `argv[0]` dispatch:** the .NET tool host invokes `hyperdu.dll` rather than passing the symlink name, so symlinking `~/.dotnet/tools/hyperdu` to `du` does not activate `du` mode.
-
-For occasional convenience when only the .NET tool is installed, use `hyperdu du ...` directly or save a small wrapper script on `PATH` (note that JIT startup overhead still applies):
-
-```sh
-#!/bin/sh
-exec hyperdu du "$@"
-```
-
-Save that as `~/.local/bin/du` and run `chmod +x ~/.local/bin/du`. Use the Native AOT release archive when replacing `du` in scripts or pipelines.
+* Never replace `/usr/bin/du`. The OS package manager owns it. Remove hyperdu with `rm -f /usr/local/bin/{du,gdu,hyperdu}`.
+* `sudo`, `cron` and `#!/bin/sh` scripts usually ignore `~/.local/bin` and shell aliases. Use `/usr/local/bin` if they should get hyperdu.
+* The .NET tool can't be a `du` drop-in: it ignores the symlink name and has JIT startup cost. Use `hyperdu du ...` with it, or use the release archive.
 
 ## Usage
 
@@ -132,17 +120,6 @@ hyperdu [option]... [path]
 | `--skip-hidden` | Skip hidden and system files. | Off |
 | `-V, --version` | Print the version and exit. | |
 | `--help` | Print help and exit. | |
-
-### Migrating legacy TUI flags
-
-`hyperdu` aligned its short flags with `du`:
-
-| Legacy flag | New flag | Notes |
-|---|---|---|
-| `-t <N>` | `-j <N>` / `--threads <N>` | `-t` now means `--threshold <SIZE>`. |
-| `-v` | `-V` / `--version` | Emits a migration error with exit status `1`. |
-| `-e <path>` | `--exclude=<pattern>` / `-X <file>` | Uses `du`-style globs across both files and directories. |
-| `-h` | `--help` | `-h` now means `--human-readable`. |
 
 Set `HYPERDU_NATIVE_IO=0` to use the .NET file enumerator instead of direct libc calls on Linux and macOS. It is slower and cannot open names that are not valid UTF-8.
 
