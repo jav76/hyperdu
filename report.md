@@ -2,7 +2,7 @@
 
 - **Project**: `jav76_hyperdu_205c3499-2670-4991-8a9a-29c5f76e3d9f`
 - **Quality Gate**: **OK**
-- **Generated (UTC)**: `2026-11-18T20:03:15Z`
+- **Generated (UTC)**: `2026-11-21T17:44:57Z`
 - **Repository**: https://github.com/jav76/hyperdu
 - **Public Dashboard**: https://jav76.github.io/hyperdu/
 
@@ -12,7 +12,7 @@
 | Reliability Rating / Issues | A (0) |
 | Security Rating / Issues | B (1) |
 | Maintainability Rating / Issues | A (69) |
-| Coverage | 59.5% |
+| Coverage | 59.6% |
 | Duplicated Lines | 0.6% |
 | Lines of Code (NCLOC) | 14.5k |
 | Technical Debt | 2h52min |
@@ -24,7 +24,7 @@
 
 | Metric | Status | Actual | Threshold |
 | :--- | :--- | :--- | :--- |
-| `new_coverage` | OK | 61.1 | LT 50 |
+| `new_coverage` | OK | 61.2 | LT 50 |
 | `new_duplicated_lines_density` | OK | 0.43962 | GT 5 |
 | `new_software_quality_reliability_rating` | OK | 1 | GT 2 |
 | `new_software_quality_security_rating` | OK | 2 | GT 2 |
