@@ -1,0 +1,38 @@
+# Repackages an extracted release tarball as .deb/.rpm. Run from the extraction dir by .github/scripts/build-linux-packages.sh.
+name: hyperdu
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: Jaret Varn <https://github.com/jav76>
+description: |
+  Parallel disk usage explorer and GNU/BSD du drop-in.
+  hyperdu is an interactive terminal explorer that scans the folder you are
+  looking at first. Run `hyperdu du` for du-compatible output.
+vendor: Jaret Varn
+homepage: https://github.com/jav76/hyperdu
+license: MIT
+
+contents:
+  - src: ./hyperdu
+    dst: /usr/bin/hyperdu
+    file_info:
+      mode: 0755
+  # Opt-in du/gdu drop-ins: off PATH so they never shadow coreutils.
+  # Enable with: export PATH="/usr/lib/hyperdu:$PATH"
+  - src: /usr/bin/hyperdu
+    dst: /usr/lib/hyperdu/du
+    type: symlink
+  - src: /usr/bin/hyperdu
+    dst: /usr/lib/hyperdu/gdu
+    type: symlink
+  - src: ./LICENSE
+    dst: /usr/share/doc/hyperdu/LICENSE
+    file_info:
+      mode: 0644
+  - src: ./README.md
+    dst: /usr/share/doc/hyperdu/README.md
+    file_info:
+      mode: 0644
+

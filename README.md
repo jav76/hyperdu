@@ -50,6 +50,12 @@ Median time for `du -s`:
 
 ## Install
 
+**Homebrew** (macOS, Linux):
+
+```bash
+brew install jav76/tap/hyperdu
+```
+
 **WinGet** (Windows):
 
 ```powershell

@@ -1,0 +1,26 @@
+# Maintainer: Jaret Varn <https://github.com/jav76>
+pkgname=hyperdu-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Parallel disk usage explorer and GNU/BSD du drop-in"
+arch=('x86_64' 'aarch64')
+url="https://github.com/jav76/hyperdu"
+license=('MIT')
+depends=('glibc')
+provides=('hyperdu')
+conflicts=('hyperdu')
+options=('!strip' '!debug')
+source_x86_64=("hyperdu-${pkgver}-x86_64.tar.gz::${url}/releases/download/v${pkgver}/hyperdu-linux-x64.tar.gz")
+source_aarch64=("hyperdu-${pkgver}-aarch64.tar.gz::${url}/releases/download/v${pkgver}/hyperdu-linux-arm64.tar.gz")
+sha256sums_x86_64=('@SHA256:hyperdu-linux-x64.tar.gz@')
+sha256sums_aarch64=('@SHA256:hyperdu-linux-arm64.tar.gz@')
+
+package() {
+  install -Dm755 hyperdu "${pkgdir}/usr/bin/hyperdu"
+  # du/gdu drop-ins stay off PATH: export PATH="/usr/lib/hyperdu:$PATH" to opt in.
+  install -d "${pkgdir}/usr/lib/hyperdu"
+  ln -s /usr/bin/hyperdu "${pkgdir}/usr/lib/hyperdu/du"
+  ln -s /usr/bin/hyperdu "${pkgdir}/usr/lib/hyperdu/gdu"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}
