@@ -1,0 +1,48 @@
+class Hyperdu < Formula
+  desc "Parallel disk usage explorer and GNU/BSD du drop-in"
+  homepage "https://github.com/jav76/hyperdu"
+  version "@VERSION@"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/jav76/hyperdu/releases/download/v@VERSION@/hyperdu-osx-arm64.tar.gz"
+      sha256 "@SHA256:hyperdu-osx-arm64.tar.gz@"
+    end
+    on_intel do
+      url "https://github.com/jav76/hyperdu/releases/download/v@VERSION@/hyperdu-osx-x64.tar.gz"
+      sha256 "@SHA256:hyperdu-osx-x64.tar.gz@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/jav76/hyperdu/releases/download/v@VERSION@/hyperdu-linux-arm64.tar.gz"
+      sha256 "@SHA256:hyperdu-linux-arm64.tar.gz@"
+    end
+    on_intel do
+      url "https://github.com/jav76/hyperdu/releases/download/v@VERSION@/hyperdu-linux-x64.tar.gz"
+      sha256 "@SHA256:hyperdu-linux-x64.tar.gz@"
+    end
+  end
+
+  def install
+    bin.install "hyperdu"
+    # du/gdu drop-ins stay off PATH so they never shadow the system du.
+    (libexec/"bin").install_symlink bin/"hyperdu" => "du"
+    (libexec/"bin").install_symlink bin/"hyperdu" => "gdu"
+  end
+
+  def caveats
+    <<~EOS
+      To use hyperdu as a drop-in `du`, put its symlinks ahead of the system du:
+        export PATH="#{opt_libexec}/bin:$PATH"
+    EOS
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/hyperdu --version")
+    (testpath/"dir/file").write("hyperdu")
+    assert_match "dir", shell_output("#{bin}/hyperdu du -s #{testpath}/dir")
+  end
+end

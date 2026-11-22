@@ -232,11 +232,94 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  # .deb/.rpm repackage the Linux tarballs. Non-blocking: a packaging failure must not
+  # hold back the release, so the release job ignores this job's result.
+  linux-packages:
+    name: Build Linux Packages (deb, rpm)
+    needs: [build]
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    permissions:
+      contents: write
+    env:
+      NFPM_VERSION: '2.49.0'
+      NFPM_SHA256: 2afaa5ffb5e3493402e31e7c67a5a1fb42133e3f66fc315ca0051934125561c7
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install nFPM
+        run: |
+          set -euo pipefail
+          asset="nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$asset" \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/$asset"
+          echo "${NFPM_SHA256}  $RUNNER_TEMP/$asset" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP" nfpm
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Download Linux Tarballs (tag builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir tarballs \
+            --pattern 'hyperdu-linux-*.tar.gz'
+
+      - name: Download Linux Tarballs (non-tag builds)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: hyperdu-linux-*
+          merge-multiple: true
+          path: tarballs
+
+      - name: Build Packages
+        run: |
+          set -euo pipefail
+          tar -xzf tarballs/hyperdu-linux-x64.tar.gz -C "$RUNNER_TEMP" hyperdu
+          version="$("$RUNNER_TEMP/hyperdu" --version | awk '{print $2}')"
+          echo "Packaging version $version"
+          bash .github/scripts/build-linux-packages.sh "$version" tarballs packages
+
+      - name: Smoke Test .deb
+        run: |
+          set -euo pipefail
+          sudo dpkg -i packages/hyperdu_*_amd64.deb
+          hyperdu --version
+          test "$(readlink /usr/lib/hyperdu/du)" = /usr/bin/hyperdu
+          test "$(command -v du)" != /usr/lib/hyperdu/du
+
+      - name: Upload Packages to Draft Release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)" != "true" ]; then
+            echo "::error::$TAG is already published; refusing to replace its assets."; exit 1
+          fi
+          gh release upload "$TAG" packages/*.deb packages/*.rpm --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Upload CI Artifact (non-tag builds)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyperdu-linux-packages
+          path: packages/
+          retention-days: 7
+          if-no-files-found: error
+
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build, pack-tool]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, pack-tool, linux-packages]
+    # linux-packages is optional; only the archives and the tool package gate the release.
+    if: >-
+      !cancelled() && startsWith(github.ref, 'refs/tags/v')
+      && needs.build.result == 'success' && needs.pack-tool.result == 'success'
     permissions:
       contents: write
       id-token: write
@@ -294,7 +377,7 @@ jobs:
           fi
           gh release upload "$TAG" artifacts/*.nupkg --repo "$GITHUB_REPOSITORY" --clobber
 
-      # Package managers (Homebrew, Scoop, AUR, Nix) read hashes from this file.
+      # Package managers (Homebrew, Scoop, AUR, Nix, aqua) read hashes from this file.
       - name: Generate and Attach SHA256SUMS
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -420,3 +503,88 @@ jobs:
           komac sync-fork
           komac submit "$MANIFEST_DIR" --yes
           komac cleanup --only-merged || true
+
+  # Pushes the rendered formula to jav76/homebrew-tap. Skipped (with a notice) until the
+  # HOMEBREW_TAP_TOKEN secret exists: a fine-grained PAT with contents:write on that repo.
+  homebrew:
+    name: Update Homebrew Tap
+    runs-on: ubuntu-24.04
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    continue-on-error: true
+    env:
+      TAP_REPO: ${{ github.repository_owner }}/homebrew-tap
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Render and Push Formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the Homebrew tap update."; exit 0
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" "$RUNNER_TEMP/tap"
+          mkdir -p "$RUNNER_TEMP/tap/Formula"
+          python3 .github/scripts/render-package-template.py packaging/homebrew/hyperdu.rb.tmpl \
+            "$VERSION" "$RUNNER_TEMP/SHA256SUMS" -o "$RUNNER_TEMP/tap/Formula/hyperdu.rb"
+          cd "$RUNNER_TEMP/tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/hyperdu.rb
+          if git diff --cached --quiet; then echo "Formula already at $VERSION"; exit 0; fi
+          git commit -m "hyperdu $VERSION"
+          git push origin HEAD
+
+  # Publishes hyperdu-bin to the AUR. Skipped (with a notice) until AUR_SSH_PRIVATE_KEY
+  # holds the private key whose public half is registered on the AUR account.
+  aur:
+    name: Update AUR Package
+    runs-on: ubuntu-24.04
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    continue-on-error: true
+    steps:
+      - name: Check AUR Credentials
+        id: creds
+        env:
+          AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AUR_KEY" ]; then
+            echo "::notice::AUR_SSH_PRIVATE_KEY is not set; skipping the AUR update."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout Repository
+        if: steps.creds.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+
+      - name: Render PKGBUILD
+        if: steps.creds.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
+          python3 .github/scripts/render-package-template.py packaging/aur/PKGBUILD.tmpl \
+            "${GITHUB_REF_NAME#v}" "$RUNNER_TEMP/SHA256SUMS" -o "$RUNNER_TEMP/PKGBUILD"
+          cat "$RUNNER_TEMP/PKGBUILD"
+
+      - name: Publish to AUR
+        if: steps.creds.outputs.enabled == 'true'
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
+        with:
+          pkgname: hyperdu-bin
+          pkgbuild: ${{ runner.temp }}/PKGBUILD
+          commit_username: ${{ github.repository_owner }}
+          commit_email: ${{ github.repository_owner }}@users.noreply.github.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: hyperdu ${{ github.ref_name }}
+          test: true
